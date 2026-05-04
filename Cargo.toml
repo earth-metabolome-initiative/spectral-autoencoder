@@ -1,0 +1,53 @@
+[package]
+name = "spectral-autoencoder"
+version = "0.1.0"
+edition = "2024"
+description = "MS/MS spectral autoencoder models built with Burn."
+license = "MIT"
+repository = "https://github.com/earth-metabolome-initiative/spectral-autoencoder"
+readme = "README.md"
+
+[lib]
+name = "spectral_autoencoder"
+path = "src/lib.rs"
+
+[features]
+default = ["std", "ndarray", "train", "tui"]
+std = [
+    "burn/dataset",
+    "burn/std",
+    "mascot_rs/std",
+    "mass_spectrometry/std",
+    "serde/std",
+    "thiserror/std",
+]
+ndarray = ["burn/ndarray"]
+train = ["burn/train", "ndarray"]
+tui = ["train", "burn/tui"]
+cuda = ["burn/cuda"]
+cuda-fusion = ["cuda", "burn/fusion", "burn/autotune"]
+cuda-no-fusion = ["cuda", "burn/autotune"]
+
+[dependencies]
+burn = { version = "=0.20.1", default-features = false }
+mascot_rs = { package = "mascot-rs", git = "https://github.com/LucaCappelletti94/mascot-rs", default-features = false, features = ["std"] }
+mass_spectrometry = { git = "https://github.com/earth-metabolome-initiative/mass-spectrometry-traits", rev = "33849cf912c9d2e6d13258f01593b7261e9f3c23", default-features = false, features = ["std"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+approx = "0.5"
+indicatif = "0.18"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[profile.release]
+debug = 1
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
