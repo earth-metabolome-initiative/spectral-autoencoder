@@ -19,15 +19,19 @@ use crate::{
     model::RegularizationConfig,
     model::auxiliary::{
         AuxiliaryLossConfig, EmbeddingAuxiliaryHeads, EmbeddingAuxiliaryHeadsConfig,
-        RetentionOrderBatch, apply_latent_noise, weighted_cosine_distance_loss,
-        weighted_intruder_detection_loss, weighted_retention_order_output,
     },
     model::reconstruction::{SetReconstructionLossConfig, set_reconstruction_loss_from_triples},
     tokenize::SpectrumTokenizerConfig,
 };
 
 #[cfg(feature = "train")]
-use crate::training::{AutoencoderDiagnostics, AutoencoderLossBreakdown};
+use crate::{
+    model::auxiliary::{
+        apply_latent_noise, weighted_cosine_distance_loss, weighted_intruder_detection_loss,
+        weighted_similarity_ranking_output,
+    },
+    training::{AutoencoderDiagnostics, AutoencoderLossBreakdown},
+};
 
 /// Peak-token encoder configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,7 +40,7 @@ pub struct PeakSetEncoderConfig {
     pub max_peaks: usize,
     /// Width of each peak token feature vector.
     pub token_feature_width: usize,
-    /// Width of the metadata conditioning vector.
+    /// Width of the encoder-side metadata conditioning vector.
     pub condition_width: usize,
     /// Internal peak-token embedding width.
     pub token_embedding_width: usize,
@@ -102,7 +106,10 @@ pub struct PeakSetDecoderConfig {
     pub max_peaks: usize,
     /// Width of the latent embedding.
     pub latent_width: usize,
-    /// Width of the metadata conditioning vector.
+    /// Width of the decoder-side metadata conditioning vector.
+    ///
+    /// The diffusion-oriented default is zero so the decoder reconstructs from
+    /// the latent embedding alone.
     pub condition_width: usize,
     /// Width of each learned output query.
     pub query_width: usize,
@@ -162,6 +169,7 @@ impl PeakSetDecoderConfig {
             output: LinearConfig::new(self.query_width, self.output_feature_width()).init(device),
             max_peaks: self.max_peaks,
             query_width: self.query_width,
+            condition_width: self.condition_width,
         }
     }
 }
@@ -178,7 +186,7 @@ pub struct PeakSetAutoencoderConfig {
     /// L1/L2 model-parameter regularization.
     #[serde(default)]
     pub regularization: RegularizationConfig,
-    /// Auxiliary denoising, consistency, and retention-order objectives.
+    /// Auxiliary denoising, consistency, intruder, and similarity-ranking objectives.
     #[serde(default)]
     pub auxiliary: AuxiliaryLossConfig,
 }
@@ -186,16 +194,25 @@ pub struct PeakSetAutoencoderConfig {
 impl PeakSetAutoencoderConfig {
     /// Starting peak-set transformer configuration for the 20M-spectrum run.
     ///
-    /// This is the recommended first large-run configuration: 60 peak tokens,
+    /// This is the recommended first large-run configuration: top-N peak tokens,
     /// a 512-wide encoder/decoder, six transformer encoder layers, four set
     /// decoder layers, and an 8-head attention layout. It is substantially
     /// larger than the smoke-test-sized defaults while staying below
     /// DreaMS-scale memory pressure on a single RTX 4090/5090-class GPU. The
     /// transformer internals stay 512-wide, while the deliverable embedding is
-    /// a compact 64-dimensional latent.
+    /// a compact 96-dimensional latent.
     #[must_use]
     pub fn twenty_million_run() -> Self {
-        let tokenizer = SpectrumTokenizerConfig::default();
+        Self::twenty_million_run_with_peaks(SpectrumTokenizerConfig::default().max_peaks)
+    }
+
+    /// Starting peak-set transformer configuration for a top-N GeMS run.
+    #[must_use]
+    pub fn twenty_million_run_with_peaks(max_peaks: usize) -> Self {
+        let tokenizer = SpectrumTokenizerConfig {
+            max_peaks,
+            ..SpectrumTokenizerConfig::default()
+        };
         let condition_width = ConditioningConfig::default().vector_width();
         let token_embedding_width = 512;
 
@@ -210,12 +227,12 @@ impl PeakSetAutoencoderConfig {
                 transformer_feed_forward_width: token_embedding_width * 4,
                 dropout: 0.1,
                 hidden_widths: vec![2048, 1024],
-                latent_width: 64,
+                latent_width: 96,
             },
             decoder: PeakSetDecoderConfig {
                 max_peaks: tokenizer.max_peaks,
-                latent_width: 64,
-                condition_width,
+                latent_width: 96,
+                condition_width: 0,
                 query_width: token_embedding_width,
                 attention_heads: 8,
                 decoder_layers: 4,
@@ -255,7 +272,7 @@ impl PeakSetAutoencoderConfig {
             decoder: PeakSetDecoderConfig {
                 max_peaks,
                 latent_width,
-                condition_width,
+                condition_width: 0,
                 query_width: token_embedding_width,
                 attention_heads,
                 decoder_layers: 2,
@@ -290,7 +307,6 @@ impl PeakSetAutoencoderConfig {
             auxiliary_heads: EmbeddingAuxiliaryHeadsConfig {
                 latent_width: self.encoder.latent_width,
                 max_peaks: self.encoder.max_peaks,
-                retention_hidden_width: self.auxiliary.retention_hidden_width,
                 intruder_hidden_width: self.auxiliary.intruder_hidden_width,
             }
             .init(device),
@@ -303,10 +319,12 @@ impl PeakSetAutoencoderConfig {
             reconstruction_weight: self.auxiliary.reconstruction_weight,
             masked_peak_weight: self.auxiliary.masked_peak_weight,
             consistency_weight: self.auxiliary.consistency_weight,
-            retention_order_weight: self.auxiliary.retention_order_weight,
             intruder_peak_weight: self.auxiliary.intruder_peak_weight,
+            similarity_ranking_weight: self.auxiliary.similarity_ranking_weight,
+            similarity_ranking_margin: self.auxiliary.similarity_ranking_margin,
+            similarity_ranking_min_gap: self.auxiliary.similarity_ranking_min_gap,
             latent_noise_std: self.auxiliary.latent_noise_std,
-            retention_pairs_per_batch: self.auxiliary.retention_pairs_per_batch,
+            similarity_ranking_pairs_per_batch: self.auxiliary.similarity_ranking_pairs_per_batch,
         }
     }
 }
@@ -366,15 +384,38 @@ pub struct PeakSetDecoder<B: Backend> {
     output: Linear<B>,
     max_peaks: usize,
     query_width: usize,
+    condition_width: usize,
 }
 
 impl<B: Backend> PeakSetDecoder<B> {
     /// Decodes a latent representation into unordered normalized peak candidates.
-    pub fn forward(&self, latent: Tensor<B, 2>, conditions: Tensor<B, 2>) -> Tensor<B, 3> {
-        let [batch_size, _latent_width] = latent.dims();
+    pub fn forward(&self, latent: Tensor<B, 2>) -> Tensor<B, 3> {
+        assert_eq!(
+            self.condition_width, 0,
+            "PeakSetDecoder::forward requires a zero-width decoder condition configuration"
+        );
+        self.forward_memory(latent)
+    }
+
+    /// Decodes a latent representation with explicit decoder-side conditions.
+    pub fn forward_with_conditions(
+        &self,
+        latent: Tensor<B, 2>,
+        conditions: Tensor<B, 2>,
+    ) -> Tensor<B, 3> {
+        let [_batch_size, condition_width] = conditions.dims();
+        assert_eq!(
+            condition_width, self.condition_width,
+            "decoder condition tensor width does not match the decoder configuration"
+        );
+        self.forward_memory(Tensor::cat(vec![latent, conditions], 1))
+    }
+
+    fn forward_memory(&self, memory_input: Tensor<B, 2>) -> Tensor<B, 3> {
+        let [batch_size, _memory_width] = memory_input.dims();
         let memory = self
             .memory_projection
-            .forward(Tensor::cat(vec![latent, conditions], 1))
+            .forward(memory_input)
             .unsqueeze_dim::<3>(1);
         let queries = self.queries.val().unsqueeze_dim::<3>(0).expand([
             batch_size,
@@ -413,10 +454,12 @@ pub struct PeakSetAutoencoder<B: Backend> {
     reconstruction_weight: f64,
     masked_peak_weight: f64,
     consistency_weight: f64,
-    retention_order_weight: f64,
     intruder_peak_weight: f64,
+    similarity_ranking_weight: f64,
+    similarity_ranking_margin: f64,
+    similarity_ranking_min_gap: f64,
     latent_noise_std: f64,
-    retention_pairs_per_batch: usize,
+    similarity_ranking_pairs_per_batch: usize,
 }
 
 #[cfg(feature = "train")]
@@ -453,10 +496,31 @@ impl<B: Backend> PeakSetAutoencoder<B> {
         padding_mask: Tensor<B, 2, burn::tensor::Bool>,
         conditions: Tensor<B, 2>,
     ) -> PeakSetAutoencoderOutput<B> {
+        let latent = self
+            .encoder
+            .forward(token_features, peak_mask, padding_mask, conditions);
+        let reconstruction = self.decoder.forward(latent.clone());
+        PeakSetAutoencoderOutput {
+            latent,
+            reconstruction,
+        }
+    }
+
+    /// Runs the full peak-token autoencoder with explicit decoder-side conditions.
+    pub fn forward_with_decoder_conditions(
+        &self,
+        token_features: Tensor<B, 3>,
+        peak_mask: Tensor<B, 2>,
+        padding_mask: Tensor<B, 2, burn::tensor::Bool>,
+        encoder_conditions: Tensor<B, 2>,
+        decoder_conditions: Tensor<B, 2>,
+    ) -> PeakSetAutoencoderOutput<B> {
         let latent =
             self.encoder
-                .forward(token_features, peak_mask, padding_mask, conditions.clone());
-        let reconstruction = self.decoder.forward(latent.clone(), conditions);
+                .forward(token_features, peak_mask, padding_mask, encoder_conditions);
+        let reconstruction = self
+            .decoder
+            .forward_with_conditions(latent.clone(), decoder_conditions);
         PeakSetAutoencoderOutput {
             latent,
             reconstruction,
@@ -502,7 +566,7 @@ impl<B: Backend> PeakSetAutoencoder<B> {
             batch.token_features,
             batch.peak_mask,
             batch.padding_mask,
-            batch.conditions.clone(),
+            batch.conditions,
         );
         let decoder_latent = if use_latent_noise {
             apply_latent_noise(latent.clone(), self.latent_noise_std)
@@ -511,7 +575,7 @@ impl<B: Backend> PeakSetAutoencoder<B> {
         };
         let output = PeakSetAutoencoderOutput {
             latent,
-            reconstruction: self.decoder.forward(decoder_latent, batch.conditions),
+            reconstruction: self.decoder.forward(decoder_latent),
         };
         let device = output.reconstruction.device();
         let reconstruction = self.set_reconstruction_loss_raw(
@@ -545,39 +609,32 @@ impl<B: Backend> PeakSetAutoencoder<B> {
             self.consistency_weight,
             &device,
         );
-        let retention = weighted_retention_order_output(
-            &self.auxiliary_heads,
-            output.latent.clone(),
-            RetentionOrderBatch {
-                retention_time: batch.retention_time,
-                retention_present: batch.retention_present,
-                filename_id: batch.filename_id,
-                partner_index: batch.retention_partner_index,
-            },
-            self.retention_pairs_per_batch,
-            self.retention_order_weight,
-        );
         let intruder = weighted_intruder_detection_loss(
             &self.auxiliary_heads,
             output.latent.clone(),
             batch.intruder_peak_mask,
-            input_peak_mask,
+            input_peak_mask.clone(),
             self.intruder_peak_weight,
+        );
+        let similarity_ranking = weighted_similarity_ranking_output(
+            output.latent.clone(),
+            batch.similarity_ranking,
+            self.similarity_ranking_pairs_per_batch,
+            self.similarity_ranking_margin,
+            self.similarity_ranking_min_gap,
+            self.similarity_ranking_weight,
         );
         let regularization = self.regularization_config().penalty(self, &device);
         let diagnostics = AutoencoderDiagnostics {
-            retention_bce: retention.raw_loss,
-            retention_pairs: retention.valid_pairs,
-            retention_accuracy: retention.accuracy,
-            retention_logit_std: retention.logit_std,
-            retention_rt_gap: retention.mean_rt_delta,
+            similarity_ranking_pairs: similarity_ranking.valid_pairs,
+            similarity_ranking_accuracy: similarity_ranking.accuracy,
         };
         let losses = AutoencoderLossBreakdown {
             reconstruction,
             masked,
             consistency,
-            retention: retention.loss,
             intruder,
+            similarity_ranking: similarity_ranking.loss,
             regularization,
         };
 
@@ -710,21 +767,33 @@ mod tests {
         assert_eq!(config.encoder.max_peaks, 60);
         assert_eq!(config.encoder.token_feature_width, 19);
         assert_eq!(config.encoder.condition_width, 16);
+        assert_eq!(config.decoder.condition_width, 0);
         assert_eq!(config.encoder.token_embedding_width, 512);
         assert_eq!(config.encoder.attention_heads, 8);
         assert_eq!(config.encoder.transformer_layers, 6);
         assert_eq!(config.decoder.decoder_layers, 4);
         assert_eq!(config.encoder.hidden_widths, vec![2048, 1024]);
-        assert_eq!(config.encoder.latent_width, 64);
-        assert_eq!(config.decoder.latent_width, 64);
+        assert_eq!(config.encoder.latent_width, 96);
+        assert_eq!(config.decoder.latent_width, 96);
         assert_eq!(config.regularization.l1, 0.0);
         assert_eq!(config.regularization.l2, 0.0);
         assert_eq!(config.auxiliary.masked_peak_weight, 0.25);
         assert_eq!(config.auxiliary.consistency_weight, 0.05);
-        assert_eq!(config.auxiliary.retention_order_weight, 0.2);
         assert_eq!(config.auxiliary.intruder_peak_weight, 0.05);
+        assert_eq!(config.auxiliary.similarity_ranking_weight, 0.05);
         assert_eq!(config.auxiliary.latent_noise_std, 0.02);
-        assert_eq!(model.num_params(), 39_086_149);
+        assert_eq!(model.num_params(), 39_122_788);
+    }
+
+    #[test]
+    fn twenty_million_run_config_accepts_larger_peak_counts() {
+        let config = PeakSetAutoencoderConfig::twenty_million_run_with_peaks(128);
+
+        assert_eq!(config.encoder.max_peaks, 128);
+        assert_eq!(config.decoder.max_peaks, 128);
+        assert_eq!(config.decoder.condition_width, 0);
+        assert_eq!(config.encoder.token_feature_width, 19);
+        assert_eq!(config.encoder.latent_width, 96);
     }
 
     #[test]

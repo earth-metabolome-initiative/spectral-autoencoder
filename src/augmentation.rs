@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::batch::{
     AutoencoderBatch, AutoencoderBatchLayout, AutoencoderBatchParts, AutoencoderSample,
     TokenizedAutoencoderBatch, TokenizedAutoencoderBatchLayout, TokenizedAutoencoderBatchParts,
-    TokenizedAutoencoderSample, autoencoder_batch_from_parts, retention_partner_indices,
+    TokenizedAutoencoderSample, autoencoder_batch_from_parts,
     tokenized_autoencoder_batch_from_parts,
 };
 
@@ -285,9 +285,6 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
         let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_spectra_mask = Vec::with_capacity(layout.spectrum_capacity());
         let mut intruder_peak_mask = Vec::with_capacity(layout.peak_capacity());
-        let mut retention_time = Vec::with_capacity(layout.metadata_capacity());
-        let mut retention_present = Vec::with_capacity(layout.metadata_capacity());
-        let mut filename_id = Vec::with_capacity(layout.metadata_capacity());
         let consistency_augmenter =
             SpectrumAugmenter::new(self.augmenter.config().without_intruder_peaks());
         for (index, item) in items.into_iter().enumerate() {
@@ -297,7 +294,6 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
                 self.augmenter.augment_vector(&item.spectrum, seed);
             let (consistency_spectrum, _, _) =
                 consistency_augmenter.augment_vector(&item.spectrum, consistency_seed);
-            let (rt, rt_present) = item.metadata.retention_parts();
             spectra.extend(augmented_spectrum);
             target_spectra.extend(item.spectrum);
             consistency_spectra.extend(consistency_spectrum);
@@ -311,12 +307,7 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
                 self.augmenter
                     .augment_conditions(&item.conditions, consistency_seed ^ 0x9e37_79b9_7f4a_7c15),
             );
-            retention_time.push(rt);
-            retention_present.push(rt_present);
-            filename_id.push(item.metadata.filename_part());
         }
-        let retention_partner_index =
-            retention_partner_indices(&filename_id, &retention_time, &retention_present);
 
         autoencoder_batch_from_parts(
             AutoencoderBatchParts {
@@ -328,10 +319,7 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
                 consistency_conditions,
                 masked_spectra_mask,
                 intruder_peak_mask,
-                retention_time,
-                retention_present,
-                filename_id,
-                retention_partner_index,
+                similarity_ranking: None,
             },
             device,
         )
@@ -379,9 +367,6 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
         let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_peak_mask = Vec::with_capacity(layout.peak_capacity());
         let mut intruder_peak_mask = Vec::with_capacity(layout.peak_capacity());
-        let mut retention_time = Vec::with_capacity(layout.metadata_capacity());
-        let mut retention_present = Vec::with_capacity(layout.metadata_capacity());
-        let mut filename_id = Vec::with_capacity(layout.metadata_capacity());
         let consistency_augmenter =
             SpectrumAugmenter::new(self.augmenter.config().without_intruder_peaks());
         for (index, item) in items.into_iter().enumerate() {
@@ -396,7 +381,6 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
                     &item.peak_mask,
                     consistency_seed,
                 );
-            let (rt, rt_present) = item.metadata.retention_parts();
             token_features.extend(input_features);
             consistency_token_features.extend(consistency_features);
             target_pairs.extend(item.target_pairs);
@@ -415,12 +399,7 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
                 self.augmenter
                     .augment_conditions(&item.conditions, consistency_seed ^ 0x9e37_79b9_7f4a_7c15),
             );
-            retention_time.push(rt);
-            retention_present.push(rt_present);
-            filename_id.push(item.metadata.filename_part());
         }
-        let retention_partner_index =
-            retention_partner_indices(&filename_id, &retention_time, &retention_present);
 
         tokenized_autoencoder_batch_from_parts(
             TokenizedAutoencoderBatchParts {
@@ -437,10 +416,7 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
                 consistency_conditions,
                 masked_peak_mask,
                 intruder_peak_mask,
-                retention_time,
-                retention_present,
-                filename_id,
-                retention_partner_index,
+                similarity_ranking: None,
             },
             device,
         )

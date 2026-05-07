@@ -24,10 +24,10 @@ pub struct AutoencoderLossBreakdown<B: Backend> {
     pub masked: Tensor<B, 1>,
     /// Latent-consistency contribution to the total loss.
     pub consistency: Tensor<B, 1>,
-    /// Retention-order contribution to the total loss.
-    pub retention: Tensor<B, 1>,
     /// Synthetic intruder-peak detection contribution to the total loss.
     pub intruder: Tensor<B, 1>,
+    /// In-batch clean-spectrum similarity-ranking contribution to the total loss.
+    pub similarity_ranking: Tensor<B, 1>,
     /// Optional explicit model-parameter regularization contribution.
     pub regularization: Tensor<B, 1>,
 }
@@ -39,8 +39,8 @@ impl<B: Backend> AutoencoderLossBreakdown<B> {
             reconstruction: Tensor::zeros([1], device),
             masked: Tensor::zeros([1], device),
             consistency: Tensor::zeros([1], device),
-            retention: Tensor::zeros([1], device),
             intruder: Tensor::zeros([1], device),
+            similarity_ranking: Tensor::zeros([1], device),
             regularization: Tensor::zeros([1], device),
         }
     }
@@ -50,35 +50,26 @@ impl<B: Backend> AutoencoderLossBreakdown<B> {
         self.reconstruction.clone()
             + self.masked.clone()
             + self.consistency.clone()
-            + self.retention.clone()
             + self.intruder.clone()
+            + self.similarity_ranking.clone()
             + self.regularization.clone()
     }
 }
 
 /// Non-loss diagnostics reported to the TUI.
 pub struct AutoencoderDiagnostics<B: Backend> {
-    /// Unweighted retention-order binary cross-entropy.
-    pub retention_bce: Tensor<B, 1>,
-    /// Number of valid retention pairs contributing to the batch.
-    pub retention_pairs: Tensor<B, 1>,
-    /// Retention-order binary classification accuracy for valid pairs.
-    pub retention_accuracy: Tensor<B, 1>,
-    /// Standard deviation of retention-order logits for valid pairs.
-    pub retention_logit_std: Tensor<B, 1>,
-    /// Mean absolute retention-time gap for valid pairs.
-    pub retention_rt_gap: Tensor<B, 1>,
+    /// Number of valid similarity-ranking pairs contributing to the batch.
+    pub similarity_ranking_pairs: Tensor<B, 1>,
+    /// Latent-vs-target ordering accuracy over valid similarity-ranking pairs.
+    pub similarity_ranking_accuracy: Tensor<B, 1>,
 }
 
 impl<B: Backend> AutoencoderDiagnostics<B> {
     /// Returns zero-valued diagnostics.
     pub fn zeros(device: &B::Device) -> Self {
         Self {
-            retention_bce: Tensor::zeros([1], device),
-            retention_pairs: Tensor::zeros([1], device),
-            retention_accuracy: Tensor::zeros([1], device),
-            retention_logit_std: Tensor::zeros([1], device),
-            retention_rt_gap: Tensor::zeros([1], device),
+            similarity_ranking_pairs: Tensor::zeros([1], device),
+            similarity_ranking_accuracy: Tensor::zeros([1], device),
         }
     }
 }
@@ -139,11 +130,9 @@ impl<B: Backend> Adaptor<AutoencoderLossComponentsInput<B>> for AutoencoderTrain
             masked: self.losses.masked.clone(),
             consistency: self.losses.consistency.clone(),
             intruder: self.losses.intruder.clone(),
-            retention_bce: self.diagnostics.retention_bce.clone(),
-            retention_pairs: self.diagnostics.retention_pairs.clone(),
-            retention_accuracy: self.diagnostics.retention_accuracy.clone(),
-            retention_logit_std: self.diagnostics.retention_logit_std.clone(),
-            retention_rt_gap: self.diagnostics.retention_rt_gap.clone(),
+            similarity_ranking: self.losses.similarity_ranking.clone(),
+            similarity_ranking_pairs: self.diagnostics.similarity_ranking_pairs.clone(),
+            similarity_ranking_accuracy: self.diagnostics.similarity_ranking_accuracy.clone(),
         }
     }
 }
@@ -157,27 +146,21 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             reconstruction,
             masked,
             consistency,
-            retention,
             intruder,
+            similarity_ranking,
             regularization,
-            retention_bce,
-            retention_pairs,
-            retention_accuracy,
-            retention_logit_std,
-            retention_rt_gap,
+            similarity_ranking_pairs,
+            similarity_ranking_accuracy,
         ] = Transaction::default()
             .register(self.loss)
             .register(self.losses.reconstruction)
             .register(self.losses.masked)
             .register(self.losses.consistency)
-            .register(self.losses.retention)
             .register(self.losses.intruder)
+            .register(self.losses.similarity_ranking)
             .register(self.losses.regularization)
-            .register(self.diagnostics.retention_bce)
-            .register(self.diagnostics.retention_pairs)
-            .register(self.diagnostics.retention_accuracy)
-            .register(self.diagnostics.retention_logit_std)
-            .register(self.diagnostics.retention_rt_gap)
+            .register(self.diagnostics.similarity_ranking_pairs)
+            .register(self.diagnostics.similarity_ranking_accuracy)
             .execute()
             .try_into()
             .expect("Correct amount of tensor data");
@@ -191,16 +174,13 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
                 reconstruction: Tensor::from_data(reconstruction, device),
                 masked: Tensor::from_data(masked, device),
                 consistency: Tensor::from_data(consistency, device),
-                retention: Tensor::from_data(retention, device),
                 intruder: Tensor::from_data(intruder, device),
+                similarity_ranking: Tensor::from_data(similarity_ranking, device),
                 regularization: Tensor::from_data(regularization, device),
             },
             diagnostics: AutoencoderDiagnostics {
-                retention_bce: Tensor::from_data(retention_bce, device),
-                retention_pairs: Tensor::from_data(retention_pairs, device),
-                retention_accuracy: Tensor::from_data(retention_accuracy, device),
-                retention_logit_std: Tensor::from_data(retention_logit_std, device),
-                retention_rt_gap: Tensor::from_data(retention_rt_gap, device),
+                similarity_ranking_pairs: Tensor::from_data(similarity_ranking_pairs, device),
+                similarity_ranking_accuracy: Tensor::from_data(similarity_ranking_accuracy, device),
             },
         }
     }
@@ -213,11 +193,9 @@ pub struct AutoencoderLossComponentsInput<B: Backend> {
     masked: Tensor<B, 1>,
     consistency: Tensor<B, 1>,
     intruder: Tensor<B, 1>,
-    retention_bce: Tensor<B, 1>,
-    retention_pairs: Tensor<B, 1>,
-    retention_accuracy: Tensor<B, 1>,
-    retention_logit_std: Tensor<B, 1>,
-    retention_rt_gap: Tensor<B, 1>,
+    similarity_ranking: Tensor<B, 1>,
+    similarity_ranking_pairs: Tensor<B, 1>,
+    similarity_ranking_accuracy: Tensor<B, 1>,
 }
 
 /// A numeric TUI metric for one autoencoder loss component or diagnostic.
@@ -250,29 +228,24 @@ impl<B: Backend> AutoencoderLossComponentMetric<B> {
         Self::new(AutoencoderLossComponent::Consistency)
     }
 
-    /// Retention-order binary accuracy.
-    pub fn retention_accuracy() -> Self {
-        Self::new(AutoencoderLossComponent::RetentionAccuracy)
-    }
-
-    /// Unweighted retention-order binary cross-entropy.
-    pub fn retention_bce() -> Self {
-        Self::new(AutoencoderLossComponent::RetentionBce)
-    }
-
-    /// Retention-order logit standard deviation.
-    pub fn retention_logit_std() -> Self {
-        Self::new(AutoencoderLossComponent::RetentionLogitStd)
-    }
-
-    /// Mean absolute retention-time gap for valid retention pairs.
-    pub fn retention_rt_gap() -> Self {
-        Self::new(AutoencoderLossComponent::RetentionRtGap)
-    }
-
     /// Synthetic intruder-peak detection loss contribution.
     pub fn intruder() -> Self {
         Self::new(AutoencoderLossComponent::Intruder)
+    }
+
+    /// In-batch clean-spectrum similarity-ranking loss contribution.
+    pub fn similarity_ranking() -> Self {
+        Self::new(AutoencoderLossComponent::SimilarityRanking)
+    }
+
+    /// Number of valid similarity-ranking pairs.
+    pub fn similarity_ranking_pairs() -> Self {
+        Self::new(AutoencoderLossComponent::SimilarityRankingPairs)
+    }
+
+    /// Similarity-ranking latent-vs-target ordering accuracy.
+    pub fn similarity_ranking_accuracy() -> Self {
+        Self::new(AutoencoderLossComponent::SimilarityRankingAccuracy)
     }
 
     fn new(component: AutoencoderLossComponent) -> Self {
@@ -314,10 +287,13 @@ impl<B: Backend> Metric for AutoencoderLossComponentMetric<B> {
             AutoencoderLossComponent::Masked => item.masked.clone(),
             AutoencoderLossComponent::Consistency => item.consistency.clone(),
             AutoencoderLossComponent::Intruder => item.intruder.clone(),
-            AutoencoderLossComponent::RetentionBce => item.retention_bce.clone(),
-            AutoencoderLossComponent::RetentionAccuracy => item.retention_accuracy.clone(),
-            AutoencoderLossComponent::RetentionLogitStd => item.retention_logit_std.clone(),
-            AutoencoderLossComponent::RetentionRtGap => item.retention_rt_gap.clone(),
+            AutoencoderLossComponent::SimilarityRanking => item.similarity_ranking.clone(),
+            AutoencoderLossComponent::SimilarityRankingPairs => {
+                item.similarity_ranking_pairs.clone()
+            }
+            AutoencoderLossComponent::SimilarityRankingAccuracy => {
+                item.similarity_ranking_accuracy.clone()
+            }
         };
         let value = tensor
             .mean()
@@ -355,11 +331,10 @@ enum AutoencoderLossComponent {
     Reconstruction,
     Masked,
     Consistency,
-    RetentionBce,
-    RetentionAccuracy,
-    RetentionLogitStd,
-    RetentionRtGap,
     Intruder,
+    SimilarityRanking,
+    SimilarityRankingPairs,
+    SimilarityRankingAccuracy,
 }
 
 impl AutoencoderLossComponent {
@@ -369,11 +344,10 @@ impl AutoencoderLossComponent {
             Self::Reconstruction => "Reconstruction Loss",
             Self::Masked => "Masked Loss",
             Self::Consistency => "Consistency Loss",
-            Self::RetentionBce => "Retention BCE",
-            Self::RetentionAccuracy => "Retention Accuracy",
-            Self::RetentionLogitStd => "Retention Logit Std",
-            Self::RetentionRtGap => "Retention RT Gap",
             Self::Intruder => "Intruder Loss",
+            Self::SimilarityRanking => "Similarity Ranking Loss",
+            Self::SimilarityRankingPairs => "Similarity Ranking Pairs",
+            Self::SimilarityRankingAccuracy => "Similarity Ranking Accuracy",
         }
     }
 
@@ -383,29 +357,22 @@ impl AutoencoderLossComponent {
             Self::Reconstruction => "reconstruction",
             Self::Masked => "masked-peak",
             Self::Consistency => "latent-consistency",
-            Self::RetentionBce => "retention-order raw BCE",
-            Self::RetentionAccuracy => "retention-order accuracy",
-            Self::RetentionLogitStd => "retention-order logit standard deviation",
-            Self::RetentionRtGap => "retention-order mean retention-time gap",
             Self::Intruder => "intruder-peak detection",
+            Self::SimilarityRanking => "teacher similarity ranking",
+            Self::SimilarityRankingPairs => "teacher similarity-ranking valid pairs",
+            Self::SimilarityRankingAccuracy => "teacher similarity-ranking ordering accuracy",
         }
     }
 
     const fn higher_is_better(self) -> bool {
-        matches!(
-            self,
-            Self::RetentionAccuracy | Self::RetentionLogitStd | Self::RetentionRtGap
-        )
+        matches!(self, Self::SimilarityRankingAccuracy)
     }
 
     fn batch_size<B: Backend>(self, item: &AutoencoderLossComponentsInput<B>) -> usize {
         match self {
-            Self::RetentionBce
-            | Self::RetentionAccuracy
-            | Self::RetentionLogitStd
-            | Self::RetentionRtGap => {
-                metric_scalar(&item.retention_pairs).max(1.0).round() as usize
-            }
+            Self::SimilarityRankingAccuracy => metric_scalar(&item.similarity_ranking_pairs)
+                .max(1.0)
+                .round() as usize,
             _ => 1,
         }
     }
@@ -459,14 +426,20 @@ where
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::masked())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::consistency())
             .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::consistency())
-            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::retention_bce())
-            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::retention_bce())
-            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::retention_accuracy())
-            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::retention_accuracy())
-            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::retention_logit_std())
-            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::retention_logit_std())
-            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::retention_rt_gap())
-            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::retention_rt_gap())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::intruder())
+            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::similarity_ranking())
+            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::similarity_ranking())
+            .metric_train_numeric(
+                AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_pairs(),
+            )
+            .metric_valid_numeric(
+                AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_pairs(),
+            )
+            .metric_train_numeric(
+                AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_accuracy(),
+            )
+            .metric_valid_numeric(
+                AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_accuracy(),
+            )
     }
 }

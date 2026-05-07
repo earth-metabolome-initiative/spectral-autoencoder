@@ -13,15 +13,15 @@ mod app {
         train::{Learner, SupervisedTraining},
     };
     use spectral_autoencoder::{
-        AutoencoderTrainingMetricsExt, ConditioningEncoder, SpectralAutoencoderConfig,
-        SpectrumAugmentationConfig, SpectrumVectorizer, VectorizedMgfIter,
-        vectorized_mgf_paths_iter,
+        AutoencoderTrainingMetricsExt, ConditioningEncoder, SpectrumAugmentationConfig,
+        SpectrumVectorizer, SpectrumVectorizerConfig, VectorizedMgfIter, vectorized_mgf_paths_iter,
     };
 
     use crate::gems_common::{
-        GeMSProgress, InnerBackend, RunArgs, TrainingBackend, augmentation_config_from_env,
-        auxiliary_loss_config_from_env, cached_vectorized_loader, print_run_header,
-        save_model_record, warm_start_model,
+        CachedTrainingLoaderConfig, GeMSProgress, InnerBackend, RunArgs, TrainingBackend,
+        augmentation_config_from_env, auxiliary_loss_config_from_env, cached_vectorized_loader,
+        flat_vector_config_from_env, print_run_header, save_model_record,
+        similarity_teacher_config_from_env, warm_start_model,
     };
 
     const FLAT_CACHE_DEFAULT_PERCENT: f64 = 100.0;
@@ -39,29 +39,44 @@ mod app {
         let device = burn::backend::cuda::CudaDevice::new(args.device);
         let augmentation =
             augmentation_config_from_env(SpectrumAugmentationConfig::masked_mz_pretraining());
+        let vectorizer_config = SpectrumVectorizerConfig {
+            max_peaks: args.max_peaks,
+            ..SpectrumVectorizerConfig::default()
+        };
+        let config = flat_vector_config_from_env(args.max_peaks)?;
+        let auxiliary = auxiliary_loss_config_from_env(config.auxiliary);
+        let similarity_teacher = similarity_teacher_config_from_env(auxiliary)?;
+        let train_loader_config = CachedTrainingLoaderConfig::new(
+            args.train_gpu_cache_percent(FLAT_CACHE_DEFAULT_PERCENT),
+            similarity_teacher,
+        );
+        let valid_loader_config = CachedTrainingLoaderConfig::new(
+            args.valid_gpu_cache_percent(FLAT_CACHE_DEFAULT_PERCENT),
+            similarity_teacher,
+        );
         let train_records_paths = args.mgf_paths.clone();
+        let train_vectorizer_config = vectorizer_config.clone();
         let train_loader = cached_vectorized_loader::<TrainingBackend, _>(
             &args,
             device.clone(),
             progress.train.clone(),
             args.train_start_item(),
             Some(augmentation),
-            args.train_gpu_cache_percent(FLAT_CACHE_DEFAULT_PERCENT),
-            move || open_records(&train_records_paths),
+            train_loader_config,
+            move || open_records(&train_records_paths, train_vectorizer_config.clone()),
         );
         let valid_records_paths = args.mgf_paths.clone();
+        let valid_vectorizer_config = vectorizer_config.clone();
         let valid_loader = cached_vectorized_loader::<InnerBackend, _>(
             &args,
             device.clone(),
             progress.valid.clone(),
             args.valid_start_item(),
             None,
-            args.valid_gpu_cache_percent(FLAT_CACHE_DEFAULT_PERCENT),
-            move || open_records(&valid_records_paths),
+            valid_loader_config,
+            move || open_records(&valid_records_paths, valid_vectorizer_config.clone()),
         );
 
-        let config = SpectralAutoencoderConfig::twenty_million_run();
-        let auxiliary = auxiliary_loss_config_from_env(config.auxiliary);
         let config = config.with_auxiliary(auxiliary);
         let model = config.init::<TrainingBackend>(&device);
         let model = warm_start_model::<TrainingBackend, _>(
@@ -83,6 +98,8 @@ mod app {
             parameter_count,
             FLAT_CACHE_DEFAULT_PERCENT,
             auxiliary,
+            similarity_teacher,
+            Some(config.reconstruction_ordering),
         );
         progress.start_training("starting GeMS flat-vector cached training");
         let training = SupervisedTraining::new(&args.output_dir, train_loader, valid_loader)
@@ -113,10 +130,11 @@ mod app {
 
     fn open_records(
         paths: &[std::path::PathBuf],
+        vectorizer_config: SpectrumVectorizerConfig,
     ) -> spectral_autoencoder::Result<VectorizedMgfIter> {
         vectorized_mgf_paths_iter(
             paths,
-            SpectrumVectorizer::default(),
+            SpectrumVectorizer::new(vectorizer_config),
             ConditioningEncoder::default(),
         )
     }

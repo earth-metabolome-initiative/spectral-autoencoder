@@ -12,26 +12,33 @@ use crate::{
     model::RegularizationConfig,
     model::auxiliary::{
         AuxiliaryLossConfig, EmbeddingAuxiliaryHeads, EmbeddingAuxiliaryHeadsConfig,
-        RetentionOrderBatch, apply_latent_noise, weighted_cosine_distance_loss,
-        weighted_intruder_detection_loss, weighted_retention_order_output,
     },
     model::reconstruction::{
-        SetReconstructionLossConfig, set_reconstruction_loss_from_vectors,
-        set_reconstruction_loss_from_vectors_with_mask, vector_element_mask_to_peak_mask,
-        vector_target_mask,
+        FlatVectorReconstructionOrdering, SetReconstructionLossConfig,
+        flat_vector_reconstruction_loss_from_vectors,
     },
     vectorize::SpectrumVectorizerConfig,
 };
 
 #[cfg(feature = "train")]
-use crate::training::{AutoencoderDiagnostics, AutoencoderLossBreakdown};
+use crate::{
+    model::auxiliary::{
+        apply_latent_noise, weighted_cosine_distance_loss, weighted_intruder_detection_loss,
+        weighted_similarity_ranking_output,
+    },
+    model::reconstruction::{
+        flat_vector_reconstruction_loss_from_vectors_with_mask, vector_element_mask_to_peak_mask,
+        vector_target_mask,
+    },
+    training::{AutoencoderDiagnostics, AutoencoderLossBreakdown},
+};
 
 /// Encoder model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncoderConfig {
     /// Width of the vectorized spectrum.
     pub spectrum_width: usize,
-    /// Width of the metadata conditioning vector.
+    /// Width of the encoder-side metadata conditioning vector.
     pub condition_width: usize,
     /// Hidden layer widths.
     pub hidden_widths: Vec<usize>,
@@ -62,7 +69,10 @@ impl EncoderConfig {
 pub struct DecoderConfig {
     /// Width of the latent embedding.
     pub latent_width: usize,
-    /// Width of the metadata conditioning vector.
+    /// Width of the decoder-side metadata conditioning vector.
+    ///
+    /// The diffusion-oriented default is zero so the decoder reconstructs from
+    /// the latent embedding alone.
     pub condition_width: usize,
     /// Hidden layer widths.
     pub hidden_widths: Vec<usize>,
@@ -84,6 +94,7 @@ impl DecoderConfig {
             layers,
             output: LinearConfig::new(input_width, self.spectrum_width).init(device),
             activation: Relu::new(),
+            condition_width: self.condition_width,
         }
     }
 }
@@ -98,10 +109,13 @@ pub struct SpectralAutoencoderConfig {
     /// Set reconstruction loss configuration.
     #[serde(default)]
     pub loss: SetReconstructionLossConfig,
+    /// How flat-vector peaks are aligned before reconstruction loss.
+    #[serde(default)]
+    pub reconstruction_ordering: FlatVectorReconstructionOrdering,
     /// L1/L2 model-parameter regularization.
     #[serde(default)]
     pub regularization: RegularizationConfig,
-    /// Auxiliary denoising, consistency, and retention-order objectives.
+    /// Auxiliary denoising, consistency, intruder, and similarity-ranking objectives.
     #[serde(default)]
     pub auxiliary: AuxiliaryLossConfig,
 }
@@ -109,18 +123,28 @@ pub struct SpectralAutoencoderConfig {
 impl SpectralAutoencoderConfig {
     /// Starting flat-vector baseline configuration for the 20M-spectrum run.
     ///
-    /// This intentionally remains a compressive baseline over the default 60
-    /// peak `(m/z, intensity)` pairs. The raw flat input has 120 spectral
-    /// values plus 16 conditioning values, so the latent width is kept below
-    /// that input width rather than mirroring transformer-scale embeddings.
+    /// This intentionally remains a compressive baseline over top-N
+    /// `(m/z, intensity)` pairs. The latent width is kept compact rather than
+    /// mirroring transformer-scale embeddings.
     #[must_use]
     pub fn twenty_million_run() -> Self {
+        Self::twenty_million_run_with_peaks(SpectrumVectorizerConfig::default().max_peaks)
+    }
+
+    /// Starting flat-vector baseline configuration for a top-N GeMS run.
+    #[must_use]
+    pub fn twenty_million_run_with_peaks(max_peaks: usize) -> Self {
         Self::symmetric(
-            SpectrumVectorizerConfig::default().vector_width(),
+            SpectrumVectorizerConfig {
+                max_peaks,
+                ..SpectrumVectorizerConfig::default()
+            }
+            .vector_width(),
             ConditioningConfig::default().vector_width(),
-            64,
+            96,
             vec![2048, 1024, 512, 256],
         )
+        .with_reconstruction_ordering(FlatVectorReconstructionOrdering::IntensityDescending)
     }
 
     /// Creates a symmetric deterministic autoencoder configuration.
@@ -131,22 +155,42 @@ impl SpectralAutoencoderConfig {
         latent_width: usize,
         hidden_widths: Vec<usize>,
     ) -> Self {
+        Self::symmetric_with_decoder_conditioning(
+            spectrum_width,
+            condition_width,
+            0,
+            latent_width,
+            hidden_widths,
+        )
+    }
+
+    /// Creates a symmetric deterministic autoencoder configuration with
+    /// explicit encoder and decoder conditioning widths.
+    #[must_use]
+    pub fn symmetric_with_decoder_conditioning(
+        spectrum_width: usize,
+        encoder_condition_width: usize,
+        decoder_condition_width: usize,
+        latent_width: usize,
+        hidden_widths: Vec<usize>,
+    ) -> Self {
         let mut decoder_hidden = hidden_widths.clone();
         decoder_hidden.reverse();
         Self {
             encoder: EncoderConfig {
                 spectrum_width,
-                condition_width,
+                condition_width: encoder_condition_width,
                 hidden_widths,
                 latent_width,
             },
             decoder: DecoderConfig {
                 latent_width,
-                condition_width,
+                condition_width: decoder_condition_width,
                 hidden_widths: decoder_hidden,
                 spectrum_width,
             },
             loss: SetReconstructionLossConfig::default(),
+            reconstruction_ordering: FlatVectorReconstructionOrdering::Slot,
             regularization: RegularizationConfig::default(),
             auxiliary: AuxiliaryLossConfig::default(),
         }
@@ -166,6 +210,16 @@ impl SpectralAutoencoderConfig {
         self
     }
 
+    /// Sets how flat-vector peaks are aligned before reconstruction loss.
+    #[must_use]
+    pub const fn with_reconstruction_ordering(
+        mut self,
+        ordering: FlatVectorReconstructionOrdering,
+    ) -> Self {
+        self.reconstruction_ordering = ordering;
+        self
+    }
+
     /// Creates an initialized autoencoder.
     pub fn init<B: Backend>(&self, device: &B::Device) -> SpectralAutoencoder<B> {
         SpectralAutoencoder {
@@ -174,7 +228,6 @@ impl SpectralAutoencoderConfig {
             auxiliary_heads: EmbeddingAuxiliaryHeadsConfig {
                 latent_width: self.encoder.latent_width,
                 max_peaks: self.encoder.spectrum_width / 2,
-                retention_hidden_width: self.auxiliary.retention_hidden_width,
                 intruder_hidden_width: self.auxiliary.intruder_hidden_width,
             }
             .init(device),
@@ -182,15 +235,18 @@ impl SpectralAutoencoderConfig {
             loss_mz_power: self.loss.mz_power,
             loss_intensity_power: self.loss.intensity_power,
             count_weight: self.loss.count_weight,
+            reconstruction_ordering: self.reconstruction_ordering.code(),
             regularization_l1: self.regularization.l1,
             regularization_l2: self.regularization.l2,
             reconstruction_weight: self.auxiliary.reconstruction_weight,
             masked_peak_weight: self.auxiliary.masked_peak_weight,
             consistency_weight: self.auxiliary.consistency_weight,
-            retention_order_weight: self.auxiliary.retention_order_weight,
             intruder_peak_weight: self.auxiliary.intruder_peak_weight,
+            similarity_ranking_weight: self.auxiliary.similarity_ranking_weight,
+            similarity_ranking_margin: self.auxiliary.similarity_ranking_margin,
+            similarity_ranking_min_gap: self.auxiliary.similarity_ranking_min_gap,
             latent_noise_std: self.auxiliary.latent_noise_std,
-            retention_pairs_per_batch: self.auxiliary.retention_pairs_per_batch,
+            similarity_ranking_pairs_per_batch: self.auxiliary.similarity_ranking_pairs_per_batch,
         }
     }
 }
@@ -220,12 +276,34 @@ pub struct Decoder<B: Backend> {
     layers: Vec<Linear<B>>,
     output: Linear<B>,
     activation: Relu,
+    condition_width: usize,
 }
 
 impl<B: Backend> Decoder<B> {
-    /// Decodes a latent representation with the decoder-side conditions.
-    pub fn forward(&self, latent: Tensor<B, 2>, conditions: Tensor<B, 2>) -> Tensor<B, 2> {
-        let mut features = Tensor::cat(vec![latent, conditions], 1);
+    /// Decodes a latent representation without direct metadata conditioning.
+    pub fn forward(&self, latent: Tensor<B, 2>) -> Tensor<B, 2> {
+        assert_eq!(
+            self.condition_width, 0,
+            "Decoder::forward requires a zero-width decoder condition configuration"
+        );
+        self.forward_features(latent)
+    }
+
+    /// Decodes a latent representation with explicit decoder-side conditions.
+    pub fn forward_with_conditions(
+        &self,
+        latent: Tensor<B, 2>,
+        conditions: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
+        let [_batch_size, condition_width] = conditions.dims();
+        assert_eq!(
+            condition_width, self.condition_width,
+            "decoder condition tensor width does not match the decoder configuration"
+        );
+        self.forward_features(Tensor::cat(vec![latent, conditions], 1))
+    }
+
+    fn forward_features(&self, mut features: Tensor<B, 2>) -> Tensor<B, 2> {
         for layer in &self.layers {
             features = self.activation.forward(layer.forward(features));
         }
@@ -253,15 +331,18 @@ pub struct SpectralAutoencoder<B: Backend> {
     loss_mz_power: f64,
     loss_intensity_power: f64,
     count_weight: f64,
+    reconstruction_ordering: usize,
     regularization_l1: f64,
     regularization_l2: f64,
     reconstruction_weight: f64,
     masked_peak_weight: f64,
     consistency_weight: f64,
-    retention_order_weight: f64,
     intruder_peak_weight: f64,
+    similarity_ranking_weight: f64,
+    similarity_ranking_margin: f64,
+    similarity_ranking_min_gap: f64,
     latent_noise_std: f64,
-    retention_pairs_per_batch: usize,
+    similarity_ranking_pairs_per_batch: usize,
 }
 
 impl<B: Backend> SpectralAutoencoder<B> {
@@ -283,15 +364,32 @@ impl<B: Backend> SpectralAutoencoder<B> {
 
     /// Runs the full autoencoder.
     pub fn forward(&self, spectra: Tensor<B, 2>, conditions: Tensor<B, 2>) -> AutoencoderOutput<B> {
-        let latent = self.encoder.forward(spectra, conditions.clone());
-        let reconstruction = self.decoder.forward(latent.clone(), conditions);
+        let latent = self.encoder.forward(spectra, conditions);
+        let reconstruction = self.decoder.forward(latent.clone());
         AutoencoderOutput {
             latent,
             reconstruction,
         }
     }
 
-    /// Computes set-wise spectral reconstruction loss on cleaned spectrum vectors.
+    /// Runs the full autoencoder with explicit decoder-side conditions.
+    pub fn forward_with_decoder_conditions(
+        &self,
+        spectra: Tensor<B, 2>,
+        encoder_conditions: Tensor<B, 2>,
+        decoder_conditions: Tensor<B, 2>,
+    ) -> AutoencoderOutput<B> {
+        let latent = self.encoder.forward(spectra, encoder_conditions);
+        let reconstruction = self
+            .decoder
+            .forward_with_conditions(latent.clone(), decoder_conditions);
+        AutoencoderOutput {
+            latent,
+            reconstruction,
+        }
+    }
+
+    /// Computes ordered slot-wise spectral reconstruction loss on cleaned spectrum vectors.
     pub fn reconstruction_loss(
         &self,
         reconstruction: Tensor<B, 2>,
@@ -307,7 +405,12 @@ impl<B: Backend> SpectralAutoencoder<B> {
         reconstruction: Tensor<B, 2>,
         target: Tensor<B, 2>,
     ) -> Tensor<B, 1> {
-        set_reconstruction_loss_from_vectors(reconstruction, target, self.loss_config())
+        flat_vector_reconstruction_loss_from_vectors(
+            reconstruction,
+            target,
+            self.loss_config(),
+            FlatVectorReconstructionOrdering::from_code(self.reconstruction_ordering),
+        )
     }
 
     #[cfg(feature = "train")]
@@ -323,9 +426,7 @@ impl<B: Backend> SpectralAutoencoder<B> {
     ) {
         let target = batch.target_spectra.clone();
         let input_peak_mask = vector_target_mask(batch.spectra.clone());
-        let latent = self
-            .encoder
-            .forward(batch.spectra, batch.conditions.clone());
+        let latent = self.encoder.forward(batch.spectra, batch.conditions);
         let decoder_latent = if use_latent_noise {
             apply_latent_noise(latent.clone(), self.latent_noise_std)
         } else {
@@ -333,7 +434,7 @@ impl<B: Backend> SpectralAutoencoder<B> {
         };
         let output = AutoencoderOutput {
             latent,
-            reconstruction: self.decoder.forward(decoder_latent, batch.conditions),
+            reconstruction: self.decoder.forward(decoder_latent),
         };
         let device = output.reconstruction.device();
 
@@ -345,11 +446,12 @@ impl<B: Backend> SpectralAutoencoder<B> {
             let masked_target_mask = target_peak_mask.clone()
                 * vector_element_mask_to_peak_mask(batch.masked_spectra_mask);
             let has_masked_targets = masked_target_mask.clone().sum().greater_elem(0.0).float();
-            set_reconstruction_loss_from_vectors_with_mask(
+            flat_vector_reconstruction_loss_from_vectors_with_mask(
                 output.reconstruction.clone(),
                 target.clone(),
                 masked_target_mask,
                 self.loss_config(),
+                FlatVectorReconstructionOrdering::from_code(self.reconstruction_ordering),
             ) * has_masked_targets
                 * self.masked_peak_weight
         } else {
@@ -364,39 +466,32 @@ impl<B: Backend> SpectralAutoencoder<B> {
             self.consistency_weight,
             &device,
         );
-        let retention = weighted_retention_order_output(
-            &self.auxiliary_heads,
-            output.latent.clone(),
-            RetentionOrderBatch {
-                retention_time: batch.retention_time,
-                retention_present: batch.retention_present,
-                filename_id: batch.filename_id,
-                partner_index: batch.retention_partner_index,
-            },
-            self.retention_pairs_per_batch,
-            self.retention_order_weight,
-        );
         let intruder = weighted_intruder_detection_loss(
             &self.auxiliary_heads,
             output.latent.clone(),
             batch.intruder_peak_mask,
-            input_peak_mask,
+            input_peak_mask.clone(),
             self.intruder_peak_weight,
+        );
+        let similarity_ranking = weighted_similarity_ranking_output(
+            output.latent.clone(),
+            batch.similarity_ranking,
+            self.similarity_ranking_pairs_per_batch,
+            self.similarity_ranking_margin,
+            self.similarity_ranking_min_gap,
+            self.similarity_ranking_weight,
         );
         let regularization = self.regularization_config().penalty(self, &device);
         let diagnostics = AutoencoderDiagnostics {
-            retention_bce: retention.raw_loss,
-            retention_pairs: retention.valid_pairs,
-            retention_accuracy: retention.accuracy,
-            retention_logit_std: retention.logit_std,
-            retention_rt_gap: retention.mean_rt_delta,
+            similarity_ranking_pairs: similarity_ranking.valid_pairs,
+            similarity_ranking_accuracy: similarity_ranking.accuracy,
         };
         let losses = AutoencoderLossBreakdown {
             reconstruction,
             masked,
             consistency,
-            retention: retention.loss,
             intruder,
+            similarity_ranking: similarity_ranking.loss,
             regularization,
         };
 
@@ -476,6 +571,10 @@ mod tests {
         );
 
         let output = model.forward(batch.spectra, batch.conditions);
+        assert_eq!(
+            config.reconstruction_ordering,
+            FlatVectorReconstructionOrdering::Slot
+        );
         assert_eq!(output.latent.dims(), [1, 32]);
         assert_eq!(output.reconstruction.dims(), [1, 120]);
     }
@@ -489,17 +588,36 @@ mod tests {
 
         assert_eq!(config.encoder.spectrum_width, 120);
         assert_eq!(config.encoder.condition_width, 16);
-        assert_eq!(config.encoder.latent_width, 64);
+        assert_eq!(config.decoder.condition_width, 0);
+        assert_eq!(config.encoder.latent_width, 96);
         assert_eq!(config.encoder.hidden_widths, vec![2048, 1024, 512, 256]);
         assert_eq!(config.decoder.hidden_widths, vec![256, 512, 1024, 2048]);
+        assert_eq!(
+            config.reconstruction_ordering,
+            FlatVectorReconstructionOrdering::IntensityDescending
+        );
         assert_eq!(config.regularization.l1, 0.0);
         assert_eq!(config.regularization.l2, 0.0);
         assert_eq!(config.auxiliary.masked_peak_weight, 0.25);
         assert_eq!(config.auxiliary.consistency_weight, 0.05);
-        assert_eq!(config.auxiliary.retention_order_weight, 0.2);
         assert_eq!(config.auxiliary.intruder_peak_weight, 0.05);
+        assert_eq!(config.auxiliary.similarity_ranking_weight, 0.05);
         assert_eq!(config.auxiliary.latent_noise_std, 0.02);
-        assert_eq!(model.num_params(), 6_098_618);
+        assert_eq!(model.num_params(), 6_106_585);
+    }
+
+    #[test]
+    fn twenty_million_run_config_accepts_larger_peak_counts() {
+        let config = SpectralAutoencoderConfig::twenty_million_run_with_peaks(128);
+
+        assert_eq!(config.encoder.spectrum_width, 256);
+        assert_eq!(config.decoder.spectrum_width, 256);
+        assert_eq!(config.decoder.condition_width, 0);
+        assert_eq!(config.encoder.latent_width, 96);
+        assert_eq!(
+            config.reconstruction_ordering,
+            FlatVectorReconstructionOrdering::IntensityDescending
+        );
     }
 
     #[test]

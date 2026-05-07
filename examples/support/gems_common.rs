@@ -22,20 +22,39 @@ use burn::{
     tensor::{Bool, Distribution, Int, Tensor, TensorData, backend::Backend},
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use mascot_rs::prelude::{GEMS_A10_TOP_60_ZENODO_DOI, GemsA10Builder, MGFVec};
+use mascot_rs::prelude::{
+    GEMS_A10_TOP_60_ZENODO_DOI, GEMS_A10_TOP_128_ZENODO_DOI, GemsA10Builder, MGFVec,
+};
+use mass_spectrometry::prelude::{LinearCosine, LinearEntropy, ScalarSimilarity, Spectrum};
+#[cfg(feature = "cuda")]
+use spectral_autoencoder::linear_cosine_cuda::{
+    LinearCosineKernelBackend, LinearCosineKernelConfig, linear_cosine_preprocessed_paired_kernel,
+};
 use spectral_autoencoder::{
-    AutoencoderBatch, AutoencoderSample, AuxiliaryLossConfig, SpectrumAugmentationConfig,
-    TokenizedAutoencoderBatch, TokenizedAutoencoderSample, TokenizedMgfIter, VectorizedMgfIter,
-    retention_partner_indices_with_seed,
+    AutoencoderBatch, AutoencoderSample, AuxiliaryLossConfig, FlatVectorReconstructionOrdering,
+    SimilarityRankingBatch, SpectralAutoencoderConfig, SpectralMetricConfig,
+    SpectrumAugmentationConfig, TokenizedAutoencoderBatch, TokenizedAutoencoderSample,
+    TokenizedMgfIter, VectorizedMgfIter,
 };
 
 pub type InnerBackend = Cuda<f32, i32>;
 pub type TrainingBackend = Autodiff<InnerBackend>;
 
+#[cfg(feature = "cuda")]
+pub trait SimilarityTeacherBackend: Backend + LinearCosineKernelBackend {}
+#[cfg(feature = "cuda")]
+impl<B> SimilarityTeacherBackend for B where B: Backend + LinearCosineKernelBackend {}
+
+#[cfg(not(feature = "cuda"))]
+pub trait SimilarityTeacherBackend: Backend {}
+#[cfg(not(feature = "cuda"))]
+impl<B> SimilarityTeacherBackend for B where B: Backend {}
+
 #[derive(Debug, Clone)]
 pub struct RunArgs {
     pub mgf_source: String,
     pub mgf_paths: Vec<PathBuf>,
+    pub max_peaks: usize,
     pub output_dir: PathBuf,
     pub device: usize,
     pub batch_size: usize,
@@ -54,7 +73,8 @@ impl RunArgs {
         default_output_dir: &str,
         default_batch_size: usize,
     ) -> Result<Self, Box<dyn StdError>> {
-        let (mgf_source, mgf_paths) = resolve_mascot_gems_a10_paths()?;
+        let max_peaks = usize_var("GEMS_MAX_PEAKS", 128);
+        let (mgf_source, mgf_paths) = resolve_mascot_gems_a10_paths(max_peaks)?;
         let resume_epoch = optional_usize_var("GEMS_RESUME_EPOCH");
         if resume_epoch == Some(0) {
             return Err(io::Error::new(
@@ -83,6 +103,7 @@ impl RunArgs {
         Ok(Self {
             mgf_source,
             mgf_paths,
+            max_peaks,
             output_dir: path_var("GEMS_RUN_DIR", default_output_dir),
             device: usize_var("GEMS_CUDA_DEVICE", 0),
             batch_size: usize_var("GEMS_BATCH_SIZE", default_batch_size),
@@ -130,10 +151,26 @@ impl RunArgs {
     }
 }
 
-fn resolve_mascot_gems_a10_paths() -> Result<(String, Vec<PathBuf>), Box<dyn StdError>> {
-    let target_directory = path_var("GEMS_A10_DIR", "datasets/gems-a10-top-60-peaks");
+fn resolve_mascot_gems_a10_paths(
+    max_peaks: usize,
+) -> Result<(String, Vec<PathBuf>), Box<dyn StdError>> {
+    let default_directory = format!("datasets/gems-a10-top-{max_peaks}-peaks");
+    let target_directory = env::var_os("GEMS_A10_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&default_directory));
     let force_download = bool_var("GEMS_A10_FORCE_DOWNLOAD", false);
-    let mut builder = MGFVec::<usize, f64>::gems_a10_top_60_peaks()
+    let builder = match max_peaks {
+        60 => MGFVec::<f64>::gems_a10_top_60_peaks(),
+        128 => MGFVec::<f64>::gems_a10_top_128_peaks(),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("GEMS_MAX_PEAKS={other} is unsupported; use 60 or 128"),
+            )
+            .into());
+        }
+    };
+    let mut builder = builder
         .target_directory(&target_directory)
         .force_download(force_download);
     if let Some(parts) = gems_a10_parts_from_env()? {
@@ -148,9 +185,14 @@ fn resolve_mascot_gems_a10_paths() -> Result<(String, Vec<PathBuf>), Box<dyn Std
 
     ensure_mascot_gems_a10_files(&builder, force_download)?;
     let paths = builder.paths();
+    let doi = match max_peaks {
+        60 => GEMS_A10_TOP_60_ZENODO_DOI,
+        128 => GEMS_A10_TOP_128_ZENODO_DOI,
+        _ => unreachable!("unsupported GeMS peak count should already be rejected"),
+    };
     Ok((
         format!(
-            "mascot-rs GeMS-A10 top-60 {GEMS_A10_TOP_60_ZENODO_DOI} ({} files in {})",
+            "mascot-rs GeMS-A10 top-{max_peaks} {doi} ({} files in {})",
             paths.len(),
             target_directory.display()
         ),
@@ -241,10 +283,13 @@ pub fn print_run_header(
     parameter_count: usize,
     cache_default_percent: f64,
     auxiliary: AuxiliaryLossConfig,
+    similarity_teacher: SimilarityTeacherConfig,
+    flat_reconstruction_ordering: Option<FlatVectorReconstructionOrdering>,
 ) {
     println!("GeMS {model_name} cached-window training");
     println!("mgf source: {}", args.mgf_source);
     println!("mgf files: {}", args.mgf_paths.len());
+    println!("max peaks: {}", args.max_peaks);
     if let Some(first_path) = args.mgf_paths.first() {
         println!("mgf first: {}", first_path.display());
     }
@@ -289,20 +334,65 @@ pub fn print_run_header(
         args.valid_gpu_cache_percent(cache_default_percent)
     );
     println!("model parameters: {parameter_count}");
+    if let Some(ordering) = flat_reconstruction_ordering {
+        println!("flat reconstruction ordering: {}", ordering.label());
+    }
+    println!("similarity teacher: {}", similarity_teacher.summary());
     println!(
-        "auxiliary losses: reconstruction {} masked {} consistency {} retention {} intruder {} latent-noise-std {} retention-pairs/batch {}",
+        "auxiliary losses: reconstruction {} masked {} consistency {} intruder {} similarity-ranking {} latent-noise-std {} similarity-ranking-pairs/batch {}",
         auxiliary.reconstruction_weight,
         auxiliary.masked_peak_weight,
         auxiliary.consistency_weight,
-        auxiliary.retention_order_weight,
         auxiliary.intruder_peak_weight,
+        auxiliary.similarity_ranking_weight,
         auxiliary.latent_noise_std,
-        if auxiliary.retention_pairs_per_batch == 0 {
+        if auxiliary.similarity_ranking_pairs_per_batch == 0 {
             "all".to_string()
         } else {
-            auxiliary.retention_pairs_per_batch.to_string()
+            auxiliary.similarity_ranking_pairs_per_batch.to_string()
         }
     );
+}
+
+#[allow(dead_code)]
+pub fn flat_vector_config_from_env(
+    max_peaks: usize,
+) -> Result<SpectralAutoencoderConfig, Box<dyn StdError>> {
+    let mut config = SpectralAutoencoderConfig::twenty_million_run_with_peaks(max_peaks);
+    let latent_width = usize_var("GEMS_FLAT_LATENT_WIDTH", config.encoder.latent_width);
+    let hidden_widths = usize_list_var("GEMS_FLAT_HIDDEN_WIDTHS", &config.encoder.hidden_widths)?;
+
+    config.encoder.latent_width = latent_width;
+    config.decoder.latent_width = latent_width;
+    config.encoder.hidden_widths = hidden_widths.clone();
+    config.decoder.hidden_widths = hidden_widths.into_iter().rev().collect();
+    config.reconstruction_ordering =
+        flat_reconstruction_ordering_from_env(config.reconstruction_ordering)?;
+    Ok(config)
+}
+
+#[allow(dead_code)]
+fn flat_reconstruction_ordering_from_env(
+    default: FlatVectorReconstructionOrdering,
+) -> Result<FlatVectorReconstructionOrdering, Box<dyn StdError>> {
+    let value = env::var("GEMS_FLAT_RECONSTRUCTION_ORDERING")
+        .unwrap_or_else(|_| default.label().to_string())
+        .to_ascii_lowercase();
+    match value.as_str() {
+        "slot" | "slots" | "strict" | "slot-wise" | "slot_wise" => {
+            Ok(FlatVectorReconstructionOrdering::Slot)
+        }
+        "intensity"
+        | "intensity-desc"
+        | "intensity_desc"
+        | "intensity-descending"
+        | "intensity_descending" => Ok(FlatVectorReconstructionOrdering::IntensityDescending),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "GEMS_FLAT_RECONSTRUCTION_ORDERING must be slot or intensity-desc",
+        )
+        .into()),
+    }
 }
 
 pub fn auxiliary_loss_config_from_env(default: AuxiliaryLossConfig) -> AuxiliaryLossConfig {
@@ -313,24 +403,262 @@ pub fn auxiliary_loss_config_from_env(default: AuxiliaryLossConfig) -> Auxiliary
         ),
         masked_peak_weight: f64_var("GEMS_AUX_MASKED_WEIGHT", default.masked_peak_weight),
         consistency_weight: f64_var("GEMS_AUX_CONSISTENCY_WEIGHT", default.consistency_weight),
-        retention_order_weight: f64_var(
-            "GEMS_AUX_RETENTION_WEIGHT",
-            default.retention_order_weight,
-        ),
         intruder_peak_weight: f64_var("GEMS_AUX_INTRUDER_WEIGHT", default.intruder_peak_weight),
-        latent_noise_std: f64_var("GEMS_LATENT_NOISE_STD", default.latent_noise_std),
-        retention_pairs_per_batch: usize_var(
-            "GEMS_RETENTION_PAIRS_PER_BATCH",
-            default.retention_pairs_per_batch,
+        similarity_ranking_weight: f64_var(
+            "GEMS_AUX_SIMILARITY_RANKING_WEIGHT",
+            default.similarity_ranking_weight,
         ),
-        retention_hidden_width: usize_var(
-            "GEMS_RETENTION_HIDDEN_WIDTH",
-            default.retention_hidden_width,
+        similarity_ranking_margin: f64_var(
+            "GEMS_SIMILARITY_RANKING_MARGIN",
+            default.similarity_ranking_margin,
+        ),
+        similarity_ranking_min_gap: f64_var(
+            "GEMS_SIMILARITY_RANKING_MIN_GAP",
+            default.similarity_ranking_min_gap,
+        ),
+        latent_noise_std: f64_var("GEMS_LATENT_NOISE_STD", default.latent_noise_std),
+        similarity_ranking_pairs_per_batch: usize_var(
+            "GEMS_SIMILARITY_RANKING_PAIRS_PER_BATCH",
+            default.similarity_ranking_pairs_per_batch,
         ),
         intruder_hidden_width: usize_var(
             "GEMS_INTRUDER_HIDDEN_WIDTH",
             default.intruder_hidden_width,
         ),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SimilarityTeacherConfig {
+    enabled: bool,
+    metric: SimilarityTeacherMetric,
+    execution: SimilarityTeacherExecution,
+    mz_tolerance: f64,
+    max_mz: f64,
+    cosine_mz_power: f64,
+    cosine_intensity_power: f64,
+    entropy_mz_power: f64,
+    entropy_intensity_power: f64,
+    weighted_entropy: bool,
+    candidates_per_anchor: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimilarityTeacherExecution {
+    Cpu,
+    Cuda,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimilarityTeacherMetric {
+    LinearCosine,
+    LinearEntropy,
+}
+
+impl SimilarityTeacherMetric {
+    fn from_env() -> Result<Self, Box<dyn StdError>> {
+        let value = env::var("GEMS_SIMILARITY_RANKING_METRIC")
+            .unwrap_or_else(|_| "linear-cosine".to_string())
+            .to_ascii_lowercase();
+        match value.as_str() {
+            "cosine" | "linear-cosine" | "linear_cosine" => Ok(Self::LinearCosine),
+            "entropy" | "linear-entropy" | "linear_entropy" => Ok(Self::LinearEntropy),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GEMS_SIMILARITY_RANKING_METRIC must be linear-cosine or linear-entropy",
+            )
+            .into()),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::LinearCosine => "linear cosine",
+            Self::LinearEntropy => "linear entropy",
+        }
+    }
+}
+
+impl SimilarityTeacherExecution {
+    fn from_env(metric: SimilarityTeacherMetric) -> Result<Self, Box<dyn StdError>> {
+        let default = if cfg!(feature = "cuda") && metric == SimilarityTeacherMetric::LinearCosine {
+            "cuda"
+        } else {
+            "cpu"
+        };
+        let value = env::var("GEMS_SIMILARITY_RANKING_TEACHER")
+            .unwrap_or_else(|_| default.to_string())
+            .to_ascii_lowercase();
+        match value.as_str() {
+            "cpu" | "linear" | "linear-cpu" => Ok(Self::Cpu),
+            "cuda" | "gpu" | "linear-cuda" | "cuda-linear" => Ok(Self::Cuda),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GEMS_SIMILARITY_RANKING_TEACHER must be cpu or cuda",
+            )
+            .into()),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Cuda => "CUDA",
+        }
+    }
+}
+
+impl SimilarityTeacherConfig {
+    fn from_env(auxiliary: AuxiliaryLossConfig) -> Result<Self, Box<dyn StdError>> {
+        let metrics = SpectralMetricConfig::default();
+        let metric = SimilarityTeacherMetric::from_env()?;
+        reject_similarity_teacher_blend_weight("GEMS_SIMILARITY_RANKING_COSINE_WEIGHT")?;
+        reject_similarity_teacher_blend_weight("GEMS_SIMILARITY_RANKING_ENTROPY_WEIGHT")?;
+        let mut config = Self {
+            enabled: auxiliary.similarity_ranking_weight > 0.0,
+            metric,
+            execution: SimilarityTeacherExecution::from_env(metric)?,
+            mz_tolerance: f64_var("GEMS_SIMILARITY_RANKING_MZ_TOLERANCE", metrics.mz_tolerance),
+            max_mz: f64_var("GEMS_SIMILARITY_RANKING_MAX_MZ", 2_000.0),
+            cosine_mz_power: f64_var(
+                "GEMS_SIMILARITY_RANKING_COSINE_MZ_POWER",
+                metrics.cosine_mz_power,
+            ),
+            cosine_intensity_power: f64_var(
+                "GEMS_SIMILARITY_RANKING_COSINE_INTENSITY_POWER",
+                metrics.cosine_intensity_power,
+            ),
+            entropy_mz_power: f64_var(
+                "GEMS_SIMILARITY_RANKING_ENTROPY_MZ_POWER",
+                metrics.entropy_mz_power,
+            ),
+            entropy_intensity_power: f64_var(
+                "GEMS_SIMILARITY_RANKING_ENTROPY_INTENSITY_POWER",
+                metrics.entropy_intensity_power,
+            ),
+            weighted_entropy: bool_var(
+                "GEMS_SIMILARITY_RANKING_WEIGHTED_ENTROPY",
+                metrics.weighted_entropy,
+            ),
+            candidates_per_anchor: usize_var("GEMS_SIMILARITY_RANKING_CANDIDATES", 4),
+        };
+        if config.enabled && config.candidates_per_anchor < 2 {
+            config.candidates_per_anchor = 2;
+        }
+        config.validate()?;
+        Ok(config)
+    }
+
+    const fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    fn summary(self) -> String {
+        if !self.enabled() {
+            return "disabled".to_string();
+        }
+        format!(
+            "online {} teacher on {}, tolerance {} Da, candidates/anchor {}",
+            self.metric.label(),
+            self.execution.label(),
+            self.mz_tolerance,
+            self.candidates_per_anchor
+        )
+    }
+
+    fn validate(self) -> Result<(), Box<dyn StdError>> {
+        if !self.enabled() {
+            return Ok(());
+        }
+        if !(self.max_mz.is_finite() && self.max_mz > 0.0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GEMS_SIMILARITY_RANKING_MAX_MZ must be finite and positive",
+            )
+            .into());
+        }
+        if self.execution == SimilarityTeacherExecution::Cuda {
+            if !cfg!(feature = "cuda") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "GEMS_SIMILARITY_RANKING_TEACHER=cuda requires a CUDA feature",
+                )
+                .into());
+            }
+            if self.metric != SimilarityTeacherMetric::LinearCosine {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "GEMS_SIMILARITY_RANKING_TEACHER=cuda currently supports only GEMS_SIMILARITY_RANKING_METRIC=linear-cosine",
+                )
+                .into());
+            }
+        }
+        match self.metric {
+            SimilarityTeacherMetric::LinearCosine => {
+                LinearCosine::new(
+                    self.cosine_mz_power,
+                    self.cosine_intensity_power,
+                    self.mz_tolerance,
+                )
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid linear-cosine teacher config: {error}"),
+                    )
+                })?;
+            }
+            SimilarityTeacherMetric::LinearEntropy => {
+                LinearEntropy::new(
+                    self.entropy_mz_power,
+                    self.entropy_intensity_power,
+                    self.mz_tolerance,
+                    self.weighted_entropy,
+                )
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid linear-entropy teacher config: {error}"),
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    const fn use_cuda_teacher(self) -> bool {
+        matches!(self.execution, SimilarityTeacherExecution::Cuda)
+    }
+}
+
+fn reject_similarity_teacher_blend_weight(name: &str) -> Result<(), Box<dyn StdError>> {
+    if env::var_os(name).is_none() {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{name} is no longer supported; use GEMS_SIMILARITY_RANKING_METRIC to choose one teacher metric"),
+    )
+    .into())
+}
+
+pub fn similarity_teacher_config_from_env(
+    auxiliary: AuxiliaryLossConfig,
+) -> Result<SimilarityTeacherConfig, Box<dyn StdError>> {
+    SimilarityTeacherConfig::from_env(auxiliary)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CachedTrainingLoaderConfig {
+    cache_percent: f64,
+    similarity_teacher: SimilarityTeacherConfig,
+}
+
+impl CachedTrainingLoaderConfig {
+    pub const fn new(cache_percent: f64, similarity_teacher: SimilarityTeacherConfig) -> Self {
+        Self {
+            cache_percent,
+            similarity_teacher,
+        }
     }
 }
 
@@ -395,11 +723,11 @@ pub fn cached_vectorized_loader<B, Open>(
     progress: LoaderProgress,
     start_item: usize,
     augment: Option<SpectrumAugmentationConfig>,
-    cache_percent: f64,
+    loader_config: CachedTrainingLoaderConfig,
     open_records: Open,
 ) -> Arc<dyn DataLoader<B, AutoencoderBatch<B>>>
 where
-    B: Backend + 'static,
+    B: SimilarityTeacherBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     let loader = Arc::new(CachedVectorizedMgfLoader::new(
@@ -408,7 +736,11 @@ where
             batch_size: args.batch_size,
             max_batches: progress.max_batches,
             start_item,
-            cache_items: cache_items(args.batch_size, progress.max_batches, cache_percent),
+            cache_items: cache_items(
+                args.batch_size,
+                progress.max_batches,
+                loader_config.cache_percent,
+            ),
             preprocessed_cache_path: flat_preprocessed_cache_path(
                 args,
                 start_item,
@@ -417,7 +749,8 @@ where
             device,
             progress,
             augment,
-            randomize_retention_pairs: augment.is_some(),
+            similarity_teacher: loader_config.similarity_teacher,
+            randomize_pair_sampling: augment.is_some(),
         },
         open_records,
     ));
@@ -432,11 +765,11 @@ pub fn cached_tokenized_loader<B, Open>(
     progress: LoaderProgress,
     start_item: usize,
     augment: Option<SpectrumAugmentationConfig>,
-    cache_percent: f64,
+    loader_config: CachedTrainingLoaderConfig,
     open_records: Open,
 ) -> Arc<dyn DataLoader<B, TokenizedAutoencoderBatch<B>>>
 where
-    B: Backend + 'static,
+    B: SimilarityTeacherBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
 {
     Arc::new(CachedTokenizedMgfLoader::new(
@@ -445,12 +778,17 @@ where
             batch_size: args.batch_size,
             max_batches: progress.max_batches,
             start_item,
-            cache_items: cache_items(args.batch_size, progress.max_batches, cache_percent),
+            cache_items: cache_items(
+                args.batch_size,
+                progress.max_batches,
+                loader_config.cache_percent,
+            ),
             preprocessed_cache_path: None,
             device,
             progress,
             augment,
-            randomize_retention_pairs: augment.is_some(),
+            similarity_teacher: loader_config.similarity_teacher,
+            randomize_pair_sampling: augment.is_some(),
         },
         open_records,
     ))
@@ -466,7 +804,8 @@ struct CachedLoaderOptions<B: Backend> {
     device: B::Device,
     progress: LoaderProgress,
     augment: Option<SpectrumAugmentationConfig>,
-    randomize_retention_pairs: bool,
+    similarity_teacher: SimilarityTeacherConfig,
+    randomize_pair_sampling: bool,
 }
 
 fn cache_items(batch_size: usize, max_batches: usize, cache_percent: f64) -> usize {
@@ -480,7 +819,7 @@ fn cache_items(batch_size: usize, max_batches: usize, cache_percent: f64) -> usi
     requested.div_ceil(batch_size) * batch_size
 }
 
-fn retention_pair_seed(epoch_index: u64, batch_index: usize, item_offset: usize) -> u64 {
+fn pair_sampling_seed(epoch_index: u64, batch_index: usize, item_offset: usize) -> u64 {
     let mut value = epoch_index
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         .wrapping_add((batch_index as u64).rotate_left(23))
@@ -492,8 +831,570 @@ fn retention_pair_seed(epoch_index: u64, batch_index: usize, item_offset: usize)
     value ^ (value >> 31)
 }
 
+fn similarity_pair_seed(epoch_index: u64, batch_index: usize, item_offset: usize) -> u64 {
+    pair_sampling_seed(
+        epoch_index ^ 0xa5a5_5a5a_d3c1_b2e9,
+        batch_index,
+        item_offset,
+    )
+}
+
+#[derive(Clone)]
+struct TeacherSpectraCache {
+    mz: Vec<f32>,
+    intensity: Vec<f32>,
+    offsets: Vec<usize>,
+    fixed_mz: Vec<f32>,
+    fixed_intensity: Vec<f32>,
+    fixed_peak_width: usize,
+}
+
+impl TeacherSpectraCache {
+    fn from_target_pairs(
+        config: SimilarityTeacherConfig,
+        target_pairs: &[f32],
+        items: usize,
+        target_width: usize,
+        progress: Option<&ProgressBar>,
+    ) -> Self {
+        let mut builder = TeacherSpectraBuilder::new(config, items);
+        for item in 0..items {
+            let start = item * target_width;
+            let end = start + target_width;
+            builder.push_pairs(&target_pairs[start..end]);
+            if let Some(bar) = progress
+                && ((item + 1).is_multiple_of(8192) || item + 1 == items)
+            {
+                bar.set_message("preprocessing teacher spectra");
+                bar.set_position((item + 1) as u64);
+            }
+        }
+        builder.finish()
+    }
+
+    fn view(&self, index: usize) -> TeacherSpectrumView<'_> {
+        let start = self.offsets[index];
+        let end = self.offsets[index + 1];
+        TeacherSpectrumView {
+            precursor_mz: 1.0,
+            mz: &self.mz[start..end],
+            intensity: &self.intensity[start..end],
+        }
+    }
+
+    fn items(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+}
+
+struct TeacherSpectraBuilder {
+    config: SimilarityTeacherConfig,
+    mz: Vec<f32>,
+    intensity: Vec<f32>,
+    offsets: Vec<usize>,
+    fixed_mz: Vec<f32>,
+    fixed_intensity: Vec<f32>,
+    fixed_peak_width: usize,
+    expected_items: usize,
+}
+
+impl TeacherSpectraBuilder {
+    fn new(config: SimilarityTeacherConfig, items: usize) -> Self {
+        let mut offsets = Vec::with_capacity(items + 1);
+        offsets.push(0);
+        Self {
+            config,
+            mz: Vec::with_capacity(items.saturating_mul(48)),
+            intensity: Vec::with_capacity(items.saturating_mul(48)),
+            offsets,
+            fixed_mz: Vec::new(),
+            fixed_intensity: Vec::new(),
+            fixed_peak_width: 0,
+            expected_items: items,
+        }
+    }
+
+    fn push_pairs(&mut self, target_pairs: &[f32]) {
+        if self.fixed_peak_width == 0 {
+            self.fixed_peak_width = target_pairs.len() / 2;
+            self.fixed_mz
+                .reserve(self.expected_items.saturating_mul(self.fixed_peak_width));
+            self.fixed_intensity
+                .reserve(self.expected_items.saturating_mul(self.fixed_peak_width));
+        }
+        let peaks = preprocess_teacher_pairs(target_pairs, self.config);
+        self.mz.extend(peaks.iter().map(|peak| peak.0));
+        self.intensity.extend(peaks.iter().map(|peak| peak.1));
+        self.offsets.push(self.mz.len());
+        for peak_index in 0..self.fixed_peak_width {
+            let (mz, intensity) = peaks.get(peak_index).copied().unwrap_or((0.0, 0.0));
+            self.fixed_mz.push(mz);
+            self.fixed_intensity.push(intensity);
+        }
+    }
+
+    fn finish(self) -> TeacherSpectraCache {
+        TeacherSpectraCache {
+            mz: self.mz,
+            intensity: self.intensity,
+            offsets: self.offsets,
+            fixed_mz: self.fixed_mz,
+            fixed_intensity: self.fixed_intensity,
+            fixed_peak_width: self.fixed_peak_width,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TeacherGpuCache<B: Backend> {
+    mz: Tensor<B, 2>,
+    intensity: Tensor<B, 2>,
+    peak_width: usize,
+}
+
+impl<B: Backend> TeacherGpuCache<B> {
+    fn from_cpu_window(
+        cache: &TeacherSpectraCache,
+        start: usize,
+        end: usize,
+        device: &B::Device,
+    ) -> Option<Self> {
+        let peak_width = cache.fixed_peak_width;
+        if peak_width == 0 || start >= end || end > cache.items() {
+            return None;
+        }
+        let start_offset = start * peak_width;
+        let end_offset = end * peak_width;
+        let items = end - start;
+        Some(Self {
+            mz: Tensor::<B, 2>::from_data(
+                TensorData::new(
+                    cache.fixed_mz[start_offset..end_offset].to_vec(),
+                    [items, peak_width],
+                ),
+                device,
+            ),
+            intensity: Tensor::<B, 2>::from_data(
+                TensorData::new(
+                    cache.fixed_intensity[start_offset..end_offset].to_vec(),
+                    [items, peak_width],
+                ),
+                device,
+            ),
+            peak_width,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TeacherSpectrumView<'a> {
+    precursor_mz: f32,
+    mz: &'a [f32],
+    intensity: &'a [f32],
+}
+
+impl Spectrum for TeacherSpectrumView<'_> {
+    type Precision = f32;
+
+    type SortedIntensitiesIter<'a>
+        = std::iter::Copied<std::slice::Iter<'a, f32>>
+    where
+        Self: 'a;
+    type SortedMzIter<'a>
+        = std::iter::Copied<std::slice::Iter<'a, f32>>
+    where
+        Self: 'a;
+    type SortedPeaksIter<'a>
+        = std::iter::Zip<
+        std::iter::Copied<std::slice::Iter<'a, f32>>,
+        std::iter::Copied<std::slice::Iter<'a, f32>>,
+    >
+    where
+        Self: 'a;
+
+    fn len(&self) -> usize {
+        self.mz.len()
+    }
+
+    fn intensities(&self) -> Self::SortedIntensitiesIter<'_> {
+        self.intensity.iter().copied()
+    }
+
+    fn intensity_nth(&self, n: usize) -> Self::Precision {
+        self.intensity[n]
+    }
+
+    fn mz(&self) -> Self::SortedMzIter<'_> {
+        self.mz.iter().copied()
+    }
+
+    fn mz_from(&self, index: usize) -> Self::SortedMzIter<'_> {
+        self.mz[index..].iter().copied()
+    }
+
+    fn mz_nth(&self, n: usize) -> Self::Precision {
+        self.mz[n]
+    }
+
+    fn peaks(&self) -> Self::SortedPeaksIter<'_> {
+        self.mz.iter().copied().zip(self.intensity.iter().copied())
+    }
+
+    fn peak_nth(&self, n: usize) -> (Self::Precision, Self::Precision) {
+        (self.mz[n], self.intensity[n])
+    }
+
+    fn precursor_mz(&self) -> Self::Precision {
+        self.precursor_mz
+    }
+}
+
+enum SimilarityTeacherScorer {
+    LinearCosine(LinearCosine),
+    LinearEntropy(LinearEntropy),
+}
+
+impl SimilarityTeacherScorer {
+    fn new(config: SimilarityTeacherConfig) -> Option<Self> {
+        if !config.enabled() {
+            return None;
+        }
+        match config.metric {
+            SimilarityTeacherMetric::LinearCosine => LinearCosine::new(
+                config.cosine_mz_power,
+                config.cosine_intensity_power,
+                config.mz_tolerance,
+            )
+            .ok()
+            .map(Self::LinearCosine),
+            SimilarityTeacherMetric::LinearEntropy => LinearEntropy::new(
+                config.entropy_mz_power,
+                config.entropy_intensity_power,
+                config.mz_tolerance,
+                config.weighted_entropy,
+            )
+            .ok()
+            .map(Self::LinearEntropy),
+        }
+    }
+
+    fn score(&self, left: TeacherSpectrumView<'_>, right: TeacherSpectrumView<'_>) -> f32 {
+        match self {
+            Self::LinearCosine(cosine) => cosine
+                .similarity(&left, &right)
+                .map(|(score, _)| score as f32)
+                .unwrap_or(0.0),
+            Self::LinearEntropy(entropy) => entropy
+                .similarity(&left, &right)
+                .map(|(score, _)| score as f32)
+                .unwrap_or(0.0),
+        }
+    }
+}
+
+fn preprocess_teacher_pairs(
+    target_pairs: &[f32],
+    config: SimilarityTeacherConfig,
+) -> Vec<(f32, f32)> {
+    let mut peaks = target_pairs
+        .chunks_exact(2)
+        .filter_map(|pair| {
+            let mz = f64::from(pair[0]) * config.max_mz;
+            let intensity = f64::from(pair[1]);
+            if mz.is_finite() && intensity.is_finite() && mz > 0.0 && intensity > 0.0 {
+                Some((mz, intensity))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    if peaks.len() < 2 {
+        return peaks
+            .into_iter()
+            .map(|(mz, intensity)| (mz as f32, intensity as f32))
+            .collect();
+    }
+
+    peaks.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let merge_window = config.mz_tolerance + config.mz_tolerance;
+    let mut order = (0..peaks.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        peaks[right]
+            .1
+            .total_cmp(&peaks[left].1)
+            .then_with(|| peaks[left].0.total_cmp(&peaks[right].0))
+    });
+
+    let mut consumed = vec![false; peaks.len()];
+    let mut survivors = Vec::with_capacity(peaks.len());
+    for index in order {
+        if consumed[index] {
+            continue;
+        }
+        consumed[index] = true;
+        let dominant_mz = peaks[index].0;
+        let mut summed_intensity = peaks[index].1;
+
+        let mut left = index;
+        while left > 0 {
+            left -= 1;
+            if consumed[left] {
+                continue;
+            }
+            if dominant_mz - peaks[left].0 <= merge_window {
+                summed_intensity = (summed_intensity + peaks[left].1).min(f64::MAX);
+                consumed[left] = true;
+            } else {
+                break;
+            }
+        }
+
+        for right in (index + 1)..peaks.len() {
+            if consumed[right] {
+                continue;
+            }
+            if peaks[right].0 - dominant_mz <= merge_window {
+                summed_intensity = (summed_intensity + peaks[right].1).min(f64::MAX);
+                consumed[right] = true;
+            } else {
+                break;
+            }
+        }
+        survivors.push((dominant_mz as f32, summed_intensity as f32));
+    }
+
+    survivors.sort_by(|left, right| left.0.total_cmp(&right.0));
+    survivors
+}
+
+#[derive(Clone, Copy)]
+struct TeacherBatchStart {
+    cpu: usize,
+    gpu: usize,
+}
+
+fn teacher_similarity_ranking_batch<B: SimilarityTeacherBackend>(
+    teacher: Option<&TeacherSpectraCache>,
+    teacher_gpu: Option<&TeacherGpuCache<B>>,
+    start: TeacherBatchStart,
+    batch_items: usize,
+    seed: u64,
+    config: SimilarityTeacherConfig,
+    device: &B::Device,
+) -> SimilarityRankingBatch<B> {
+    if config.use_cuda_teacher()
+        && let Some(batch) = teacher_similarity_ranking_batch_cuda(
+            teacher_gpu,
+            start.gpu,
+            batch_items,
+            seed,
+            config,
+            device,
+        )
+    {
+        return batch;
+    }
+
+    let Some(teacher) = teacher else {
+        return SimilarityRankingBatch::zeros(batch_items, device);
+    };
+    let Some(scorer) = SimilarityTeacherScorer::new(config) else {
+        return SimilarityRankingBatch::zeros(batch_items, device);
+    };
+    if batch_items < 3 {
+        return SimilarityRankingBatch::zeros(batch_items, device);
+    }
+
+    let candidates = config
+        .candidates_per_anchor
+        .max(2)
+        .min(batch_items.saturating_sub(1));
+    let mut partner_a = Vec::with_capacity(batch_items);
+    let mut partner_b = Vec::with_capacity(batch_items);
+    let mut target_delta = Vec::with_capacity(batch_items);
+
+    for anchor in 0..batch_items {
+        let anchor_view = teacher.view(start.cpu + anchor);
+        let mut state = seed
+            .wrapping_add((anchor as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .wrapping_add((start.cpu as u64).rotate_left(29));
+        let mut best_index = anchor;
+        let mut worst_index = anchor;
+        let mut best_score = f32::NEG_INFINITY;
+        let mut worst_score = f32::INFINITY;
+
+        for _ in 0..candidates {
+            let local_partner = sample_nonself_index(&mut state, batch_items, anchor);
+            let score = scorer.score(anchor_view, teacher.view(start.cpu + local_partner));
+            if score > best_score {
+                best_score = score;
+                best_index = local_partner;
+            }
+            if score < worst_score {
+                worst_score = score;
+                worst_index = local_partner;
+            }
+        }
+
+        partner_a.push(best_index as i64);
+        partner_b.push(worst_index as i64);
+        target_delta.push((best_score - worst_score).max(0.0));
+    }
+
+    SimilarityRankingBatch {
+        partner_a_index: Tensor::<B, 1, Int>::from_data(
+            TensorData::new(partner_a, [batch_items]),
+            device,
+        ),
+        partner_b_index: Tensor::<B, 1, Int>::from_data(
+            TensorData::new(partner_b, [batch_items]),
+            device,
+        ),
+        target_delta: Tensor::<B, 2>::from_data(
+            TensorData::new(target_delta, [batch_items, 1]),
+            device,
+        ),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn teacher_similarity_ranking_batch_cuda<B: SimilarityTeacherBackend>(
+    teacher: Option<&TeacherGpuCache<B>>,
+    start: usize,
+    batch_items: usize,
+    seed: u64,
+    config: SimilarityTeacherConfig,
+    device: &B::Device,
+) -> Option<SimilarityRankingBatch<B>> {
+    let teacher = teacher?;
+    if batch_items < 3 || teacher.peak_width == 0 {
+        return None;
+    }
+
+    let candidates = config
+        .candidates_per_anchor
+        .max(2)
+        .min(batch_items.saturating_sub(1));
+    let pair_count = batch_items.checked_mul(candidates)?;
+    let mut anchor_indices = Vec::with_capacity(pair_count);
+    let mut candidate_indices = Vec::with_capacity(pair_count);
+    let mut candidate_local_indices = Vec::with_capacity(pair_count);
+
+    for anchor in 0..batch_items {
+        let mut state = seed
+            .wrapping_add((anchor as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            .wrapping_add((start as u64).rotate_left(29));
+        for _ in 0..candidates {
+            let local_partner = sample_nonself_index(&mut state, batch_items, anchor);
+            anchor_indices.push((start + anchor) as i64);
+            candidate_indices.push((start + local_partner) as i64);
+            candidate_local_indices.push(local_partner);
+        }
+    }
+
+    let anchor_index =
+        Tensor::<B, 1, Int>::from_data(TensorData::new(anchor_indices, [pair_count]), device);
+    let candidate_index =
+        Tensor::<B, 1, Int>::from_data(TensorData::new(candidate_indices, [pair_count]), device);
+    let scores = linear_cosine_preprocessed_paired_kernel(
+        teacher.mz.clone().select(0, anchor_index.clone()),
+        teacher.intensity.clone().select(0, anchor_index),
+        teacher.mz.clone().select(0, candidate_index.clone()),
+        teacher.intensity.clone().select(0, candidate_index),
+        Tensor::<B, 1>::from_data(
+            TensorData::new(
+                vec![config.cosine_mz_power as f32; pair_count],
+                [pair_count],
+            ),
+            device,
+        ),
+        Tensor::<B, 1>::from_data(
+            TensorData::new(
+                vec![config.cosine_intensity_power as f32; pair_count],
+                [pair_count],
+            ),
+            device,
+        ),
+        Tensor::<B, 1>::from_data(
+            TensorData::new(vec![config.mz_tolerance as f32; pair_count], [pair_count]),
+            device,
+        ),
+        LinearCosineKernelConfig { epsilon: 1.0e-8 },
+    )
+    .into_data()
+    .to_vec::<f32>()
+    .expect("CUDA teacher scores should be f32");
+
+    let mut partner_a = Vec::with_capacity(batch_items);
+    let mut partner_b = Vec::with_capacity(batch_items);
+    let mut target_delta = Vec::with_capacity(batch_items);
+    for anchor in 0..batch_items {
+        let score_start = anchor * candidates;
+        let mut best_index = anchor;
+        let mut worst_index = anchor;
+        let mut best_score = f32::NEG_INFINITY;
+        let mut worst_score = f32::INFINITY;
+        for candidate_offset in 0..candidates {
+            let score_index = score_start + candidate_offset;
+            let score = scores[score_index];
+            let score = if score.is_finite() { score } else { 0.0 };
+            let local_partner = candidate_local_indices[score_index];
+            if score > best_score {
+                best_score = score;
+                best_index = local_partner;
+            }
+            if score < worst_score {
+                worst_score = score;
+                worst_index = local_partner;
+            }
+        }
+        partner_a.push(best_index as i64);
+        partner_b.push(worst_index as i64);
+        target_delta.push((best_score - worst_score).max(0.0));
+    }
+
+    Some(SimilarityRankingBatch {
+        partner_a_index: Tensor::<B, 1, Int>::from_data(
+            TensorData::new(partner_a, [batch_items]),
+            device,
+        ),
+        partner_b_index: Tensor::<B, 1, Int>::from_data(
+            TensorData::new(partner_b, [batch_items]),
+            device,
+        ),
+        target_delta: Tensor::<B, 2>::from_data(
+            TensorData::new(target_delta, [batch_items, 1]),
+            device,
+        ),
+    })
+}
+
+#[cfg(not(feature = "cuda"))]
+fn teacher_similarity_ranking_batch_cuda<B: Backend>(
+    _teacher: Option<&TeacherGpuCache<B>>,
+    _start: usize,
+    _batch_items: usize,
+    _seed: u64,
+    _config: SimilarityTeacherConfig,
+    _device: &B::Device,
+) -> Option<SimilarityRankingBatch<B>> {
+    None
+}
+
+fn sample_nonself_index(state: &mut u64, len: usize, excluded: usize) -> usize {
+    *state ^= *state >> 12;
+    *state ^= *state << 25;
+    *state ^= *state >> 27;
+    let value = (*state).wrapping_mul(0x2545_f491_4f6c_dd1d);
+    let mut index = (value % (len as u64 - 1)) as usize;
+    if index >= excluded {
+        index += 1;
+    }
+    index
+}
+
 const FLAT_CACHE_MAGIC: &[u8; 8] = b"SAFLC01\0";
-const FLAT_CACHE_VERSION: u32 = 2;
+const FLAT_CACHE_VERSION: u32 = 4;
 
 fn flat_preprocessed_cache_path(
     args: &RunArgs,
@@ -504,11 +1405,15 @@ fn flat_preprocessed_cache_path(
         return None;
     }
 
-    let cache_dir = path_var(
-        "GEMS_FLAT_PREPROCESSED_CACHE_DIR",
-        "datasets/gems-a10-top-60-peaks/preprocessed-flat",
+    let default_cache_dir = format!(
+        "datasets/gems-a10-top-{}-peaks/preprocessed-flat",
+        args.max_peaks
     );
-    let fingerprint = flat_preprocessed_cache_fingerprint(args, start_item, max_batches);
+    let cache_dir = env::var_os("GEMS_FLAT_PREPROCESSED_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(default_cache_dir));
+    let total_items = args.batch_size.saturating_mul(max_batches);
+    let fingerprint = flat_preprocessed_cache_fingerprint(args, start_item, total_items);
     Some(cache_dir.join(format!(
         "flat-v{FLAT_CACHE_VERSION}-{fingerprint:016x}.saefc"
     )))
@@ -517,15 +1422,14 @@ fn flat_preprocessed_cache_path(
 fn flat_preprocessed_cache_fingerprint(
     args: &RunArgs,
     start_item: usize,
-    max_batches: usize,
+    total_items: usize,
 ) -> u64 {
     let mut hasher = DefaultHasher::new();
     FLAT_CACHE_MAGIC.hash(&mut hasher);
     FLAT_CACHE_VERSION.hash(&mut hasher);
     args.mgf_source.hash(&mut hasher);
-    args.batch_size.hash(&mut hasher);
-    max_batches.hash(&mut hasher);
     start_item.hash(&mut hasher);
+    total_items.hash(&mut hasher);
     for path in &args.mgf_paths {
         path.as_os_str().to_string_lossy().hash(&mut hasher);
         if let Ok(metadata) = fs::metadata(path) {
@@ -1041,12 +1945,13 @@ where
     preprocessed_cache_path: Option<PathBuf>,
     device: B::Device,
     augment: Option<SpectrumAugmentationConfig>,
+    similarity_teacher: SimilarityTeacherConfig,
     open_records: Open,
     cpu_cache: Arc<Mutex<Option<Arc<FlatCpuCache>>>>,
     initial_cache: Arc<Mutex<Option<FlatGpuCache<B>>>>,
     full_cache: Arc<Mutex<Option<FlatGpuCache<B>>>>,
-    randomize_retention_pairs: bool,
-    retention_epoch: Arc<AtomicU64>,
+    randomize_pair_sampling: bool,
+    pair_sampling_epoch: Arc<AtomicU64>,
 }
 
 impl<B, Open> Clone for CachedVectorizedMgfLoader<B, Open>
@@ -1066,12 +1971,13 @@ where
             preprocessed_cache_path: self.preprocessed_cache_path.clone(),
             device: self.device.clone(),
             augment: self.augment,
+            similarity_teacher: self.similarity_teacher,
             open_records: self.open_records.clone(),
             cpu_cache: self.cpu_cache.clone(),
             initial_cache: self.initial_cache.clone(),
             full_cache: self.full_cache.clone(),
-            randomize_retention_pairs: self.randomize_retention_pairs,
-            retention_epoch: self.retention_epoch.clone(),
+            randomize_pair_sampling: self.randomize_pair_sampling,
+            pair_sampling_epoch: self.pair_sampling_epoch.clone(),
         }
     }
 }
@@ -1092,12 +1998,13 @@ where
             preprocessed_cache_path: options.preprocessed_cache_path,
             device: options.device,
             augment: options.augment,
+            similarity_teacher: options.similarity_teacher,
             open_records,
             cpu_cache: Arc::new(Mutex::new(None)),
             initial_cache: Arc::new(Mutex::new(None)),
             full_cache: Arc::new(Mutex::new(None)),
-            randomize_retention_pairs: options.randomize_retention_pairs,
-            retention_epoch: Arc::new(AtomicU64::new(0)),
+            randomize_pair_sampling: options.randomize_pair_sampling,
+            pair_sampling_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1105,11 +2012,19 @@ where
         self.cache_items >= self.batch_size.saturating_mul(self.max_batches)
     }
 
-    fn next_retention_epoch(&self) -> u64 {
-        if self.randomize_retention_pairs {
-            self.retention_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    fn next_pair_sampling_epoch(&self) -> u64 {
+        if self.randomize_pair_sampling {
+            self.pair_sampling_epoch.fetch_add(1, Ordering::Relaxed) + 1
         } else {
             0
+        }
+    }
+
+    fn gpu_transfer_stages(&self) -> usize {
+        if self.similarity_teacher.use_cuda_teacher() {
+            3
+        } else {
+            2
         }
     }
 }
@@ -1137,6 +2052,7 @@ where
                 format!("{} gpu", self.progress.label),
                 cpu_cache.items,
                 "moving full CPU cache to GPU",
+                self.gpu_transfer_stages(),
             );
             let cache = self.move_flat_cache_window_to_gpu(
                 &cpu_cache,
@@ -1163,6 +2079,7 @@ where
                 format!("{} gpu", self.progress.label),
                 target_items,
                 "moving initial CPU cache window to GPU",
+                self.gpu_transfer_stages(),
             );
             let cache = self.move_flat_cache_window_to_gpu(
                 &cpu_cache,
@@ -1201,7 +2118,8 @@ where
                 total_items,
                 format!("{} disk", self.progress.label),
             ) {
-                Ok(cpu_cache) => {
+                Ok(mut cpu_cache) => {
+                    self.attach_flat_teacher_cache(&mut cpu_cache);
                     let cpu_cache = Arc::new(cpu_cache);
                     *self
                         .cpu_cache
@@ -1236,11 +2154,12 @@ where
         );
         let cpu_cache = self.read_flat_cpu_cache(&mut records, total_items, 0, Some(&bar));
         match cpu_cache {
-            Some(cpu_cache) => {
+            Some(mut cpu_cache) => {
                 bar.finish_with_message(format!(
                     "preprocessed {} spectra into CPU memory",
                     cpu_cache.items
                 ));
+                self.attach_flat_teacher_cache(&mut cpu_cache);
                 if let Some(path) = &self.preprocessed_cache_path
                     && let Err(error) = write_flat_cpu_cache_file(
                         path,
@@ -1283,6 +2202,26 @@ where
         bar.finish_with_message(format!("split offset reached at {}", self.start_item));
     }
 
+    fn attach_flat_teacher_cache(&self, cpu_cache: &mut FlatCpuCache) {
+        if !self.similarity_teacher.enabled() || cpu_cache.teacher.is_some() {
+            return;
+        }
+        let bar = preload_bar(
+            format!("{} teacher", self.progress.label),
+            cpu_cache.items,
+            "preprocessing teacher spectra",
+        );
+        let teacher = TeacherSpectraCache::from_target_pairs(
+            self.similarity_teacher,
+            &cpu_cache.spectra,
+            cpu_cache.items,
+            cpu_cache.spectrum_width,
+            Some(&bar),
+        );
+        bar.finish_with_message(format!("preprocessed {} teacher spectra", cpu_cache.items));
+        cpu_cache.teacher = Some(Arc::new(teacher));
+    }
+
     fn read_flat_cpu_cache(
         &self,
         records: &mut VectorizedMgfIter,
@@ -1296,13 +2235,14 @@ where
 
         let mut spectra = Vec::new();
         let mut conditions = Vec::new();
-        let mut retention_time = Vec::new();
-        let mut retention_present = Vec::new();
-        let mut filename_id = Vec::new();
         let mut spectrum_width = 0usize;
         let mut condition_width = 0usize;
         let mut items = 0usize;
         let mut reported_items = 0usize;
+        let mut teacher_builder = self
+            .similarity_teacher
+            .enabled()
+            .then(|| TeacherSpectraBuilder::new(self.similarity_teacher, target_items));
 
         while items < target_items {
             let sample = match records.next() {
@@ -1322,16 +2262,12 @@ where
                 condition_width = sample.conditions.len();
                 spectra.reserve(target_items * spectrum_width);
                 conditions.reserve(target_items * condition_width);
-                retention_time.reserve(target_items);
-                retention_present.reserve(target_items);
-                filename_id.reserve(target_items);
             }
-            let (rt, rt_present) = sample.metadata.retention_parts();
+            if let Some(builder) = &mut teacher_builder {
+                builder.push_pairs(&sample.spectrum);
+            }
             spectra.extend(sample.spectrum);
             conditions.extend(sample.conditions);
-            retention_time.push(rt);
-            retention_present.push(rt_present);
-            filename_id.push(sample.metadata.filename_part());
             items += 1;
             if items.is_multiple_of(self.batch_size) || items == target_items {
                 if let Some(bar) = preload_bar {
@@ -1369,9 +2305,7 @@ where
             items,
             spectrum_width,
             condition_width,
-            retention_time,
-            retention_present,
-            filename_id,
+            teacher: teacher_builder.map(|builder| Arc::new(builder.finish())),
         })
     }
 
@@ -1418,37 +2352,35 @@ where
                 ),
                 &self.device,
             );
-            let retention_time = Tensor::<B, 2>::from_data(
-                TensorData::new(
-                    cpu_cache.retention_time[start..end].to_vec(),
-                    [chunk_len, 1],
-                ),
-                &self.device,
-            );
-            let retention_present = Tensor::<B, 2>::from_data(
-                TensorData::new(
-                    cpu_cache.retention_present[start..end].to_vec(),
-                    [chunk_len, 1],
-                ),
-                &self.device,
-            );
-            let filename_id = Tensor::<B, 2>::from_data(
-                TensorData::new(cpu_cache.filename_id[start..end].to_vec(), [chunk_len, 1]),
-                &self.device,
-            );
             if let Some(bar) = transfer_bar {
                 bar.inc(chunk_len as u64);
             }
+            let teacher_gpu = self
+                .similarity_teacher
+                .use_cuda_teacher()
+                .then(|| {
+                    cpu_cache.teacher.as_ref().and_then(|teacher| {
+                        if let Some(bar) = transfer_bar {
+                            bar.set_message(format!("moving teacher chunk {chunk_label} to GPU"));
+                        }
+                        let cache =
+                            TeacherGpuCache::from_cpu_window(teacher, start, end, &self.device);
+                        if cache.is_some()
+                            && let Some(bar) = transfer_bar
+                        {
+                            bar.inc(chunk_len as u64);
+                        }
+                        cache
+                    })
+                })
+                .flatten();
 
             chunks.push(FlatGpuCacheChunk {
                 spectra,
                 conditions,
-                retention_time,
-                retention_present,
-                filename_id,
-                retention_time_values: cpu_cache.retention_time[start..end].to_vec(),
-                retention_present_values: cpu_cache.retention_present[start..end].to_vec(),
-                filename_id_values: cpu_cache.filename_id[start..end].to_vec(),
+                teacher: cpu_cache.teacher.clone(),
+                teacher_gpu,
+                teacher_start: start,
                 items: chunk_len,
             });
         }
@@ -1459,13 +2391,13 @@ where
 
 impl<B, Open> DataLoader<B, AutoencoderBatch<B>> for CachedVectorizedMgfLoader<B, Open>
 where
-    B: Backend + 'static,
+    B: SimilarityTeacherBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn iter<'a>(&'a self) -> Box<dyn DataLoaderIterator<AutoencoderBatch<B>> + 'a> {
         self.progress
             .start_epoch(self.batch_size * self.max_batches);
-        let epoch_index = self.next_retention_epoch();
+        let epoch_index = self.next_pair_sampling_epoch();
 
         if self.is_full_cache()
             && let Some(cache) = self
@@ -1561,9 +2493,7 @@ where
 struct FlatCpuCache {
     spectra: Vec<f32>,
     conditions: Vec<f32>,
-    retention_time: Vec<f32>,
-    retention_present: Vec<f32>,
-    filename_id: Vec<f32>,
+    teacher: Option<Arc<TeacherSpectraCache>>,
     items: usize,
     spectrum_width: usize,
     condition_width: usize,
@@ -1571,13 +2501,7 @@ struct FlatCpuCache {
 
 impl FlatCpuCache {
     fn payload_bytes(&self) -> io::Result<u64> {
-        let floats = self
-            .spectra
-            .len()
-            .saturating_add(self.conditions.len())
-            .saturating_add(self.retention_time.len())
-            .saturating_add(self.retention_present.len())
-            .saturating_add(self.filename_id.len());
+        let floats = self.spectra.len().saturating_add(self.conditions.len());
         bytes_for_floats(floats)
     }
 }
@@ -1618,8 +2542,7 @@ fn read_flat_cpu_cache_file(
     let payload_bytes = bytes_for_floats(
         items
             .saturating_mul(spectrum_width)
-            .saturating_add(items.saturating_mul(condition_width))
-            .saturating_add(items * 3),
+            .saturating_add(items.saturating_mul(condition_width)),
     )?;
     let bar = preload_bytes_bar(prefix, payload_bytes, "loading preprocessed vector cache");
     let spectra = read_f32_vec(
@@ -1634,19 +2557,6 @@ fn read_flat_cpu_cache_file(
         &bar,
         "loading conditions from vector cache",
     )?;
-    let retention_time = read_f32_vec(&mut reader, items, &bar, "loading RT from vector cache")?;
-    let retention_present = read_f32_vec(
-        &mut reader,
-        items,
-        &bar,
-        "loading RT masks from vector cache",
-    )?;
-    let filename_id = read_f32_vec(
-        &mut reader,
-        items,
-        &bar,
-        "loading filename ids from vector cache",
-    )?;
     bar.finish_with_message(format!(
         "loaded preprocessed vectors from {}",
         path.display()
@@ -1655,9 +2565,7 @@ fn read_flat_cpu_cache_file(
     Ok(FlatCpuCache {
         spectra,
         conditions,
-        retention_time,
-        retention_present,
-        filename_id,
+        teacher: None,
         items,
         spectrum_width,
         condition_width,
@@ -1698,24 +2606,6 @@ fn write_flat_cpu_cache_file(path: &Path, cache: &FlatCpuCache, prefix: String) 
             &cache.conditions,
             &bar,
             "writing conditions vector cache",
-        )?;
-        write_f32_slice(
-            &mut writer,
-            &cache.retention_time,
-            &bar,
-            "writing RT vector cache",
-        )?;
-        write_f32_slice(
-            &mut writer,
-            &cache.retention_present,
-            &bar,
-            "writing RT mask vector cache",
-        )?;
-        write_f32_slice(
-            &mut writer,
-            &cache.filename_id,
-            &bar,
-            "writing filename id vector cache",
         )?;
         writer.flush()
     })();
@@ -1827,12 +2717,9 @@ fn write_f32_slice(
 struct FlatGpuCacheChunk<B: Backend> {
     spectra: Tensor<B, 2>,
     conditions: Tensor<B, 2>,
-    retention_time: Tensor<B, 2>,
-    retention_present: Tensor<B, 2>,
-    filename_id: Tensor<B, 2>,
-    retention_time_values: Vec<f32>,
-    retention_present_values: Vec<f32>,
-    filename_id_values: Vec<f32>,
+    teacher: Option<Arc<TeacherSpectraCache>>,
+    teacher_gpu: Option<TeacherGpuCache<B>>,
+    teacher_start: usize,
     items: usize,
 }
 
@@ -1872,7 +2759,7 @@ where
 
 impl<B, Open> Iterator for CachedVectorizedMgfIter<'_, B, Open>
 where
-    B: Backend,
+    B: SimilarityTeacherBackend,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     type Item = AutoencoderBatch<B>;
@@ -1961,33 +2848,20 @@ where
                 )
             }
         };
-        let retention_time = chunk
-            .retention_time
-            .clone()
-            .narrow(0, chunk_offset, batch_items);
-        let retention_present =
-            chunk
-                .retention_present
-                .clone()
-                .narrow(0, chunk_offset, batch_items);
-        let filename_id = chunk
-            .filename_id
-            .clone()
-            .narrow(0, chunk_offset, batch_items);
-        let retention_partner_index = Tensor::<B, 1, Int>::from_data(
-            TensorData::new(
-                retention_partner_indices_with_seed(
-                    &chunk.filename_id_values[chunk_offset..chunk_offset + batch_items],
-                    &chunk.retention_time_values[chunk_offset..chunk_offset + batch_items],
-                    &chunk.retention_present_values[chunk_offset..chunk_offset + batch_items],
-                    retention_pair_seed(
-                        self.epoch_index,
-                        self.batches_processed,
-                        self.items_processed,
-                    ),
-                ),
-                [batch_items],
+        let similarity_ranking = teacher_similarity_ranking_batch(
+            chunk.teacher.as_deref(),
+            chunk.teacher_gpu.as_ref(),
+            TeacherBatchStart {
+                cpu: chunk.teacher_start + chunk_offset,
+                gpu: chunk_offset,
+            },
+            batch_items,
+            similarity_pair_seed(
+                self.epoch_index,
+                self.batches_processed,
+                self.items_processed,
             ),
+            self.loader.similarity_teacher,
             &self.loader.device,
         );
 
@@ -2009,10 +2883,7 @@ where
             consistency_conditions,
             masked_spectra_mask,
             intruder_peak_mask,
-            retention_time,
-            retention_present,
-            filename_id,
-            retention_partner_index,
+            similarity_ranking,
         })
     }
 }
@@ -2086,7 +2957,7 @@ where
 
 impl<B, Open> DataLoaderIterator<AutoencoderBatch<B>> for CachedVectorizedMgfIter<'_, B, Open>
 where
-    B: Backend,
+    B: SimilarityTeacherBackend,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn progress(&self) -> Progress {
@@ -2110,10 +2981,11 @@ where
     cache_items: usize,
     device: B::Device,
     augment: Option<SpectrumAugmentationConfig>,
+    similarity_teacher: SimilarityTeacherConfig,
     open_records: Open,
     full_cache: Arc<Mutex<Option<TokenGpuCache<B>>>>,
-    randomize_retention_pairs: bool,
-    retention_epoch: Arc<AtomicU64>,
+    randomize_pair_sampling: bool,
+    pair_sampling_epoch: Arc<AtomicU64>,
 }
 
 impl<B, Open> Clone for CachedTokenizedMgfLoader<B, Open>
@@ -2132,10 +3004,11 @@ where
             cache_items: self.cache_items,
             device: self.device.clone(),
             augment: self.augment,
+            similarity_teacher: self.similarity_teacher,
             open_records: self.open_records.clone(),
             full_cache: self.full_cache.clone(),
-            randomize_retention_pairs: self.randomize_retention_pairs,
-            retention_epoch: self.retention_epoch.clone(),
+            randomize_pair_sampling: self.randomize_pair_sampling,
+            pair_sampling_epoch: self.pair_sampling_epoch.clone(),
         }
     }
 }
@@ -2155,10 +3028,11 @@ where
             cache_items: options.cache_items,
             device: options.device,
             augment: options.augment,
+            similarity_teacher: options.similarity_teacher,
             open_records,
             full_cache: Arc::new(Mutex::new(None)),
-            randomize_retention_pairs: options.randomize_retention_pairs,
-            retention_epoch: Arc::new(AtomicU64::new(0)),
+            randomize_pair_sampling: options.randomize_pair_sampling,
+            pair_sampling_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -2166,9 +3040,9 @@ where
         self.cache_items >= self.batch_size.saturating_mul(self.max_batches)
     }
 
-    fn next_retention_epoch(&self) -> u64 {
-        if self.randomize_retention_pairs {
-            self.retention_epoch.fetch_add(1, Ordering::Relaxed) + 1
+    fn next_pair_sampling_epoch(&self) -> u64 {
+        if self.randomize_pair_sampling {
+            self.pair_sampling_epoch.fetch_add(1, Ordering::Relaxed) + 1
         } else {
             0
         }
@@ -2177,13 +3051,13 @@ where
 
 impl<B, Open> DataLoader<B, TokenizedAutoencoderBatch<B>> for CachedTokenizedMgfLoader<B, Open>
 where
-    B: Backend + 'static,
+    B: SimilarityTeacherBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn iter<'a>(&'a self) -> Box<dyn DataLoaderIterator<TokenizedAutoencoderBatch<B>> + 'a> {
         self.progress
             .start_epoch(self.batch_size * self.max_batches);
-        let epoch_index = self.next_retention_epoch();
+        let epoch_index = self.next_pair_sampling_epoch();
 
         if self.is_full_cache()
             && let Some(cache) = self
@@ -2265,12 +3139,8 @@ struct TokenGpuCache<B: Backend> {
     target_peak_mask: Tensor<B, 2>,
     padding_mask: Tensor<B, 2, Bool>,
     conditions: Tensor<B, 2>,
-    retention_time: Tensor<B, 2>,
-    retention_present: Tensor<B, 2>,
-    filename_id: Tensor<B, 2>,
-    retention_time_values: Vec<f32>,
-    retention_present_values: Vec<f32>,
-    filename_id_values: Vec<f32>,
+    teacher: Option<Arc<TeacherSpectraCache>>,
+    teacher_gpu: Option<TeacherGpuCache<B>>,
     items: usize,
 }
 
@@ -2291,7 +3161,7 @@ where
 
 impl<B, Open> Iterator for CachedTokenizedMgfIter<'_, B, Open>
 where
-    B: Backend,
+    B: SimilarityTeacherBackend,
 {
     type Item = TokenizedAutoencoderBatch<B>;
 
@@ -2427,35 +3297,20 @@ where
                 )
             }
         };
-        let retention_time = cache
-            .retention_time
-            .clone()
-            .narrow(0, self.cache_offset, batch_items);
-        let retention_present =
-            cache
-                .retention_present
-                .clone()
-                .narrow(0, self.cache_offset, batch_items);
-        let filename_id = cache
-            .filename_id
-            .clone()
-            .narrow(0, self.cache_offset, batch_items);
-        let retention_partner_index = Tensor::<B, 1, Int>::from_data(
-            TensorData::new(
-                retention_partner_indices_with_seed(
-                    &cache.filename_id_values[self.cache_offset..self.cache_offset + batch_items],
-                    &cache.retention_time_values
-                        [self.cache_offset..self.cache_offset + batch_items],
-                    &cache.retention_present_values
-                        [self.cache_offset..self.cache_offset + batch_items],
-                    retention_pair_seed(
-                        self.epoch_index,
-                        self.batches_processed,
-                        self.items_processed,
-                    ),
-                ),
-                [batch_items],
+        let similarity_ranking = teacher_similarity_ranking_batch(
+            cache.teacher.as_deref(),
+            cache.teacher_gpu.as_ref(),
+            TeacherBatchStart {
+                cpu: self.cache_offset,
+                gpu: self.cache_offset,
+            },
+            batch_items,
+            similarity_pair_seed(
+                self.epoch_index,
+                self.batches_processed,
+                self.items_processed,
             ),
+            self.loader.similarity_teacher,
             &self.loader.device,
         );
 
@@ -2482,10 +3337,7 @@ where
             consistency_conditions,
             masked_peak_mask,
             intruder_peak_mask,
-            retention_time,
-            retention_present,
-            filename_id,
-            retention_partner_index,
+            similarity_ranking,
         })
     }
 }
@@ -2493,7 +3345,7 @@ where
 #[allow(dead_code)]
 impl<B, Open> CachedTokenizedMgfIter<'_, B, Open>
 where
-    B: Backend,
+    B: SimilarityTeacherBackend,
 {
     fn fill_cache(&mut self) -> Option<TokenGpuCache<B>> {
         let records = self.records.as_mut()?;
@@ -2513,9 +3365,11 @@ where
         let mut target_peak_mask = Vec::new();
         let mut padding_mask = Vec::new();
         let mut conditions = Vec::new();
-        let mut retention_time = Vec::new();
-        let mut retention_present = Vec::new();
-        let mut filename_id = Vec::new();
+        let mut teacher_builder = self
+            .loader
+            .similarity_teacher
+            .enabled()
+            .then(|| TeacherSpectraBuilder::new(self.loader.similarity_teacher, target_items));
         let mut max_peaks = 0usize;
         let mut token_feature_width = 0usize;
         let mut target_width = 0usize;
@@ -2546,20 +3400,16 @@ where
                 target_peak_mask.reserve(target_items * max_peaks);
                 padding_mask.reserve(target_items * max_peaks);
                 conditions.reserve(target_items * condition_width);
-                retention_time.reserve(target_items);
-                retention_present.reserve(target_items);
-                filename_id.reserve(target_items);
             }
-            let (rt, rt_present) = sample.metadata.retention_parts();
+            if let Some(builder) = &mut teacher_builder {
+                builder.push_pairs(&sample.target_pairs);
+            }
             token_features.extend(sample.token_features);
             target_pairs.extend(sample.target_pairs);
             peak_mask.extend_from_slice(&sample.peak_mask);
             target_peak_mask.extend(sample.peak_mask);
             padding_mask.extend(sample.padding_mask);
             conditions.extend(sample.conditions);
-            retention_time.push(rt);
-            retention_present.push(rt_present);
-            filename_id.push(sample.metadata.filename_part());
             items += 1;
             if items.is_multiple_of(self.loader.batch_size) || items == target_items {
                 self.loader.progress.cache_filling(
@@ -2575,6 +3425,18 @@ where
         if items == 0 {
             return None;
         }
+
+        let teacher = teacher_builder.map(|builder| Arc::new(builder.finish()));
+        let teacher_gpu = self
+            .loader
+            .similarity_teacher
+            .use_cuda_teacher()
+            .then(|| {
+                teacher.as_ref().and_then(|teacher| {
+                    TeacherGpuCache::from_cpu_window(teacher, 0, items, &self.loader.device)
+                })
+            })
+            .flatten();
 
         let cache = TokenGpuCache {
             token_features: Tensor::<B, 3>::from_data(
@@ -2601,21 +3463,8 @@ where
                 TensorData::new(conditions, [items, condition_width]),
                 &self.loader.device,
             ),
-            retention_time: Tensor::<B, 2>::from_data(
-                TensorData::new(retention_time.clone(), [items, 1]),
-                &self.loader.device,
-            ),
-            retention_present: Tensor::<B, 2>::from_data(
-                TensorData::new(retention_present.clone(), [items, 1]),
-                &self.loader.device,
-            ),
-            filename_id: Tensor::<B, 2>::from_data(
-                TensorData::new(filename_id.clone(), [items, 1]),
-                &self.loader.device,
-            ),
-            retention_time_values: retention_time,
-            retention_present_values: retention_present,
-            filename_id_values: filename_id,
+            teacher,
+            teacher_gpu,
             items,
         };
         if self.loader.is_full_cache() {
@@ -2649,7 +3498,7 @@ where
 impl<B, Open> DataLoaderIterator<TokenizedAutoencoderBatch<B>>
     for CachedTokenizedMgfIter<'_, B, Open>
 where
-    B: Backend,
+    B: SimilarityTeacherBackend,
 {
     fn progress(&self) -> Progress {
         Progress {
@@ -2826,7 +3675,7 @@ impl LoaderProgress {
 
 fn tokenization_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{prefix:>17} [{elapsed_precise}] {wide_bar:.cyan/blue} {pos}/{len} spectra {per_sec} {msg}",
+        "{prefix:>17} [{elapsed_precise}] {wide_bar:.cyan/blue} {pos}/{len} spectra {per_sec} ETA {eta_precise} {msg}",
     )
     .expect("valid indicatif template")
     .progress_chars("=> ")
@@ -2843,9 +3692,14 @@ fn preload_bar(prefix: String, total_items: usize, message: &'static str) -> Pro
     bar
 }
 
-fn preload_transfer_bar(prefix: String, items: usize, message: &'static str) -> ProgressBar {
+fn preload_transfer_bar(
+    prefix: String,
+    items: usize,
+    message: &'static str,
+    stages: usize,
+) -> ProgressBar {
     let bar = ProgressBar::with_draw_target(
-        Some((items * 2) as u64),
+        Some((items * stages) as u64),
         ProgressDrawTarget::stderr_with_hz(10),
     );
     bar.set_style(tokenization_style());
@@ -2865,7 +3719,7 @@ fn preload_bytes_bar(prefix: String, total_bytes: u64, message: &'static str) ->
 
 fn download_style() -> ProgressStyle {
     ProgressStyle::with_template(
-        "{prefix:>17} [{elapsed_precise}] {wide_bar:.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} {msg}",
+        "{prefix:>17} [{elapsed_precise}] {wide_bar:.cyan/blue} {bytes}/{total_bytes} {bytes_per_sec} ETA {eta_precise} {msg}",
     )
     .expect("valid indicatif template")
     .progress_chars("=> ")
@@ -2925,6 +3779,43 @@ fn usize_var(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+#[allow(dead_code)]
+fn usize_list_var(name: &str, default: &[usize]) -> Result<Vec<usize>, Box<dyn StdError>> {
+    let Some(value) = env::var(name).ok() else {
+        return Ok(default.to_vec());
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(default.to_vec());
+    }
+    let mut values = Vec::new();
+    for item in value.split(',') {
+        let item = item.trim();
+        if item.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} contains an empty width"),
+            )
+            .into());
+        }
+        let width = item.parse::<usize>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("failed to parse {name} item {item:?}: {error}"),
+            )
+        })?;
+        if width == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name} widths must be greater than zero"),
+            )
+            .into());
+        }
+        values.push(width);
+    }
+    Ok(values)
 }
 
 fn optional_usize_var(name: &str) -> Option<usize> {

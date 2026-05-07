@@ -4,6 +4,7 @@ use burn::{
     module::{Initializer, Param},
     nn::{Linear, LinearConfig, Relu},
     prelude::*,
+    tensor::TensorData,
     tensor::{Distribution, Int, Tensor, activation::sigmoid},
 };
 use serde::{Deserialize, Serialize};
@@ -17,19 +18,21 @@ pub struct AuxiliaryLossConfig {
     pub masked_peak_weight: f64,
     /// Weight for keeping two augmented views close in latent space.
     pub consistency_weight: f64,
-    /// Weight for retention-order prediction within the same source file.
-    pub retention_order_weight: f64,
     /// Weight for detecting synthetic intruder peaks inserted into input spectra.
     pub intruder_peak_weight: f64,
+    /// Weight for preserving clean-spectrum similarity order in latent space.
+    pub similarity_ranking_weight: f64,
+    /// Margin applied to latent cosine ordering for the similarity-ranking loss.
+    pub similarity_ranking_margin: f64,
+    /// Minimum clean-spectrum cosine gap required for a sampled ranking pair.
+    pub similarity_ranking_min_gap: f64,
     /// Gaussian decoder-input latent noise as a fraction of the batch latent standard deviation.
     ///
     /// This is applied only during training, after the encoder and before the decoder.
     /// A value of `0.0` disables latent denoising.
     pub latent_noise_std: f64,
-    /// Maximum same-file retention pairs used per batch; `0` means one partner per row.
-    pub retention_pairs_per_batch: usize,
-    /// Hidden width of the retention-order auxiliary head.
-    pub retention_hidden_width: usize,
+    /// Maximum in-batch anchors used by the similarity-ranking loss; `0` means all rows.
+    pub similarity_ranking_pairs_per_batch: usize,
     /// Hidden width of the per-slot intruder detection head.
     pub intruder_hidden_width: usize,
 }
@@ -40,11 +43,12 @@ impl Default for AuxiliaryLossConfig {
             reconstruction_weight: 1.0,
             masked_peak_weight: 0.25,
             consistency_weight: 0.05,
-            retention_order_weight: 0.2,
             intruder_peak_weight: 0.05,
+            similarity_ranking_weight: 0.05,
+            similarity_ranking_margin: 0.05,
+            similarity_ranking_min_gap: 0.05,
             latent_noise_std: 0.02,
-            retention_pairs_per_batch: 0,
-            retention_hidden_width: 128,
+            similarity_ranking_pairs_per_batch: 0,
             intruder_hidden_width: 128,
         }
     }
@@ -57,8 +61,6 @@ pub struct EmbeddingAuxiliaryHeadsConfig {
     pub latent_width: usize,
     /// Maximum number of peak slots in the model input.
     pub max_peaks: usize,
-    /// Hidden width of the retention-order scalar rank head.
-    pub retention_hidden_width: usize,
     /// Hidden width of the per-slot intruder detection MLP.
     pub intruder_hidden_width: usize,
 }
@@ -67,9 +69,6 @@ impl EmbeddingAuxiliaryHeadsConfig {
     /// Creates initialized auxiliary heads.
     pub fn init<B: Backend>(&self, device: &B::Device) -> EmbeddingAuxiliaryHeads<B> {
         EmbeddingAuxiliaryHeads {
-            retention_input: LinearConfig::new(self.latent_width, self.retention_hidden_width)
-                .init(device),
-            retention_output: LinearConfig::new(self.retention_hidden_width, 1).init(device),
             intruder_input: LinearConfig::new(self.latent_width, self.intruder_hidden_width)
                 .init(device),
             intruder_slots: Initializer::Normal {
@@ -88,8 +87,6 @@ impl EmbeddingAuxiliaryHeadsConfig {
 /// Small heads that operate on encoder embeddings.
 #[derive(Module, Debug)]
 pub struct EmbeddingAuxiliaryHeads<B: Backend> {
-    retention_input: Linear<B>,
-    retention_output: Linear<B>,
     intruder_input: Linear<B>,
     intruder_slots: Param<Tensor<B, 2>>,
     intruder_output: Linear<B>,
@@ -99,24 +96,6 @@ pub struct EmbeddingAuxiliaryHeads<B: Backend> {
 }
 
 impl<B: Backend> EmbeddingAuxiliaryHeads<B> {
-    /// Predicts a scalar retention rank for one embedding.
-    pub fn retention_scores(&self, latent: Tensor<B, 2>) -> Tensor<B, 2> {
-        self.retention_output.forward(
-            self.activation
-                .forward(self.retention_input.forward(latent)),
-        )
-    }
-
-    /// Predicts whether the right embedding elutes after the left embedding.
-    ///
-    /// The pair logit is explicitly antisymmetric: `logit(left, right) =
-    /// -logit(right, left)`. This prevents the retention objective from
-    /// collapsing into a symmetric pair classifier that scores each reversed
-    /// pair identically and sits at exactly 50% accuracy.
-    pub fn retention_logits(&self, left: Tensor<B, 2>, right: Tensor<B, 2>) -> Tensor<B, 2> {
-        self.retention_scores(right) - self.retention_scores(left)
-    }
-
     /// Predicts one intruder logit per fixed input peak slot.
     pub fn intruder_logits(&self, latent: Tensor<B, 2>) -> Tensor<B, 2> {
         let [batch_size, _latent_width] = latent.dims();
@@ -136,32 +115,34 @@ impl<B: Backend> EmbeddingAuxiliaryHeads<B> {
     }
 }
 
-/// Retention-order objective result and diagnostics.
-pub struct RetentionOrderOutput<B: Backend> {
-    /// Weighted or unweighted retention-order loss, depending on caller.
-    pub loss: Tensor<B, 1>,
-    /// Unweighted binary cross-entropy retention-order loss.
-    pub raw_loss: Tensor<B, 1>,
-    /// Number of valid same-file retention pairs before reverse augmentation.
-    pub valid_pairs: Tensor<B, 1>,
-    /// Binary pair-order accuracy over valid retention comparisons.
-    pub accuracy: Tensor<B, 1>,
-    /// Standard deviation of retention-order logits over valid comparisons.
-    pub logit_std: Tensor<B, 1>,
-    /// Mean absolute retention-time gap over valid same-file pairs.
-    pub mean_rt_delta: Tensor<B, 1>,
+/// Batch fields used to supervise similarity-ranking from non-differentiable
+/// teacher scores.
+#[derive(Debug, Clone)]
+pub struct SimilarityRankingBatch<B: Backend> {
+    /// First partner row index for each anchor.
+    pub partner_a_index: Tensor<B, 1, Int>,
+    /// Second partner row index for each anchor.
+    pub partner_b_index: Tensor<B, 1, Int>,
+    /// Teacher score delta `score(anchor, a) - score(anchor, b)`.
+    pub target_delta: Tensor<B, 2>,
 }
 
-/// Batch fields used to build same-file retention-order pairs.
-pub struct RetentionOrderBatch<B: Backend> {
-    /// Retention time tensor with shape `[batch, 1]`; value is zero when absent.
-    pub retention_time: Tensor<B, 2>,
-    /// Retention-time presence flag with shape `[batch, 1]`.
-    pub retention_present: Tensor<B, 2>,
-    /// Source-file identifier with shape `[batch, 1]`; value is `-1` when absent.
-    pub filename_id: Tensor<B, 2>,
-    /// Partner row index for same-file retention-order pairs.
-    pub partner_index: Tensor<B, 1, Int>,
+impl<B: Backend> SimilarityRankingBatch<B> {
+    /// Creates an empty ranking batch with no valid teacher gaps.
+    pub fn zeros(batch_size: usize, device: &B::Device) -> Self {
+        let indices = vec![0_i64; batch_size];
+        Self {
+            partner_a_index: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(indices.clone(), [batch_size]),
+                device,
+            ),
+            partner_b_index: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(indices, [batch_size]),
+                device,
+            ),
+            target_delta: Tensor::<B, 2>::zeros([batch_size, 1], device),
+        }
+    }
 }
 
 /// Cosine distance between two augmented views of the same embeddings.
@@ -223,140 +204,123 @@ where
     }
 }
 
-/// Binary retention-order objective over same-file partner pairs and their reverses.
-pub fn retention_order_output<B: Backend>(
-    heads: &EmbeddingAuxiliaryHeads<B>,
+/// Similarity-ranking objective result and diagnostics.
+pub struct SimilarityRankingOutput<B: Backend> {
+    /// Weighted or unweighted similarity-ranking loss, depending on caller.
+    pub loss: Tensor<B, 1>,
+    /// Number of valid anchors whose teacher similarity gap exceeded the threshold.
+    pub valid_pairs: Tensor<B, 1>,
+    /// Fraction of valid anchors where latent similarity preserved target ordering.
+    pub accuracy: Tensor<B, 1>,
+}
+
+/// In-batch ranking loss that preserves teacher similarity order.
+///
+/// The teacher scores are treated as fixed labels. Gradients flow only through
+/// the latent cosine similarities.
+pub fn similarity_ranking_loss<B: Backend>(
     latent: Tensor<B, 2>,
-    batch: RetentionOrderBatch<B>,
+    batch: SimilarityRankingBatch<B>,
     max_pairs: usize,
-) -> RetentionOrderOutput<B> {
+    margin: f64,
+    min_gap: f64,
+) -> Tensor<B, 1> {
+    similarity_ranking_output(latent, batch, max_pairs, margin, min_gap).loss
+}
+
+/// In-batch ranking objective and diagnostics for teacher similarity order.
+pub fn similarity_ranking_output<B: Backend>(
+    latent: Tensor<B, 2>,
+    batch: SimilarityRankingBatch<B>,
+    max_pairs: usize,
+    margin: f64,
+    min_gap: f64,
+) -> SimilarityRankingOutput<B> {
     let [batch_size, _latent_width] = latent.dims();
+    if batch_size < 3 {
+        return zero_similarity_ranking_output(&latent.device());
+    }
+
     let pair_count = if max_pairs == 0 {
         batch_size
     } else {
         batch_size.min(max_pairs)
     };
     if pair_count == 0 {
-        return zero_retention_order_output(&latent.device());
+        return zero_similarity_ranking_output(&latent.device());
     }
 
-    let partner_index = batch.partner_index.narrow(0, 0, pair_count);
-    let left_base = latent.clone().narrow(0, 0, pair_count);
-    let right_base = latent.clone().select(0, partner_index.clone());
-    let rt_left = batch.retention_time.clone().narrow(0, 0, pair_count);
-    let rt_right = batch
-        .retention_time
+    let anchor_latent = latent.clone().narrow(0, 0, pair_count);
+    let latent_a = latent
         .clone()
-        .select(0, partner_index.clone());
-    let present_left = batch.retention_present.clone().narrow(0, 0, pair_count);
-    let present_right = batch
-        .retention_present
+        .select(0, batch.partner_a_index.narrow(0, 0, pair_count));
+    let latent_b = latent
         .clone()
-        .select(0, partner_index.clone());
-    let file_left = batch.filename_id.clone().narrow(0, 0, pair_count);
-    let file_right = batch.filename_id.select(0, partner_index);
+        .select(0, batch.partner_b_index.narrow(0, 0, pair_count));
+    let latent_delta = row_cosine_similarity(anchor_latent.clone(), latent_a)
+        - row_cosine_similarity(anchor_latent, latent_b);
+    let target_delta = batch.target_delta.narrow(0, 0, pair_count).detach();
+    let target_gap = target_delta.clone().abs();
+    let target_direction = target_delta / (target_gap.clone() + 1.0e-6);
+    let valid = target_gap.greater_elem(min_gap).float();
+    let valid_pairs = valid.clone().sum();
+    let ordered_delta = target_direction * latent_delta;
+    let hinge = (margin - ordered_delta.clone()).clamp_min(0.0);
+    let accuracy = (ordered_delta.greater_elem(0.0).float() * valid.clone()).sum()
+        / valid_pairs.clone().clamp_min(1.0);
 
-    let same_file = file_left
-        .clone()
-        .equal(file_right.clone())
-        .bool_and(file_left.greater_equal_elem(0.0))
-        .bool_and(file_right.greater_equal_elem(0.0));
-    let valid_rt = present_left
-        .greater_elem(0.0)
-        .bool_and(present_right.greater_elem(0.0));
-    let rt_delta = rt_right.clone() - rt_left.clone();
-    let non_tie = rt_delta.clone().abs().greater_elem(1.0e-6);
-    let pair_mask = same_file.bool_and(valid_rt).bool_and(non_tie).float();
-    let valid_pairs = pair_mask.clone().sum();
-    let forward_labels = rt_delta.clone().greater_elem(0.0).float();
-
-    let left = Tensor::cat(vec![left_base.clone(), right_base.clone()], 0);
-    let right = Tensor::cat(vec![right_base, left_base], 0);
-    let reverse_labels = forward_labels.ones_like() - forward_labels.clone();
-    let labels = Tensor::cat(vec![forward_labels, reverse_labels], 0);
-    let mask = Tensor::cat(vec![pair_mask.clone(), pair_mask.clone()], 0);
-
-    let logits = heads.retention_logits(left, right);
-    let probabilities = sigmoid(logits.clone())
-        .clamp_min(1.0e-6)
-        .clamp_max(1.0 - 1.0e-6);
-    let valid_comparisons = mask.clone().sum().clamp_min(1.0);
-    let mean_logit = (logits.clone() * mask.clone()).sum() / valid_comparisons.clone();
-    let [logit_count, logit_width] = logits.dims();
-    let mean_logit = mean_logit
-        .reshape([1, 1])
-        .expand([logit_count, logit_width]);
-    let logit_delta = logits - mean_logit;
-    let logit_std =
-        ((logit_delta.clone() * logit_delta * mask.clone()).sum() / valid_comparisons).sqrt();
-    let predictions = probabilities.clone().greater_elem(0.5).float();
-    let accuracy = ((predictions - labels.clone()).abs().lower_elem(0.5).float() * mask.clone())
-        .sum()
-        / mask.clone().sum().clamp_min(1.0);
-    let inverse_labels = labels.ones_like() - labels.clone();
-    let inverse_probabilities = probabilities.ones_like() - probabilities.clone();
-    let bce = (labels * probabilities.log() + inverse_labels * inverse_probabilities.log()) * -1.0;
-    let loss = (bce * mask.clone()).sum() / mask.sum().clamp_min(1.0);
-    let mean_rt_delta =
-        (rt_delta.clone().abs() * pair_mask.clone()).sum() / valid_pairs.clone().clamp_min(1.0);
-
-    RetentionOrderOutput {
-        loss: loss.clone(),
-        raw_loss: loss,
+    SimilarityRankingOutput {
+        loss: (hinge * valid).sum() / valid_pairs.clone().clamp_min(1.0),
         valid_pairs,
         accuracy,
-        logit_std,
-        mean_rt_delta,
     }
 }
 
-/// Binary retention-order loss over same-file partner pairs and their reverses.
-pub fn retention_order_loss<B: Backend>(
-    heads: &EmbeddingAuxiliaryHeads<B>,
+/// Weighted similarity-ranking loss, or zero when the weight is disabled.
+pub fn weighted_similarity_ranking_loss<B: Backend>(
     latent: Tensor<B, 2>,
-    batch: RetentionOrderBatch<B>,
+    batch: SimilarityRankingBatch<B>,
     max_pairs: usize,
-) -> Tensor<B, 1> {
-    retention_order_output(heads, latent, batch, max_pairs).loss
-}
-
-/// Weighted retention-order loss, or zero when the weight is disabled.
-pub fn weighted_retention_order_loss<B: Backend>(
-    heads: &EmbeddingAuxiliaryHeads<B>,
-    latent: Tensor<B, 2>,
-    batch: RetentionOrderBatch<B>,
-    max_pairs: usize,
+    margin: f64,
+    min_gap: f64,
     weight: f64,
 ) -> Tensor<B, 1> {
-    weighted_retention_order_output(heads, latent, batch, max_pairs, weight).loss
+    weighted_similarity_ranking_output(latent, batch, max_pairs, margin, min_gap, weight).loss
 }
 
-/// Weighted retention-order output, or zero diagnostics when the weight is disabled.
-pub fn weighted_retention_order_output<B: Backend>(
-    heads: &EmbeddingAuxiliaryHeads<B>,
+/// Weighted similarity-ranking output, or zero diagnostics when the weight is disabled.
+pub fn weighted_similarity_ranking_output<B: Backend>(
     latent: Tensor<B, 2>,
-    batch: RetentionOrderBatch<B>,
+    batch: SimilarityRankingBatch<B>,
     max_pairs: usize,
+    margin: f64,
+    min_gap: f64,
     weight: f64,
-) -> RetentionOrderOutput<B> {
+) -> SimilarityRankingOutput<B> {
     if weight > 0.0 {
-        let mut output = retention_order_output(heads, latent, batch, max_pairs);
+        let mut output = similarity_ranking_output(latent, batch, max_pairs, margin, min_gap);
         output.loss = output.loss * weight;
         output
     } else {
-        zero_retention_order_output(&latent.device())
+        zero_similarity_ranking_output(&latent.device())
     }
 }
 
-fn zero_retention_order_output<B: Backend>(device: &B::Device) -> RetentionOrderOutput<B> {
-    RetentionOrderOutput {
+fn zero_similarity_ranking_output<B: Backend>(device: &B::Device) -> SimilarityRankingOutput<B> {
+    SimilarityRankingOutput {
         loss: Tensor::zeros([1], device),
-        raw_loss: Tensor::zeros([1], device),
         valid_pairs: Tensor::zeros([1], device),
         accuracy: Tensor::zeros([1], device),
-        logit_std: Tensor::zeros([1], device),
-        mean_rt_delta: Tensor::zeros([1], device),
     }
+}
+
+fn row_cosine_similarity<B: Backend>(left: Tensor<B, 2>, right: Tensor<B, 2>) -> Tensor<B, 2> {
+    let numerator = (left.clone() * right.clone()).sum_dim(1);
+    let left_norm = (left.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
+    let right_norm = (right.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
+    (numerator / (left_norm * right_norm))
+        .clamp_min(-1.0)
+        .clamp_max(1.0)
 }
 
 /// Binary intruder detection loss over active input peak slots.
@@ -441,90 +405,12 @@ mod tests {
     }
 
     #[test]
-    fn retention_logits_are_antisymmetric() {
-        type B = burn::backend::NdArray<f32, i64>;
-        let device = burn::backend::ndarray::NdArrayDevice::default();
-        let heads = EmbeddingAuxiliaryHeadsConfig {
-            latent_width: 2,
-            max_peaks: 1,
-            retention_hidden_width: 4,
-            intruder_hidden_width: 4,
-        }
-        .init::<B>(&device);
-        let left = Tensor::<B, 2>::from_floats([[1.0, 2.0], [3.0, 4.0]], &device);
-        let right = Tensor::<B, 2>::from_floats([[2.0, 1.0], [4.0, 3.0]], &device);
-
-        let residual = heads.retention_logits(left.clone(), right.clone())
-            + heads.retention_logits(right, left);
-
-        assert!(
-            residual
-                .into_data()
-                .to_vec::<f32>()
-                .expect("retention logits")
-                .iter()
-                .all(|value| value.abs() < 1.0e-6)
-        );
-    }
-
-    #[test]
-    fn retention_output_reports_unweighted_diagnostics() {
-        type B = burn::backend::NdArray<f32, i64>;
-        let device = burn::backend::ndarray::NdArrayDevice::default();
-        let heads = EmbeddingAuxiliaryHeadsConfig {
-            latent_width: 2,
-            max_peaks: 1,
-            retention_hidden_width: 4,
-            intruder_hidden_width: 4,
-        }
-        .init::<B>(&device);
-        let latent =
-            Tensor::<B, 2>::from_floats([[0.0, 0.1], [0.1, 0.2], [0.2, 0.3], [0.3, 0.4]], &device);
-        let retention_time = Tensor::<B, 2>::from_floats([[10.0], [20.0], [40.0], [80.0]], &device);
-        let retention_present = Tensor::<B, 2>::ones([4, 1], &device);
-        let filename_id = Tensor::<B, 2>::zeros([4, 1], &device);
-        let partner_index = Tensor::<B, 1, Int>::from_data([3, 2, 1, 0], &device);
-
-        let output = retention_order_output(
-            &heads,
-            latent.clone(),
-            RetentionOrderBatch {
-                retention_time: retention_time.clone(),
-                retention_present: retention_present.clone(),
-                filename_id: filename_id.clone(),
-                partner_index: partner_index.clone(),
-            },
-            0,
-        );
-        let weighted = weighted_retention_order_output(
-            &heads,
-            latent,
-            RetentionOrderBatch {
-                retention_time,
-                retention_present,
-                filename_id,
-                partner_index,
-            },
-            0,
-            0.2,
-        );
-
-        assert!(output.valid_pairs.into_scalar() > 0.0);
-        assert!(output.raw_loss.clone().into_scalar() > 0.0);
-        assert!(output.mean_rt_delta.into_scalar() > 0.0);
-        assert!(output.logit_std.into_scalar().is_finite());
-        assert!((output.raw_loss.into_scalar() * 0.2 - weighted.loss.into_scalar()).abs() < 1.0e-5);
-        assert!(weighted.raw_loss.into_scalar() > 0.0);
-    }
-
-    #[test]
     fn intruder_loss_is_zero_without_positive_labels() {
         type B = burn::backend::NdArray<f32, i64>;
         let device = burn::backend::ndarray::NdArrayDevice::default();
         let heads = EmbeddingAuxiliaryHeadsConfig {
             latent_width: 4,
             max_peaks: 3,
-            retention_hidden_width: 4,
             intruder_hidden_width: 4,
         }
         .init::<B>(&device);
@@ -544,7 +430,6 @@ mod tests {
         let heads = EmbeddingAuxiliaryHeadsConfig {
             latent_width: 4,
             max_peaks: 3,
-            retention_hidden_width: 4,
             intruder_hidden_width: 4,
         }
         .init::<B>(&device);
@@ -556,5 +441,67 @@ mod tests {
 
         assert!(loss.is_finite());
         assert!(loss > 0.0);
+    }
+
+    #[test]
+    fn similarity_ranking_loss_is_finite_for_ordered_targets() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let latent =
+            Tensor::<B, 2>::from_floats([[0.0, 1.0], [1.0, 0.0], [0.0, 0.9], [0.9, 0.0]], &device);
+        let batch = SimilarityRankingBatch {
+            partner_a_index: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![2_i64, 3, 0, 1], [4]),
+                &device,
+            ),
+            partner_b_index: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![1_i64, 0, 3, 2], [4]),
+                &device,
+            ),
+            target_delta: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
+        };
+
+        let loss = similarity_ranking_loss(latent, batch, 0, 0.05, 0.01).into_scalar();
+
+        assert!(loss.is_finite());
+        assert!(loss >= 0.0);
+    }
+
+    #[test]
+    fn similarity_ranking_output_reports_valid_pairs_and_accuracy() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let latent =
+            Tensor::<B, 2>::from_floats([[0.0, 1.0], [1.0, 0.0], [0.0, 0.9], [0.9, 0.0]], &device);
+        let batch = SimilarityRankingBatch {
+            partner_a_index: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![2_i64, 3, 0, 1], [4]),
+                &device,
+            ),
+            partner_b_index: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![1_i64, 0, 3, 2], [4]),
+                &device,
+            ),
+            target_delta: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
+        };
+
+        let output = similarity_ranking_output(latent, batch, 0, 0.05, 0.01);
+        let accuracy = output.accuracy.into_scalar();
+
+        assert!(output.valid_pairs.into_scalar() > 0.0);
+        assert!(accuracy.is_finite());
+        assert!((0.0..=1.0).contains(&accuracy));
+    }
+
+    #[test]
+    fn similarity_ranking_loss_is_zero_for_too_small_batches() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let latent = Tensor::<B, 2>::zeros([2, 2], &device);
+        let batch = SimilarityRankingBatch::zeros(2, &device);
+
+        let loss = similarity_ranking_loss(latent, batch, 0, 0.05, 0.01).into_scalar();
+
+        assert_eq!(loss, 0.0);
     }
 }

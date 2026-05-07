@@ -1,36 +1,16 @@
 //! Burn batch types for autoencoder training.
 
-use std::collections::HashMap;
-
 use burn::{
     data::dataloader::batcher::Batcher,
     prelude::*,
-    tensor::{Bool, Int, Tensor, TensorData},
+    tensor::{Bool, Tensor, TensorData},
 };
+
+use crate::model::auxiliary::SimilarityRankingBatch;
 
 /// Per-spectrum metadata used by auxiliary objectives.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct SampleMetadata {
-    /// Retention time in seconds when present.
-    pub retention_time: Option<f32>,
-    /// Stable source-file identifier when present.
-    pub filename_id: Option<u32>,
-}
-
-impl SampleMetadata {
-    /// Returns `(retention_time, present_flag)` for tensor batching.
-    pub fn retention_parts(self) -> (f32, f32) {
-        match self.retention_time {
-            Some(value) if value.is_finite() && value > 0.0 => (value, 1.0),
-            _ => (0.0, 0.0),
-        }
-    }
-
-    /// Returns the filename identifier as a tensor value, or `-1.0` when absent.
-    pub fn filename_part(self) -> f32 {
-        self.filename_id.map_or(-1.0, |id| id as f32)
-    }
-}
+pub struct SampleMetadata;
 
 /// One vectorized autoencoder sample.
 #[derive(Debug, Clone, PartialEq)]
@@ -50,7 +30,7 @@ pub struct AutoencoderBatch<B: Backend> {
     pub spectra: Tensor<B, 2>,
     /// Cleaned reconstruction targets.
     pub target_spectra: Tensor<B, 2>,
-    /// Metadata conditions fed to both encoder and decoder.
+    /// Metadata conditions fed to the encoder.
     pub conditions: Tensor<B, 2>,
     /// Second input view used for latent consistency.
     pub consistency_spectra: Tensor<B, 2>,
@@ -60,14 +40,8 @@ pub struct AutoencoderBatch<B: Backend> {
     pub masked_spectra_mask: Tensor<B, 2>,
     /// Float mask with `1.0` for synthetic intruder peak slots.
     pub intruder_peak_mask: Tensor<B, 2>,
-    /// Retention time tensor with shape `[batch, 1]`; value is zero when absent.
-    pub retention_time: Tensor<B, 2>,
-    /// Retention-time presence flag with shape `[batch, 1]`.
-    pub retention_present: Tensor<B, 2>,
-    /// Source-file identifier with shape `[batch, 1]`; value is `-1` when absent.
-    pub filename_id: Tensor<B, 2>,
-    /// Partner row index for DreaMS-style same-file retention-order pairs.
-    pub retention_partner_index: Tensor<B, 1, Int>,
+    /// Teacher-supervised similarity-ranking partners and score gaps.
+    pub similarity_ranking: SimilarityRankingBatch<B>,
 }
 
 /// One tokenized autoencoder sample.
@@ -100,7 +74,7 @@ pub struct TokenizedAutoencoderBatch<B: Backend> {
     pub target_peak_mask: Tensor<B, 2>,
     /// Attention padding mask with shape `[batch, max_peaks]`.
     pub padding_mask: Tensor<B, 2, Bool>,
-    /// Metadata conditions fed to both encoder and decoder.
+    /// Metadata conditions fed to the encoder.
     pub conditions: Tensor<B, 2>,
     /// Second peak-token input view used for latent consistency.
     pub consistency_token_features: Tensor<B, 3>,
@@ -114,14 +88,8 @@ pub struct TokenizedAutoencoderBatch<B: Backend> {
     pub masked_peak_mask: Tensor<B, 2>,
     /// Float mask with `1.0` for synthetic intruder peak tokens.
     pub intruder_peak_mask: Tensor<B, 2>,
-    /// Retention time tensor with shape `[batch, 1]`; value is zero when absent.
-    pub retention_time: Tensor<B, 2>,
-    /// Retention-time presence flag with shape `[batch, 1]`.
-    pub retention_present: Tensor<B, 2>,
-    /// Source-file identifier with shape `[batch, 1]`; value is `-1` when absent.
-    pub filename_id: Tensor<B, 2>,
-    /// Partner row index for DreaMS-style same-file retention-order pairs.
-    pub retention_partner_index: Tensor<B, 1, Int>,
+    /// Teacher-supervised similarity-ranking partners and score gaps.
+    pub similarity_ranking: SimilarityRankingBatch<B>,
 }
 
 /// Converts vectorized samples into Burn tensors.
@@ -139,11 +107,7 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for Autoenco
         let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_spectra_mask = Vec::with_capacity(layout.spectrum_capacity());
         let mut intruder_peak_mask = Vec::with_capacity(layout.peak_capacity());
-        let mut retention_time = Vec::with_capacity(layout.metadata_capacity());
-        let mut retention_present = Vec::with_capacity(layout.metadata_capacity());
-        let mut filename_id = Vec::with_capacity(layout.metadata_capacity());
         for item in items {
-            let (rt, rt_present) = item.metadata.retention_parts();
             spectra.extend_from_slice(&item.spectrum);
             target_spectra.extend_from_slice(&item.spectrum);
             consistency_spectra.extend(item.spectrum);
@@ -151,12 +115,7 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for Autoenco
             consistency_conditions.extend(item.conditions);
             masked_spectra_mask.resize(masked_spectra_mask.len() + layout.spectrum_width, 0.0);
             intruder_peak_mask.resize(intruder_peak_mask.len() + layout.peak_count(), 0.0);
-            retention_time.push(rt);
-            retention_present.push(rt_present);
-            filename_id.push(item.metadata.filename_part());
         }
-        let retention_partner_index =
-            retention_partner_indices(&filename_id, &retention_time, &retention_present);
 
         autoencoder_batch_from_parts(
             AutoencoderBatchParts {
@@ -168,10 +127,7 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for Autoenco
                 consistency_conditions,
                 masked_spectra_mask,
                 intruder_peak_mask,
-                retention_time,
-                retention_present,
-                filename_id,
-                retention_partner_index,
+                similarity_ranking: None,
             },
             device,
         )
@@ -204,11 +160,7 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
         let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_peak_mask = Vec::with_capacity(layout.peak_capacity());
         let mut intruder_peak_mask = Vec::with_capacity(layout.peak_capacity());
-        let mut retention_time = Vec::with_capacity(layout.metadata_capacity());
-        let mut retention_present = Vec::with_capacity(layout.metadata_capacity());
-        let mut filename_id = Vec::with_capacity(layout.metadata_capacity());
         for item in items {
-            let (rt, rt_present) = item.metadata.retention_parts();
             token_features.extend_from_slice(&item.token_features);
             consistency_token_features.extend(item.token_features);
             target_pairs.extend(item.target_pairs);
@@ -221,12 +173,7 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
             consistency_padding_mask.extend(item.padding_mask);
             conditions.extend_from_slice(&item.conditions);
             consistency_conditions.extend(item.conditions);
-            retention_time.push(rt);
-            retention_present.push(rt_present);
-            filename_id.push(item.metadata.filename_part());
         }
-        let retention_partner_index =
-            retention_partner_indices(&filename_id, &retention_time, &retention_present);
 
         tokenized_autoencoder_batch_from_parts(
             TokenizedAutoencoderBatchParts {
@@ -243,99 +190,11 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
                 consistency_conditions,
                 masked_peak_mask,
                 intruder_peak_mask,
-                retention_time,
-                retention_present,
-                filename_id,
-                retention_partner_index,
+                similarity_ranking: None,
             },
             device,
         )
     }
-}
-
-/// Chooses one deterministic same-file partner per row for retention-order training.
-///
-/// The returned indices are row-local. Rows without another valid same-file,
-/// non-tied retention-time partner point to themselves and are later masked out.
-#[must_use]
-pub fn retention_partner_indices(
-    filename_id: &[f32],
-    retention_time: &[f32],
-    retention_present: &[f32],
-) -> Vec<i64> {
-    retention_partner_indices_with_seed(filename_id, retention_time, retention_present, 0)
-}
-
-/// Chooses one seeded same-file partner per row for retention-order training.
-///
-/// The seed is intended to include epoch/batch information for training loaders
-/// so the same cached spectra can expose different valid partners over time.
-#[must_use]
-pub fn retention_partner_indices_with_seed(
-    filename_id: &[f32],
-    retention_time: &[f32],
-    retention_present: &[f32],
-    seed: u64,
-) -> Vec<i64> {
-    assert_eq!(
-        filename_id.len(),
-        retention_time.len(),
-        "filename ids and retention times must have the same length"
-    );
-    assert_eq!(
-        filename_id.len(),
-        retention_present.len(),
-        "filename ids and retention masks must have the same length"
-    );
-
-    let mut partners: Vec<i64> = (0..filename_id.len() as i64).collect();
-    let mut by_file: HashMap<i64, Vec<usize>> = HashMap::new();
-    for (index, ((file_id, rt), present)) in filename_id
-        .iter()
-        .zip(retention_time)
-        .zip(retention_present)
-        .enumerate()
-    {
-        if *file_id >= 0.0 && *present > 0.0 && rt.is_finite() {
-            by_file.entry(*file_id as i64).or_default().push(index);
-        }
-    }
-
-    for (file_id, indices) in by_file {
-        if indices.len() < 2 {
-            continue;
-        }
-        for (position, &index) in indices.iter().enumerate() {
-            let mut step =
-                1 + (mixed_index_seed(file_id, index, seed) as usize % (indices.len() - 1));
-            for _ in 0..indices.len() - 1 {
-                let partner = indices[(position + step) % indices.len()];
-                if (retention_time[partner] - retention_time[index]).abs() > 1.0e-6 {
-                    partners[index] = partner as i64;
-                    break;
-                }
-                step = if step == indices.len() - 1 {
-                    1
-                } else {
-                    step + 1
-                };
-            }
-        }
-    }
-
-    partners
-}
-
-fn mixed_index_seed(file_id: i64, index: usize, seed: u64) -> u64 {
-    let mut value = (file_id as u64)
-        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        .wrapping_add(index as u64)
-        .wrapping_add(seed.rotate_left(17));
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -372,13 +231,9 @@ impl AutoencoderBatchLayout {
     pub(crate) const fn condition_capacity(&self) -> usize {
         self.batch_size * self.condition_width
     }
-
-    pub(crate) const fn metadata_capacity(&self) -> usize {
-        self.batch_size
-    }
 }
 
-pub(crate) struct AutoencoderBatchParts {
+pub(crate) struct AutoencoderBatchParts<B: Backend> {
     pub(crate) layout: AutoencoderBatchLayout,
     pub(crate) spectra: Vec<f32>,
     pub(crate) target_spectra: Vec<f32>,
@@ -387,16 +242,16 @@ pub(crate) struct AutoencoderBatchParts {
     pub(crate) consistency_conditions: Vec<f32>,
     pub(crate) masked_spectra_mask: Vec<f32>,
     pub(crate) intruder_peak_mask: Vec<f32>,
-    pub(crate) retention_time: Vec<f32>,
-    pub(crate) retention_present: Vec<f32>,
-    pub(crate) filename_id: Vec<f32>,
-    pub(crate) retention_partner_index: Vec<i64>,
+    pub(crate) similarity_ranking: Option<SimilarityRankingBatch<B>>,
 }
 
 pub(crate) fn autoencoder_batch_from_parts<B: Backend>(
-    parts: AutoencoderBatchParts,
+    parts: AutoencoderBatchParts<B>,
     device: &B::Device,
 ) -> AutoencoderBatch<B> {
+    let similarity_ranking = parts
+        .similarity_ranking
+        .unwrap_or_else(|| SimilarityRankingBatch::zeros(parts.layout.batch_size, device));
     AutoencoderBatch {
         spectra: Tensor::<B, 2>::from_data(
             TensorData::new(
@@ -447,22 +302,7 @@ pub(crate) fn autoencoder_batch_from_parts<B: Backend>(
             ),
             device,
         ),
-        retention_time: Tensor::<B, 2>::from_data(
-            TensorData::new(parts.retention_time, [parts.layout.batch_size, 1]),
-            device,
-        ),
-        retention_present: Tensor::<B, 2>::from_data(
-            TensorData::new(parts.retention_present, [parts.layout.batch_size, 1]),
-            device,
-        ),
-        filename_id: Tensor::<B, 2>::from_data(
-            TensorData::new(parts.filename_id, [parts.layout.batch_size, 1]),
-            device,
-        ),
-        retention_partner_index: Tensor::<B, 1, Int>::from_data(
-            TensorData::new(parts.retention_partner_index, [parts.layout.batch_size]),
-            device,
-        ),
+        similarity_ranking,
     }
 }
 
@@ -505,13 +345,9 @@ impl TokenizedAutoencoderBatchLayout {
     pub(crate) const fn condition_capacity(&self) -> usize {
         self.batch_size * self.condition_width
     }
-
-    pub(crate) const fn metadata_capacity(&self) -> usize {
-        self.batch_size
-    }
 }
 
-pub(crate) struct TokenizedAutoencoderBatchParts {
+pub(crate) struct TokenizedAutoencoderBatchParts<B: Backend> {
     pub(crate) layout: TokenizedAutoencoderBatchLayout,
     pub(crate) token_features: Vec<f32>,
     pub(crate) target_pairs: Vec<f32>,
@@ -525,16 +361,16 @@ pub(crate) struct TokenizedAutoencoderBatchParts {
     pub(crate) consistency_conditions: Vec<f32>,
     pub(crate) masked_peak_mask: Vec<f32>,
     pub(crate) intruder_peak_mask: Vec<f32>,
-    pub(crate) retention_time: Vec<f32>,
-    pub(crate) retention_present: Vec<f32>,
-    pub(crate) filename_id: Vec<f32>,
-    pub(crate) retention_partner_index: Vec<i64>,
+    pub(crate) similarity_ranking: Option<SimilarityRankingBatch<B>>,
 }
 
 pub(crate) fn tokenized_autoencoder_batch_from_parts<B: Backend>(
-    parts: TokenizedAutoencoderBatchParts,
+    parts: TokenizedAutoencoderBatchParts<B>,
     device: &B::Device,
 ) -> TokenizedAutoencoderBatch<B> {
+    let similarity_ranking = parts
+        .similarity_ranking
+        .unwrap_or_else(|| SimilarityRankingBatch::zeros(parts.layout.batch_size, device));
     TokenizedAutoencoderBatch {
         token_features: Tensor::<B, 3>::from_data(
             TensorData::new(
@@ -628,22 +464,7 @@ pub(crate) fn tokenized_autoencoder_batch_from_parts<B: Backend>(
             ),
             device,
         ),
-        retention_time: Tensor::<B, 2>::from_data(
-            TensorData::new(parts.retention_time, [parts.layout.batch_size, 1]),
-            device,
-        ),
-        retention_present: Tensor::<B, 2>::from_data(
-            TensorData::new(parts.retention_present, [parts.layout.batch_size, 1]),
-            device,
-        ),
-        filename_id: Tensor::<B, 2>::from_data(
-            TensorData::new(parts.filename_id, [parts.layout.batch_size, 1]),
-            device,
-        ),
-        retention_partner_index: Tensor::<B, 1, Int>::from_data(
-            TensorData::new(parts.retention_partner_index, [parts.layout.batch_size]),
-            device,
-        ),
+        similarity_ranking,
     }
 }
 
@@ -666,10 +487,7 @@ mod tests {
                 AutoencoderSample {
                     spectrum: vec![0.3, 0.4],
                     conditions: vec![0.0],
-                    metadata: SampleMetadata {
-                        retention_time: Some(12.0),
-                        filename_id: Some(3),
-                    },
+                    metadata: SampleMetadata,
                 },
             ],
             &device,
@@ -681,9 +499,6 @@ mod tests {
         assert_eq!(batch.consistency_spectra.dims(), [2, 2]);
         assert_eq!(batch.masked_spectra_mask.dims(), [2, 2]);
         assert_eq!(batch.intruder_peak_mask.dims(), [2, 1]);
-        assert_eq!(batch.retention_time.dims(), [2, 1]);
-        assert_eq!(batch.filename_id.dims(), [2, 1]);
-        assert_eq!(batch.retention_partner_index.dims(), [2]);
     }
 
     #[test]
@@ -707,10 +522,7 @@ mod tests {
                     peak_mask: vec![1.0, 1.0],
                     padding_mask: vec![false, false],
                     conditions: vec![0.0],
-                    metadata: SampleMetadata {
-                        retention_time: Some(13.0),
-                        filename_id: Some(3),
-                    },
+                    metadata: SampleMetadata,
                 },
             ],
             &device,
@@ -726,53 +538,5 @@ mod tests {
         assert_eq!(batch.consistency_peak_mask.dims(), [2, 2]);
         assert_eq!(batch.masked_peak_mask.dims(), [2, 2]);
         assert_eq!(batch.intruder_peak_mask.dims(), [2, 2]);
-        assert_eq!(batch.retention_time.dims(), [2, 1]);
-        assert_eq!(batch.filename_id.dims(), [2, 1]);
-        assert_eq!(batch.retention_partner_index.dims(), [2]);
-    }
-
-    #[test]
-    fn retention_partners_use_same_file_non_tied_rows() {
-        let filename_id = vec![1.0, 2.0, 1.0, 1.0, 2.0, -1.0];
-        let retention_time = vec![10.0, 20.0, 10.0, 40.0, 25.0, 50.0];
-        let retention_present = vec![1.0; 6];
-
-        let partners = retention_partner_indices(&filename_id, &retention_time, &retention_present);
-
-        assert_eq!(partners[1], 4);
-        assert_eq!(partners[4], 1);
-        assert_eq!(partners[5], 5);
-        for &index in &[0_usize, 2, 3] {
-            let partner = partners[index] as usize;
-            assert_eq!(filename_id[partner], filename_id[index]);
-            assert_ne!(retention_time[partner], retention_time[index]);
-        }
-    }
-
-    #[test]
-    fn retention_partners_change_with_seed_when_choices_exist() {
-        let filename_id = vec![1.0; 6];
-        let retention_time = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
-        let retention_present = vec![1.0; 6];
-
-        let first = retention_partner_indices_with_seed(
-            &filename_id,
-            &retention_time,
-            &retention_present,
-            0,
-        );
-        let second = retention_partner_indices_with_seed(
-            &filename_id,
-            &retention_time,
-            &retention_present,
-            1,
-        );
-
-        assert_ne!(first, second);
-        for (index, &partner) in second.iter().enumerate() {
-            let partner = partner as usize;
-            assert_eq!(filename_id[partner], filename_id[index]);
-            assert_ne!(retention_time[partner], retention_time[index]);
-        }
     }
 }

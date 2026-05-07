@@ -12,6 +12,8 @@ pub mod batch;
 pub mod conditioning;
 pub mod data;
 pub mod error;
+#[cfg(feature = "cuda")]
+pub mod linear_cosine_cuda;
 pub mod metrics;
 pub mod model;
 pub mod tokenize;
@@ -26,7 +28,6 @@ pub use augmentation::{
 pub use batch::{
     AutoencoderBatch, AutoencoderBatcher, AutoencoderSample, SampleMetadata,
     TokenizedAutoencoderBatch, TokenizedAutoencoderBatcher, TokenizedAutoencoderSample,
-    retention_partner_indices, retention_partner_indices_with_seed,
 };
 pub use conditioning::{ConditioningConfig, ConditioningEncoder};
 pub use data::{
@@ -37,10 +38,11 @@ pub use error::{Error, Result};
 pub use metrics::{DenseReconstructionMetrics, SpectralMetricConfig, SpectralMetrics};
 pub use model::{
     AutoencoderOutput, AuxiliaryLossConfig, Decoder, DecoderConfig, EmbeddingAuxiliaryHeads,
-    EmbeddingAuxiliaryHeadsConfig, Encoder, EncoderConfig, PeakSetAutoencoder,
-    PeakSetAutoencoderConfig, PeakSetAutoencoderOutput, PeakSetDecoder, PeakSetDecoderConfig,
-    PeakSetEncoder, PeakSetEncoderConfig, PeakSetLossConfig, RegularizationConfig,
-    SetReconstructionLossConfig, SpectralAutoencoder, SpectralAutoencoderConfig,
+    EmbeddingAuxiliaryHeadsConfig, Encoder, EncoderConfig, FlatVectorReconstructionOrdering,
+    PeakSetAutoencoder, PeakSetAutoencoderConfig, PeakSetAutoencoderOutput, PeakSetDecoder,
+    PeakSetDecoderConfig, PeakSetEncoder, PeakSetEncoderConfig, PeakSetLossConfig,
+    RegularizationConfig, SetReconstructionLossConfig, SimilarityRankingBatch, SpectralAutoencoder,
+    SpectralAutoencoderConfig,
 };
 pub use tokenize::{SpectrumTokenizer, SpectrumTokenizerConfig, SpectrumTokens};
 #[cfg(feature = "train")]

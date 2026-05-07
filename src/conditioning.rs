@@ -115,9 +115,8 @@ impl ConditioningEncoder {
     }
 
     /// Encodes metadata available on an MGF record.
-    pub fn encode<I, P>(&self, record: &MascotGenericFormat<I, P>) -> Vec<f32>
+    pub fn encode<P>(&self, record: &MascotGenericFormat<P>) -> Vec<f32>
     where
-        I: Copy,
         P: SpectrumFloat,
     {
         let mut values = Vec::with_capacity(self.vector_width());
@@ -134,8 +133,7 @@ impl ConditioningEncoder {
             }
         }
         if self.config.include_charge {
-            let charge = record.charge();
-            if charge != 0 {
+            if let Some(charge) = record.charge().filter(|charge| *charge != 0) {
                 let scaled = f32::from(charge) / self.config.charge_scale as f32;
                 values.push(scaled.clamp(-1.0, 1.0));
                 values.push(1.0);

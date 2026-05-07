@@ -799,7 +799,7 @@ checksum = "fe6d2e5af09e8c8ad56c969f2157a3d4238cebc7c55f0a517728c38f7b200f81"
 dependencies = [
  "serde",
  "termcolor",
- "unicode-width 0.2.0",
+ "unicode-width 0.1.14",
 ]
 
 [[package]]
@@ -860,24 +860,11 @@ dependencies = [
 
 [[package]]
 name = "console"
-version = "0.15.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e1f83fc076bd6dd27517eacdf25fef6c4dfe5f1d7448bafaaf3a26f13b5e4eb"
-dependencies = [
- "encode_unicode 0.3.6",
- "lazy_static",
- "libc",
- "unicode-width 0.1.14",
- "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "console"
 version = "0.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d64e8af5551369d19cf50138de61f1c42074ab970f74e99be916646777f8fc87"
 dependencies = [
- "encode_unicode 1.0.0",
+ "encode_unicode",
  "libc",
  "unicode-width 0.2.0",
  "windows-sys 0.61.2",
@@ -1764,9 +1751,9 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "elements_rs"
-version = "0.2.6"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bd188e809697c6ab48177f32792f1d29f41451e7956336b0ba939adfde120aa"
+checksum = "1ee1cc8038a8b7ac1ab9fd940d5a20c99e01defa3bd982057e62017ea4e5402e"
 dependencies = [
  "serde",
  "strum 0.28.0",
@@ -1829,12 +1816,6 @@ checksum = "0c4c685bbef7fe13c3c6dd4da26841ed3980ef33e841cddfa15ce8a8fb3f1884"
 dependencies = [
  "embedded-hal 1.0.0",
 ]
-
-[[package]]
-name = "encode_unicode"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a357d28ed41a50f9c765dbfe56cbc04a64e53e5fc58ba79fbc34c10ef3df831f"
 
 [[package]]
 name = "encode_unicode"
@@ -2275,7 +2256,7 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#6f1bc412e34c3e698877bab976124041f8043b75"
+source = "git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main#c0b1a8e9c9add3398b83ada2f2bb7ff6d7d2f0c5"
 dependencies = [
  "bitvec",
  "hashbrown 0.16.1",
@@ -2289,7 +2270,7 @@ dependencies = [
 [[package]]
 name = "geometric-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/geometric-traits#6f1bc412e34c3e698877bab976124041f8043b75"
+source = "git+https://github.com/earth-metabolome-initiative/geometric-traits#c0b1a8e9c9add3398b83ada2f2bb7ff6d7d2f0c5"
 dependencies = [
  "bitvec",
  "hashbrown 0.16.1",
@@ -2510,6 +2491,10 @@ name = "hashbrown"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
+dependencies = [
+ "foldhash 0.2.0",
+ "rustc-std-workspace-alloc",
+]
 
 [[package]]
 name = "heck"
@@ -2655,7 +2640,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.61.2",
+ "windows-core 0.58.0",
 ]
 
 [[package]]
@@ -2796,23 +2781,11 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
-version = "0.17.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "183b3088984b400f4cfac3620d5e076c84da5364016b4f49473de574b2586235"
-dependencies = [
- "console 0.15.8",
- "number_prefix",
- "portable-atomic",
- "web-time",
-]
-
-[[package]]
-name = "indicatif"
 version = "0.18.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25470f23803092da7d239834776d653104d551bc4d7eacaf31e6837854b8e9eb"
 dependencies = [
- "console 0.16.3",
+ "console",
  "portable-atomic",
  "unicode-width 0.2.0",
  "unit-prefix",
@@ -3149,13 +3122,13 @@ dependencies = [
 [[package]]
 name = "mascot-rs"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/mascot-rs#2a432aaf259aba499509e83fdd8e0ade812ac774"
+source = "git+https://github.com/LucaCappelletti94/mascot-rs#6f11bdb4f57b592e5eae29675ce21735537eb236"
 dependencies = [
- "console 0.15.8",
  "flate2",
- "indicatif 0.17.11",
+ "indicatif",
  "mass_spectrometry",
  "mem_dbg",
+ "molecular-formulas",
  "smiles-parser",
  "thiserror 2.0.18",
  "ureq",
@@ -3166,10 +3139,9 @@ dependencies = [
 [[package]]
 name = "mass_spectrometry"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/mass-spectrometry-traits?rev=33849cf912c9d2e6d13258f01593b7261e9f3c23#33849cf912c9d2e6d13258f01593b7261e9f3c23"
+source = "git+https://github.com/earth-metabolome-initiative/mass-spectrometry-traits#937bdee730be861c4ca94285f7c478c719b4835e"
 dependencies = [
  "arbitrary",
- "bitvec",
  "geometric-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/geometric-traits)",
  "half",
  "itoa",
@@ -3314,9 +3286,9 @@ checksum = "4a0b3262dc837d2513fe2ef31ff8461352ef932dcca31ba0c0abe33547cf6b9b"
 
 [[package]]
 name = "molecular-formulas"
-version = "0.1.9"
+version = "0.1.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f50760a98089095da7db7c128617b704d2e257ac942dd37b44387d138b63c24e"
+checksum = "2157428e33c26e3e5b856371a3be0c2de365d95f968604be07ca05b4bd690adb"
 dependencies = [
  "elements_rs",
  "num-traits",
@@ -3527,12 +3499,6 @@ checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
 dependencies = [
  "libc",
 ]
-
-[[package]]
-name = "number_prefix"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "830b246a0e5f20af87141b25c173cd1b609bd7779a4617d6ec582abaf90870f3"
 
 [[package]]
 name = "objc"
@@ -4621,11 +4587,11 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 [[package]]
 name = "smiles-parser"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/smiles-parser?rev=8e8f5195979efba0cf12caf6c497a8654fc0bb9e#8e8f5195979efba0cf12caf6c497a8654fc0bb9e"
+source = "git+https://github.com/earth-metabolome-initiative/smiles-parser?rev=ad15ce7205f4e3ad842f5eaa153d562f3548bd79#ad15ce7205f4e3ad842f5eaa153d562f3548bd79"
 dependencies = [
  "elements_rs",
  "geometric-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/geometric-traits?branch=main)",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "molecular-formulas",
  "smallvec",
  "thiserror 2.0.18",
@@ -4647,7 +4613,11 @@ version = "0.1.0"
 dependencies = [
  "approx",
  "burn",
- "indicatif 0.18.4",
+ "burn-cubecl",
+ "burn-fusion",
+ "burn-ir",
+ "cubecl",
+ "indicatif",
  "mascot-rs",
  "mass_spectrometry",
  "serde",

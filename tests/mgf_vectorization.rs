@@ -20,7 +20,7 @@ END IONS
 
 #[test]
 fn vectorizes_mgf_record_with_conditions() -> Result<()> {
-    let mut records = MGFIter::<usize>::from_document(MGF);
+    let mut records = MGFIter::<f64>::from_document(MGF);
     let record = match records.next() {
         Some(record) => record?,
         None => panic!("test MGF should contain one record"),
@@ -66,13 +66,11 @@ fn vectorized_iterator_streams_multiple_mgf_paths() -> Result<()> {
     )?;
     let first = iter.next().expect("first path should yield one record")?;
     assert_eq!(first.spectrum.len(), 120);
-    assert_eq!(first.metadata.retention_time, Some(37.5));
-    assert_eq!(first.metadata.filename_id, Some(0));
+    assert_eq!(first.metadata, Default::default());
 
     let second = iter.next().expect("second path should yield one record")?;
     assert_eq!(second.spectrum.len(), 120);
-    assert_eq!(second.metadata.retention_time, Some(37.5));
-    assert_eq!(second.metadata.filename_id, Some(0));
+    assert_eq!(second.metadata, Default::default());
     assert!(iter.next().is_none());
 
     std::fs::remove_file(first_path).ok();

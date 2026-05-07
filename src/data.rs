@@ -1,9 +1,6 @@
 //! Streaming MGF ingestion and vectorized samples.
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use mascot_rs::mascot_generic_format::MGFPathIter;
 use mascot_rs::prelude::{MGFIter, MascotGenericFormat};
@@ -47,7 +44,7 @@ impl MgfSummary {
 /// Summarizes an MGF file with tolerant parsing.
 pub fn summarize_mgf_path(path: impl AsRef<Path>, limit: Option<usize>) -> Result<MgfSummary> {
     let path = path.as_ref();
-    let mut iter = MGFIter::<usize, f64, _>::from_path(path)?.skipping_invalid_records();
+    let mut iter = MGFIter::<f64, _>::from_path(path)?.skipping_invalid_records();
     let mut records = 0usize;
     let mut peaks = 0usize;
     let mut min_peaks = usize::MAX;
@@ -82,14 +79,14 @@ pub fn summarize_mgf_path(path: impl AsRef<Path>, limit: Option<usize>) -> Resul
 }
 
 enum MgfRecordIter {
-    Single(MGFPathIter<usize, f64>),
+    Single(MGFPathIter<f64>),
     Multiple(MultiMgfRecordIter),
 }
 
 impl MgfRecordIter {
     fn from_path(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self::Single(
-            MGFIter::<usize, f64, _>::from_path(path)?.skipping_invalid_records(),
+            MGFIter::<f64, _>::from_path(path)?.skipping_invalid_records(),
         ))
     }
 
@@ -123,8 +120,7 @@ impl MgfRecordIter {
 }
 
 impl Iterator for MgfRecordIter {
-    type Item =
-        std::result::Result<MascotGenericFormat<usize, f64>, mascot_rs::prelude::MascotError>;
+    type Item = std::result::Result<MascotGenericFormat<f64>, mascot_rs::prelude::MascotError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -137,7 +133,7 @@ impl Iterator for MgfRecordIter {
 struct MultiMgfRecordIter {
     paths: Vec<PathBuf>,
     next_path: usize,
-    current: Option<MGFPathIter<usize, f64>>,
+    current: Option<MGFPathIter<f64>>,
     skipped_records: usize,
 }
 
@@ -160,7 +156,7 @@ impl MultiMgfRecordIter {
     ) -> Option<std::result::Result<(), mascot_rs::prelude::MascotError>> {
         let path = self.paths.get(self.next_path)?;
         self.next_path += 1;
-        match MGFIter::<usize, f64, _>::from_path(path) {
+        match MGFIter::<f64, _>::from_path(path) {
             Ok(records) => {
                 self.current = Some(records.skipping_invalid_records());
                 Some(Ok(()))
@@ -171,8 +167,7 @@ impl MultiMgfRecordIter {
 }
 
 impl Iterator for MultiMgfRecordIter {
-    type Item =
-        std::result::Result<MascotGenericFormat<usize, f64>, mascot_rs::prelude::MascotError>;
+    type Item = std::result::Result<MascotGenericFormat<f64>, mascot_rs::prelude::MascotError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -197,7 +192,6 @@ pub struct VectorizedMgfIter {
     records: MgfRecordIter,
     vectorizer: SpectrumVectorizer,
     conditioning: ConditioningEncoder,
-    filename_ids: HashMap<String, u32>,
 }
 
 /// Iterator over tokenized spectra loaded from one or more MGF paths.
@@ -205,7 +199,6 @@ pub struct TokenizedMgfIter {
     records: MgfRecordIter,
     tokenizer: SpectrumTokenizer,
     conditioning: ConditioningEncoder,
-    filename_ids: HashMap<String, u32>,
 }
 
 impl VectorizedMgfIter {
@@ -219,7 +212,6 @@ impl VectorizedMgfIter {
             records: MgfRecordIter::from_path(path)?,
             vectorizer,
             conditioning,
-            filename_ids: HashMap::new(),
         })
     }
 
@@ -237,7 +229,6 @@ impl VectorizedMgfIter {
             records: MgfRecordIter::from_paths(paths)?,
             vectorizer,
             conditioning,
-            filename_ids: HashMap::new(),
         })
     }
 
@@ -247,15 +238,11 @@ impl VectorizedMgfIter {
         self.records.skipped_records()
     }
 
-    fn encode_record(
-        &mut self,
-        record: &MascotGenericFormat<usize, f64>,
-    ) -> Result<AutoencoderSample> {
-        let metadata = sample_metadata(record, &mut self.filename_ids);
+    fn encode_record(&mut self, record: &MascotGenericFormat<f64>) -> Result<AutoencoderSample> {
         Ok(AutoencoderSample {
             spectrum: self.vectorizer.encode(record)?.values,
             conditions: self.conditioning.encode(record),
-            metadata,
+            metadata: SampleMetadata,
         })
     }
 }
@@ -283,7 +270,6 @@ impl TokenizedMgfIter {
             records: MgfRecordIter::from_path(path)?,
             tokenizer,
             conditioning,
-            filename_ids: HashMap::new(),
         })
     }
 
@@ -301,7 +287,6 @@ impl TokenizedMgfIter {
             records: MgfRecordIter::from_paths(paths)?,
             tokenizer,
             conditioning,
-            filename_ids: HashMap::new(),
         })
     }
 
@@ -313,17 +298,16 @@ impl TokenizedMgfIter {
 
     fn encode_record(
         &mut self,
-        record: &MascotGenericFormat<usize, f64>,
+        record: &MascotGenericFormat<f64>,
     ) -> Result<TokenizedAutoencoderSample> {
         let tokens = self.tokenizer.encode(record)?;
-        let metadata = sample_metadata(record, &mut self.filename_ids);
         Ok(TokenizedAutoencoderSample {
             token_features: tokens.features,
             target_pairs: tokens.target_pairs,
             peak_mask: tokens.peak_mask,
             padding_mask: tokens.padding_mask,
             conditions: self.conditioning.encode(record),
-            metadata,
+            metadata: SampleMetadata,
         })
     }
 }
@@ -382,24 +366,4 @@ where
     Paths: IntoIterator<Item = PathLike>,
 {
     TokenizedMgfIter::from_paths(paths, tokenizer, conditioning)
-}
-
-fn sample_metadata(
-    record: &MascotGenericFormat<usize, f64>,
-    filename_ids: &mut HashMap<String, u32>,
-) -> SampleMetadata {
-    let retention_time = record
-        .metadata()
-        .retention_time()
-        .map(|retention_time| retention_time as f32)
-        .filter(|retention_time| retention_time.is_finite() && *retention_time > 0.0);
-    let filename_id = record.metadata().filename().map(|filename| {
-        let next_id = filename_ids.len() as u32;
-        *filename_ids.entry(filename.to_owned()).or_insert(next_id)
-    });
-
-    SampleMetadata {
-        retention_time,
-        filename_id,
-    }
 }
