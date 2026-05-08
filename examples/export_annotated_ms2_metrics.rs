@@ -75,7 +75,7 @@ mod app {
             let metrics = SpectrumMetrics::from_spectrum(written, &record);
             metrics.write(&mut writer)?;
             written += 1;
-            if written % 512 == 0 {
+            if written.is_multiple_of(512) {
                 bar.set_position(written as u64);
             }
             if args.limit.is_some_and(|limit| written >= limit) {
@@ -265,7 +265,7 @@ mod app {
             return f64::NAN;
         }
         let middle = values.len() / 2;
-        if values.len() % 2 == 0 {
+        if values.len().is_multiple_of(2) {
             (values[middle - 1] + values[middle]) / 2.0
         } else {
             values[middle]

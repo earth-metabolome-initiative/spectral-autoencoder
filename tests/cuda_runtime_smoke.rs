@@ -27,7 +27,6 @@ fn peak_set_autoencoder_runs_cuda_fusion_train_step() {
             peak_mask: vec![1.0, 1.0, 1.0, 0.0],
             padding_mask: vec![false, false, false, true],
             conditions: vec![0.0; 16],
-            metadata: Default::default(),
         }],
         &device,
     );

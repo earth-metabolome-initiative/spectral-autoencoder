@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import argparse
 import re
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import matplotlib
 
@@ -120,9 +121,7 @@ def parse_args() -> argparse.Namespace:
 def read_embedding_dimension(path: Path) -> int:
     with path.open("r", encoding="utf-8") as file:
         header = file.readline().rstrip("\n").split("\t")
-    z_columns = [
-        column for column in header if column.startswith("z") and column[1:].isdigit()
-    ]
+    z_columns = [column for column in header if column.startswith("z") and column[1:].isdigit()]
     if not z_columns:
         raise SystemExit(f"no latent columns named z0..zN found in {path}")
     return len(z_columns)
@@ -200,7 +199,7 @@ def log10_column(name: str) -> MetricTransform:
 
 
 def required_column(transform: MetricTransform) -> str:
-    return getattr(transform, "required_column")
+    return transform.required_column
 
 
 def write_density_heatmap(

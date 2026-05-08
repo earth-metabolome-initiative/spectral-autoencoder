@@ -1,16 +1,15 @@
 //! Burn batch types for autoencoder training.
 
+#[cfg(feature = "std")]
+use burn::data::dataloader::batcher::Batcher;
+#[cfg(feature = "std")]
+use burn::tensor::TensorData;
 use burn::{
-    data::dataloader::batcher::Batcher,
     prelude::*,
-    tensor::{Bool, Tensor, TensorData},
+    tensor::{Bool, Tensor},
 };
 
 use crate::model::auxiliary::SimilarityRankingBatch;
-
-/// Per-spectrum metadata used by auxiliary objectives.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct SampleMetadata;
 
 /// One vectorized autoencoder sample.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,8 +18,6 @@ pub struct AutoencoderSample {
     pub spectrum: Vec<f32>,
     /// Optional metadata conditioning vector with explicit unknown buckets.
     pub conditions: Vec<f32>,
-    /// Metadata used only by auxiliary objectives.
-    pub metadata: SampleMetadata,
 }
 
 /// Batched tensors for the autoencoder.
@@ -32,6 +29,10 @@ pub struct AutoencoderBatch<B: Backend> {
     pub target_spectra: Tensor<B, 2>,
     /// Metadata conditions fed to the encoder.
     pub conditions: Tensor<B, 2>,
+    /// Clean metadata condition targets reconstructed by the decoder.
+    pub target_conditions: Tensor<B, 2>,
+    /// Float mask with `1.0` for rows whose precursor condition was masked in the encoder input.
+    pub masked_precursor_mask: Tensor<B, 2>,
     /// Second input view used for latent consistency.
     pub consistency_spectra: Tensor<B, 2>,
     /// Conditions for the second input view.
@@ -57,8 +58,6 @@ pub struct TokenizedAutoencoderSample {
     pub padding_mask: Vec<bool>,
     /// Optional metadata conditioning vector with explicit unknown buckets.
     pub conditions: Vec<f32>,
-    /// Metadata used only by auxiliary objectives.
-    pub metadata: SampleMetadata,
 }
 
 /// Batched tensors for token/set autoencoder training.
@@ -76,6 +75,10 @@ pub struct TokenizedAutoencoderBatch<B: Backend> {
     pub padding_mask: Tensor<B, 2, Bool>,
     /// Metadata conditions fed to the encoder.
     pub conditions: Tensor<B, 2>,
+    /// Clean metadata condition targets reconstructed by the decoder.
+    pub target_conditions: Tensor<B, 2>,
+    /// Float mask with `1.0` for rows whose precursor condition was masked in the encoder input.
+    pub masked_precursor_mask: Tensor<B, 2>,
     /// Second peak-token input view used for latent consistency.
     pub consistency_token_features: Tensor<B, 3>,
     /// Peak mask for the second input view.
@@ -93,9 +96,11 @@ pub struct TokenizedAutoencoderBatch<B: Backend> {
 }
 
 /// Converts vectorized samples into Burn tensors.
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, Default)]
 pub struct AutoencoderBatcher;
 
+#[cfg(feature = "std")]
 impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for AutoencoderBatcher {
     fn batch(&self, items: Vec<AutoencoderSample>, device: &B::Device) -> AutoencoderBatch<B> {
         let layout = AutoencoderBatchLayout::from_samples(&items);
@@ -103,6 +108,8 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for Autoenco
         let mut spectra = Vec::with_capacity(layout.spectrum_capacity());
         let mut target_spectra = Vec::with_capacity(layout.spectrum_capacity());
         let mut conditions = Vec::with_capacity(layout.condition_capacity());
+        let mut target_conditions = Vec::with_capacity(layout.condition_capacity());
+        let mut masked_precursor_mask = Vec::with_capacity(layout.batch_size);
         let mut consistency_spectra = Vec::with_capacity(layout.spectrum_capacity());
         let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_spectra_mask = Vec::with_capacity(layout.spectrum_capacity());
@@ -112,7 +119,9 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for Autoenco
             target_spectra.extend_from_slice(&item.spectrum);
             consistency_spectra.extend(item.spectrum);
             conditions.extend_from_slice(&item.conditions);
+            target_conditions.extend_from_slice(&item.conditions);
             consistency_conditions.extend(item.conditions);
+            masked_precursor_mask.push(0.0);
             masked_spectra_mask.resize(masked_spectra_mask.len() + layout.spectrum_width, 0.0);
             intruder_peak_mask.resize(intruder_peak_mask.len() + layout.peak_count(), 0.0);
         }
@@ -123,6 +132,8 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for Autoenco
                 spectra,
                 target_spectra,
                 conditions,
+                target_conditions,
+                masked_precursor_mask,
                 consistency_spectra,
                 consistency_conditions,
                 masked_spectra_mask,
@@ -135,9 +146,11 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for Autoenco
 }
 
 /// Converts tokenized samples into Burn tensors.
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, Default)]
 pub struct TokenizedAutoencoderBatcher;
 
+#[cfg(feature = "std")]
 impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatch<B>>
     for TokenizedAutoencoderBatcher
 {
@@ -154,6 +167,8 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
         let mut target_peak_mask = Vec::with_capacity(layout.peak_capacity());
         let mut padding_mask = Vec::with_capacity(layout.peak_capacity());
         let mut conditions = Vec::with_capacity(layout.condition_capacity());
+        let mut target_conditions = Vec::with_capacity(layout.condition_capacity());
+        let mut masked_precursor_mask = Vec::with_capacity(layout.batch_size);
         let mut consistency_token_features = Vec::with_capacity(layout.token_feature_capacity());
         let mut consistency_peak_mask = Vec::with_capacity(layout.peak_capacity());
         let mut consistency_padding_mask = Vec::with_capacity(layout.peak_capacity());
@@ -172,7 +187,9 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
             padding_mask.extend_from_slice(&item.padding_mask);
             consistency_padding_mask.extend(item.padding_mask);
             conditions.extend_from_slice(&item.conditions);
+            target_conditions.extend_from_slice(&item.conditions);
             consistency_conditions.extend(item.conditions);
+            masked_precursor_mask.push(0.0);
         }
 
         tokenized_autoencoder_batch_from_parts(
@@ -184,6 +201,8 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
                 target_peak_mask,
                 padding_mask,
                 conditions,
+                target_conditions,
+                masked_precursor_mask,
                 consistency_token_features,
                 consistency_peak_mask,
                 consistency_padding_mask,
@@ -198,12 +217,14 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "std")]
 pub(crate) struct AutoencoderBatchLayout {
     batch_size: usize,
     spectrum_width: usize,
     condition_width: usize,
 }
 
+#[cfg(feature = "std")]
 impl AutoencoderBatchLayout {
     pub(crate) fn from_samples(samples: &[AutoencoderSample]) -> Self {
         let first = samples
@@ -220,6 +241,10 @@ impl AutoencoderBatchLayout {
         self.batch_size * self.spectrum_width
     }
 
+    pub(crate) const fn batch_capacity(&self) -> usize {
+        self.batch_size
+    }
+
     pub(crate) const fn peak_count(&self) -> usize {
         self.spectrum_width / 2
     }
@@ -233,11 +258,14 @@ impl AutoencoderBatchLayout {
     }
 }
 
+#[cfg(feature = "std")]
 pub(crate) struct AutoencoderBatchParts<B: Backend> {
     pub(crate) layout: AutoencoderBatchLayout,
     pub(crate) spectra: Vec<f32>,
     pub(crate) target_spectra: Vec<f32>,
     pub(crate) conditions: Vec<f32>,
+    pub(crate) target_conditions: Vec<f32>,
+    pub(crate) masked_precursor_mask: Vec<f32>,
     pub(crate) consistency_spectra: Vec<f32>,
     pub(crate) consistency_conditions: Vec<f32>,
     pub(crate) masked_spectra_mask: Vec<f32>,
@@ -245,6 +273,7 @@ pub(crate) struct AutoencoderBatchParts<B: Backend> {
     pub(crate) similarity_ranking: Option<SimilarityRankingBatch<B>>,
 }
 
+#[cfg(feature = "std")]
 pub(crate) fn autoencoder_batch_from_parts<B: Backend>(
     parts: AutoencoderBatchParts<B>,
     device: &B::Device,
@@ -272,6 +301,17 @@ pub(crate) fn autoencoder_batch_from_parts<B: Backend>(
                 parts.conditions,
                 [parts.layout.batch_size, parts.layout.condition_width],
             ),
+            device,
+        ),
+        target_conditions: Tensor::<B, 2>::from_data(
+            TensorData::new(
+                parts.target_conditions,
+                [parts.layout.batch_size, parts.layout.condition_width],
+            ),
+            device,
+        ),
+        masked_precursor_mask: Tensor::<B, 2>::from_data(
+            TensorData::new(parts.masked_precursor_mask, [parts.layout.batch_size, 1]),
             device,
         ),
         consistency_spectra: Tensor::<B, 2>::from_data(
@@ -307,6 +347,7 @@ pub(crate) fn autoencoder_batch_from_parts<B: Backend>(
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "std")]
 pub(crate) struct TokenizedAutoencoderBatchLayout {
     batch_size: usize,
     max_peaks: usize,
@@ -315,6 +356,7 @@ pub(crate) struct TokenizedAutoencoderBatchLayout {
     condition_width: usize,
 }
 
+#[cfg(feature = "std")]
 impl TokenizedAutoencoderBatchLayout {
     pub(crate) fn from_samples(samples: &[TokenizedAutoencoderSample]) -> Self {
         let first = samples
@@ -334,6 +376,10 @@ impl TokenizedAutoencoderBatchLayout {
         self.batch_size * self.max_peaks * self.token_feature_width
     }
 
+    pub(crate) const fn batch_capacity(&self) -> usize {
+        self.batch_size
+    }
+
     pub(crate) const fn target_capacity(&self) -> usize {
         self.batch_size * self.target_width
     }
@@ -347,6 +393,7 @@ impl TokenizedAutoencoderBatchLayout {
     }
 }
 
+#[cfg(feature = "std")]
 pub(crate) struct TokenizedAutoencoderBatchParts<B: Backend> {
     pub(crate) layout: TokenizedAutoencoderBatchLayout,
     pub(crate) token_features: Vec<f32>,
@@ -355,6 +402,8 @@ pub(crate) struct TokenizedAutoencoderBatchParts<B: Backend> {
     pub(crate) target_peak_mask: Vec<f32>,
     pub(crate) padding_mask: Vec<bool>,
     pub(crate) conditions: Vec<f32>,
+    pub(crate) target_conditions: Vec<f32>,
+    pub(crate) masked_precursor_mask: Vec<f32>,
     pub(crate) consistency_token_features: Vec<f32>,
     pub(crate) consistency_peak_mask: Vec<f32>,
     pub(crate) consistency_padding_mask: Vec<bool>,
@@ -364,6 +413,7 @@ pub(crate) struct TokenizedAutoencoderBatchParts<B: Backend> {
     pub(crate) similarity_ranking: Option<SimilarityRankingBatch<B>>,
 }
 
+#[cfg(feature = "std")]
 pub(crate) fn tokenized_autoencoder_batch_from_parts<B: Backend>(
     parts: TokenizedAutoencoderBatchParts<B>,
     device: &B::Device,
@@ -418,6 +468,17 @@ pub(crate) fn tokenized_autoencoder_batch_from_parts<B: Backend>(
             ),
             device,
         ),
+        target_conditions: Tensor::<B, 2>::from_data(
+            TensorData::new(
+                parts.target_conditions,
+                [parts.layout.batch_size, parts.layout.condition_width],
+            ),
+            device,
+        ),
+        masked_precursor_mask: Tensor::<B, 2>::from_data(
+            TensorData::new(parts.masked_precursor_mask, [parts.layout.batch_size, 1]),
+            device,
+        ),
         consistency_token_features: Tensor::<B, 3>::from_data(
             TensorData::new(
                 parts.consistency_token_features,
@@ -468,7 +529,7 @@ pub(crate) fn tokenized_autoencoder_batch_from_parts<B: Backend>(
     }
 }
 
-#[cfg(all(test, feature = "ndarray"))]
+#[cfg(all(test, feature = "std", feature = "ndarray"))]
 mod tests {
     use super::*;
 
@@ -482,12 +543,10 @@ mod tests {
                 AutoencoderSample {
                     spectrum: vec![0.1, 0.2],
                     conditions: vec![1.0],
-                    metadata: SampleMetadata::default(),
                 },
                 AutoencoderSample {
                     spectrum: vec![0.3, 0.4],
                     conditions: vec![0.0],
-                    metadata: SampleMetadata,
                 },
             ],
             &device,
@@ -496,6 +555,8 @@ mod tests {
         assert_eq!(batch.spectra.dims(), [2, 2]);
         assert_eq!(batch.target_spectra.dims(), [2, 2]);
         assert_eq!(batch.conditions.dims(), [2, 1]);
+        assert_eq!(batch.target_conditions.dims(), [2, 1]);
+        assert_eq!(batch.masked_precursor_mask.dims(), [2, 1]);
         assert_eq!(batch.consistency_spectra.dims(), [2, 2]);
         assert_eq!(batch.masked_spectra_mask.dims(), [2, 2]);
         assert_eq!(batch.intruder_peak_mask.dims(), [2, 1]);
@@ -514,7 +575,6 @@ mod tests {
                     peak_mask: vec![1.0, 0.0],
                     padding_mask: vec![false, true],
                     conditions: vec![1.0],
-                    metadata: SampleMetadata::default(),
                 },
                 TokenizedAutoencoderSample {
                     token_features: vec![0.3, 0.4, 1.0, 0.5, 0.6, 1.0],
@@ -522,7 +582,6 @@ mod tests {
                     peak_mask: vec![1.0, 1.0],
                     padding_mask: vec![false, false],
                     conditions: vec![0.0],
-                    metadata: SampleMetadata,
                 },
             ],
             &device,
@@ -534,6 +593,8 @@ mod tests {
         assert_eq!(batch.target_peak_mask.dims(), [2, 2]);
         assert_eq!(batch.padding_mask.dims(), [2, 2]);
         assert_eq!(batch.conditions.dims(), [2, 1]);
+        assert_eq!(batch.target_conditions.dims(), [2, 1]);
+        assert_eq!(batch.masked_precursor_mask.dims(), [2, 1]);
         assert_eq!(batch.consistency_token_features.dims(), [2, 2, 3]);
         assert_eq!(batch.consistency_peak_mask.dims(), [2, 2]);
         assert_eq!(batch.masked_peak_mask.dims(), [2, 2]);

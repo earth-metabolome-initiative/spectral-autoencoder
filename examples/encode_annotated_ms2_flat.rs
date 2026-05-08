@@ -147,12 +147,15 @@ mod app {
         println!("output: {}", args.output.display());
         println!("device: cuda:{}", args.device);
         println!("batch size: {}", args.batch_size);
+        println!("latent width: {}", args.latent_width);
         if let Some(limit) = args.limit {
             println!("limit: {limit}");
         }
 
         let device = CudaDevice::new(args.device);
-        let config = SpectralAutoencoderConfig::twenty_million_run_with_peaks(MAX_PEAKS);
+        let mut config = SpectralAutoencoderConfig::twenty_million_run_with_peaks(MAX_PEAKS);
+        config.encoder.latent_width = args.latent_width;
+        config.decoder.latent_width = args.latent_width;
         let model = config.init::<Backend>(&device);
         let record = CompactRecorder::new().load(record_base_path(&args.model), &device)?;
         let model = model.load_record(record);
@@ -184,13 +187,15 @@ mod app {
                 write_batch(
                     &model,
                     &device,
-                    &mut writer,
-                    &mut spectra,
-                    &mut conditions,
-                    &mut annotations,
-                    config.encoder.spectrum_width,
-                    config.encoder.condition_width,
-                    config.encoder.latent_width,
+                    BatchBuffers {
+                        writer: &mut writer,
+                        spectra: &mut spectra,
+                        conditions: &mut conditions,
+                        annotations: &mut annotations,
+                        spectrum_width: config.encoder.spectrum_width,
+                        condition_width: config.encoder.condition_width,
+                        latent_width: config.encoder.latent_width,
+                    },
                 )?;
                 written += args.batch_size;
                 bar.set_position(written as u64);
@@ -212,13 +217,15 @@ mod app {
             write_batch(
                 &model,
                 &device,
-                &mut writer,
-                &mut spectra,
-                &mut conditions,
-                &mut annotations,
-                config.encoder.spectrum_width,
-                config.encoder.condition_width,
-                config.encoder.latent_width,
+                BatchBuffers {
+                    writer: &mut writer,
+                    spectra: &mut spectra,
+                    conditions: &mut conditions,
+                    annotations: &mut annotations,
+                    spectrum_width: config.encoder.spectrum_width,
+                    condition_width: config.encoder.condition_width,
+                    latent_width: config.encoder.latent_width,
+                },
             )?;
             written += batch_items;
             bar.set_position(written as u64);
@@ -238,6 +245,7 @@ mod app {
         output: PathBuf,
         dataset_dir: PathBuf,
         batch_size: usize,
+        latent_width: usize,
         device: usize,
         limit: Option<usize>,
         force_download: bool,
@@ -250,6 +258,7 @@ mod app {
                 output: path_var("ANNOTATED_MS2_OUT", DEFAULT_OUTPUT),
                 dataset_dir: path_var("ANNOTATED_MS2_DIR", DEFAULT_DATASET_DIR),
                 batch_size: usize_var("ANNOTATED_MS2_BATCH_SIZE", DEFAULT_BATCH_SIZE)?,
+                latent_width: usize_var("ANNOTATED_MS2_LATENT_WIDTH", 96)?,
                 device: usize_var("ANNOTATED_MS2_CUDA_DEVICE", 0)?,
                 limit: optional_usize_var("ANNOTATED_MS2_LIMIT")?,
                 force_download: bool_var("ANNOTATED_MS2_FORCE_DOWNLOAD", false)?,
@@ -257,17 +266,30 @@ mod app {
         }
     }
 
-    fn write_batch<W: Write>(
-        model: &spectral_autoencoder::SpectralAutoencoder<Backend>,
-        device: &CudaDevice,
-        writer: &mut W,
-        spectra: &mut Vec<f32>,
-        conditions: &mut Vec<f32>,
-        annotations: &mut Vec<Vec<String>>,
+    struct BatchBuffers<'a, W: Write> {
+        writer: &'a mut W,
+        spectra: &'a mut Vec<f32>,
+        conditions: &'a mut Vec<f32>,
+        annotations: &'a mut Vec<Vec<String>>,
         spectrum_width: usize,
         condition_width: usize,
         latent_width: usize,
+    }
+
+    fn write_batch<W: Write>(
+        model: &spectral_autoencoder::SpectralAutoencoder<Backend>,
+        device: &CudaDevice,
+        batch: BatchBuffers<'_, W>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let BatchBuffers {
+            writer,
+            spectra,
+            conditions,
+            annotations,
+            spectrum_width,
+            condition_width,
+            latent_width,
+        } = batch;
         let batch_size = annotations.len();
         let spectra_tensor = Tensor::<Backend, 2>::from_data(
             TensorData::new(core::mem::take(spectra), [batch_size, spectrum_width]),
@@ -358,10 +380,9 @@ mod app {
             if keys
                 .iter()
                 .any(|key| observed_key.eq_ignore_ascii_case(key))
+                && let Some(value) = clean_label(value)
             {
-                if let Some(value) = clean_label(value) {
-                    return value.to_owned();
-                }
+                return value.to_owned();
             }
         }
         String::new()

@@ -1,10 +1,13 @@
 //! Training-time spectral input augmentation.
 
+use serde::{Deserialize, Serialize};
+#[cfg(feature = "std")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(feature = "std")]
 use burn::{data::dataloader::batcher::Batcher, prelude::*};
-use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "std")]
 use crate::batch::{
     AutoencoderBatch, AutoencoderBatchLayout, AutoencoderBatchParts, AutoencoderSample,
     TokenizedAutoencoderBatch, TokenizedAutoencoderBatchLayout, TokenizedAutoencoderBatchParts,
@@ -12,7 +15,9 @@ use crate::batch::{
     tokenized_autoencoder_batch_from_parts,
 };
 
+#[cfg(feature = "std")]
 type AugmentedVector = (Vec<f32>, Vec<f32>, Vec<f32>);
+#[cfg(feature = "std")]
 type AugmentedTokenFeatures = (Vec<f32>, Vec<f32>, Vec<bool>, Vec<f32>, Vec<f32>);
 
 /// Spectral input augmentation configuration.
@@ -36,9 +41,9 @@ pub struct SpectrumAugmentationConfig {
     /// Multiplicative intensity jitter range around `1.0`.
     #[serde(default)]
     pub intensity_jitter_fraction: f32,
-    /// Probability of zeroing each conditioning feature in the input.
+    /// Probability of atomically masking the precursor condition pair in the encoder input.
     #[serde(default)]
-    pub condition_dropout_probability: f32,
+    pub precursor_mask_probability: f32,
     /// Probability of filling each originally empty peak slot with a synthetic intruder peak.
     #[serde(default)]
     pub intruder_peak_probability: f32,
@@ -52,7 +57,7 @@ impl Default for SpectrumAugmentationConfig {
             mz_shift_range: 0.0,
             mz_jitter_range: 0.0,
             intensity_jitter_fraction: 0.0,
-            condition_dropout_probability: 0.0,
+            precursor_mask_probability: 0.0,
             intruder_peak_probability: 0.0,
         }
     }
@@ -68,7 +73,7 @@ impl SpectrumAugmentationConfig {
             mz_shift_range: 0.0,
             mz_jitter_range: 0.0,
             intensity_jitter_fraction: 0.05,
-            condition_dropout_probability: 0.05,
+            precursor_mask_probability: 0.30,
             intruder_peak_probability: 0.02,
         }
     }
@@ -88,7 +93,7 @@ impl SpectrumAugmentationConfig {
             && self.mz_shift_range <= 0.0
             && self.mz_jitter_range <= 0.0
             && self.intensity_jitter_fraction <= 0.0
-            && self.condition_dropout_probability <= 0.0
+            && self.precursor_mask_probability <= 0.0
             && self.intruder_peak_probability <= 0.0
     }
 }
@@ -118,6 +123,7 @@ impl SpectrumAugmenter {
         &self.config
     }
 
+    #[cfg(feature = "std")]
     fn augment_vector(&self, values: &[f32], seed: u64) -> AugmentedVector {
         let peak_count = values.len() / 2;
         if self.config.is_disabled() {
@@ -161,6 +167,7 @@ impl SpectrumAugmenter {
         (output, masked, intruder_peak_mask)
     }
 
+    #[cfg(feature = "std")]
     fn augment_token_features(
         &self,
         features: &[f32],
@@ -239,27 +246,32 @@ impl SpectrumAugmenter {
         )
     }
 
-    fn augment_conditions(&self, conditions: &[f32], seed: u64) -> Vec<f32> {
-        let probability = self.config.condition_dropout_probability.clamp(0.0, 1.0);
-        if probability <= 0.0 {
-            return conditions.to_vec();
+    #[cfg(feature = "std")]
+    fn augment_precursor_conditions(&self, conditions: &[f32], seed: u64) -> (Vec<f32>, f32) {
+        let probability = self.config.precursor_mask_probability.clamp(0.0, 1.0);
+        let precursor_present = conditions.get(1).copied().unwrap_or(0.0) > 0.0;
+        if probability <= 0.0 || !precursor_present {
+            return (conditions.to_vec(), 0.0);
         }
 
         let mut rng = SmallRng::new(seed);
-        conditions
-            .iter()
-            .map(|value| if rng.event(probability) { 0.0 } else { *value })
-            .collect()
+        if rng.event(probability) {
+            (vec![0.0; conditions.len()], 1.0)
+        } else {
+            (conditions.to_vec(), 0.0)
+        }
     }
 }
 
 /// Batcher that corrupts vector inputs and keeps clean vector targets.
+#[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct AugmentingAutoencoderBatcher {
     augmenter: SpectrumAugmenter,
     next_seed: AtomicU64,
 }
 
+#[cfg(feature = "std")]
 impl AugmentingAutoencoderBatcher {
     /// Creates an augmenting batcher.
     #[must_use]
@@ -271,6 +283,7 @@ impl AugmentingAutoencoderBatcher {
     }
 }
 
+#[cfg(feature = "std")]
 impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
     for AugmentingAutoencoderBatcher
 {
@@ -281,6 +294,8 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
         let mut spectra = Vec::with_capacity(layout.spectrum_capacity());
         let mut target_spectra = Vec::with_capacity(layout.spectrum_capacity());
         let mut conditions = Vec::with_capacity(layout.condition_capacity());
+        let mut target_conditions = Vec::with_capacity(layout.condition_capacity());
+        let mut masked_precursor_mask = Vec::with_capacity(layout.batch_capacity());
         let mut consistency_spectra = Vec::with_capacity(layout.spectrum_capacity());
         let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_spectra_mask = Vec::with_capacity(layout.spectrum_capacity());
@@ -299,14 +314,17 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
             consistency_spectra.extend(consistency_spectrum);
             masked_spectra_mask.extend(masked);
             intruder_peak_mask.extend(intruders);
-            conditions.extend(
-                self.augmenter
-                    .augment_conditions(&item.conditions, seed ^ 0x9e37_79b9_7f4a_7c15),
+            target_conditions.extend_from_slice(&item.conditions);
+            let (input_conditions, masked_precursor) = self
+                .augmenter
+                .augment_precursor_conditions(&item.conditions, seed ^ 0x9e37_79b9_7f4a_7c15);
+            let (input_consistency_conditions, _) = self.augmenter.augment_precursor_conditions(
+                &item.conditions,
+                consistency_seed ^ 0x9e37_79b9_7f4a_7c15,
             );
-            consistency_conditions.extend(
-                self.augmenter
-                    .augment_conditions(&item.conditions, consistency_seed ^ 0x9e37_79b9_7f4a_7c15),
-            );
+            conditions.extend(input_conditions);
+            consistency_conditions.extend(input_consistency_conditions);
+            masked_precursor_mask.push(masked_precursor);
         }
 
         autoencoder_batch_from_parts(
@@ -315,6 +333,8 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
                 spectra,
                 target_spectra,
                 conditions,
+                target_conditions,
+                masked_precursor_mask,
                 consistency_spectra,
                 consistency_conditions,
                 masked_spectra_mask,
@@ -327,12 +347,14 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
 }
 
 /// Batcher that corrupts peak-token inputs and keeps clean set targets.
+#[cfg(feature = "std")]
 #[derive(Debug)]
 pub struct AugmentingTokenizedAutoencoderBatcher {
     augmenter: SpectrumAugmenter,
     next_seed: AtomicU64,
 }
 
+#[cfg(feature = "std")]
 impl AugmentingTokenizedAutoencoderBatcher {
     /// Creates an augmenting tokenized batcher.
     #[must_use]
@@ -344,6 +366,7 @@ impl AugmentingTokenizedAutoencoderBatcher {
     }
 }
 
+#[cfg(feature = "std")]
 impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatch<B>>
     for AugmentingTokenizedAutoencoderBatcher
 {
@@ -361,6 +384,8 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
         let mut target_peak_mask = Vec::with_capacity(layout.peak_capacity());
         let mut padding_mask = Vec::with_capacity(layout.peak_capacity());
         let mut conditions = Vec::with_capacity(layout.condition_capacity());
+        let mut target_conditions = Vec::with_capacity(layout.condition_capacity());
+        let mut masked_precursor_mask = Vec::with_capacity(layout.batch_capacity());
         let mut consistency_token_features = Vec::with_capacity(layout.token_feature_capacity());
         let mut consistency_peak_mask = Vec::with_capacity(layout.peak_capacity());
         let mut consistency_padding_mask = Vec::with_capacity(layout.peak_capacity());
@@ -391,14 +416,17 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
             consistency_padding_mask.extend(consistency_padding);
             masked_peak_mask.extend(masked_peaks);
             intruder_peak_mask.extend(intruders);
-            conditions.extend(
-                self.augmenter
-                    .augment_conditions(&item.conditions, seed ^ 0x9e37_79b9_7f4a_7c15),
+            target_conditions.extend_from_slice(&item.conditions);
+            let (input_conditions, masked_precursor) = self
+                .augmenter
+                .augment_precursor_conditions(&item.conditions, seed ^ 0x9e37_79b9_7f4a_7c15);
+            let (input_consistency_conditions, _) = self.augmenter.augment_precursor_conditions(
+                &item.conditions,
+                consistency_seed ^ 0x9e37_79b9_7f4a_7c15,
             );
-            consistency_conditions.extend(
-                self.augmenter
-                    .augment_conditions(&item.conditions, consistency_seed ^ 0x9e37_79b9_7f4a_7c15),
-            );
+            conditions.extend(input_conditions);
+            consistency_conditions.extend(input_consistency_conditions);
+            masked_precursor_mask.push(masked_precursor);
         }
 
         tokenized_autoencoder_batch_from_parts(
@@ -410,6 +438,8 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
                 target_peak_mask,
                 padding_mask,
                 conditions,
+                target_conditions,
+                masked_precursor_mask,
                 consistency_token_features,
                 consistency_peak_mask,
                 consistency_padding_mask,
@@ -423,6 +453,7 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
     }
 }
 
+#[cfg(feature = "std")]
 fn insert_vector_intruders(
     original: &[f32],
     output: &mut [f32],
@@ -456,6 +487,7 @@ fn insert_vector_intruders(
     intruder_peak_mask
 }
 
+#[cfg(feature = "std")]
 fn insert_token_intruders(
     original_features: &[f32],
     original_peak_mask: &[f32],
@@ -496,6 +528,7 @@ fn insert_token_intruders(
     intruder_peak_mask
 }
 
+#[cfg(feature = "std")]
 fn peak_range_from_vector(values: &[f32]) -> Option<PeakRange> {
     values
         .chunks_exact(2)
@@ -503,6 +536,7 @@ fn peak_range_from_vector(values: &[f32]) -> Option<PeakRange> {
         .fold(None, update_peak_range)
 }
 
+#[cfg(feature = "std")]
 fn peak_range_from_tokens(features: &[f32], peak_mask: &[f32]) -> Option<PeakRange> {
     let max_peaks = peak_mask.len();
     let feature_width = features.len() / max_peaks;
@@ -517,11 +551,13 @@ fn peak_range_from_tokens(features: &[f32], peak_mask: &[f32]) -> Option<PeakRan
         .fold(None, update_peak_range)
 }
 
+#[cfg(feature = "std")]
 fn valid_peak(mz: f32, intensity: f32) -> Option<(f32, f32)> {
     (mz.is_finite() && intensity.is_finite() && mz > 0.0 && intensity > 0.0)
         .then_some((mz, intensity))
 }
 
+#[cfg(feature = "std")]
 fn update_peak_range(range: Option<PeakRange>, peak: (f32, f32)) -> Option<PeakRange> {
     let (mz, intensity) = peak;
     Some(match range {
@@ -541,6 +577,7 @@ fn update_peak_range(range: Option<PeakRange>, peak: (f32, f32)) -> Option<PeakR
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "std")]
 struct PeakRange {
     min_mz: f32,
     max_mz: f32,
@@ -548,6 +585,7 @@ struct PeakRange {
     max_intensity: f32,
 }
 
+#[cfg(feature = "std")]
 impl PeakRange {
     fn random_mz(self, rng: &mut SmallRng) -> f32 {
         sample_range(self.min_mz, self.max_mz, rng)
@@ -558,6 +596,7 @@ impl PeakRange {
     }
 }
 
+#[cfg(feature = "std")]
 fn sample_range(min: f32, max: f32, rng: &mut SmallRng) -> f32 {
     if max <= min {
         min
@@ -567,6 +606,7 @@ fn sample_range(min: f32, max: f32, rng: &mut SmallRng) -> f32 {
     .clamp(0.0, 1.0)
 }
 
+#[cfg(feature = "std")]
 fn jitter_intensity(value: f32, fraction: f32, rng: &mut SmallRng) -> f32 {
     let fraction = fraction.max(0.0);
     if fraction <= 0.0 {
@@ -575,12 +615,14 @@ fn jitter_intensity(value: f32, fraction: f32, rng: &mut SmallRng) -> f32 {
     (value * (1.0 + rng.signed(fraction))).clamp(0.0, 1.0)
 }
 
+#[cfg(feature = "std")]
 fn zero_fourier_features(row: &mut [f32]) {
     for value in &mut row[3..] {
         *value = 0.0;
     }
 }
 
+#[cfg(feature = "std")]
 fn rewrite_fourier_features(row: &mut [f32]) {
     let feature_count = row.len().saturating_sub(3);
     let fourier_pairs = feature_count / 2;
@@ -593,15 +635,18 @@ fn rewrite_fourier_features(row: &mut [f32]) {
     }
 }
 
+#[cfg(feature = "std")]
 fn mix_seed(seed: u64, index: u64) -> u64 {
     seed ^ index.wrapping_mul(0x517c_c1b7_2722_0a95)
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "std")]
 struct SmallRng {
     state: u64,
 }
 
+#[cfg(feature = "std")]
 impl SmallRng {
     fn new(seed: u64) -> Self {
         Self { state: seed }
@@ -634,7 +679,7 @@ impl SmallRng {
     }
 }
 
-#[cfg(all(test, feature = "ndarray"))]
+#[cfg(all(test, feature = "std", feature = "ndarray"))]
 mod tests {
     use super::*;
 
@@ -653,7 +698,6 @@ mod tests {
             vec![AutoencoderSample {
                 spectrum: vec![0.1, 0.8, 0.2, 0.4],
                 conditions: vec![1.0],
-                metadata: Default::default(),
             }],
             &device,
         );
@@ -706,7 +750,6 @@ mod tests {
                 peak_mask: vec![1.0, 1.0],
                 padding_mask: vec![false, false],
                 conditions: vec![1.0],
-                metadata: Default::default(),
             }],
             &device,
         );
@@ -762,6 +805,91 @@ mod tests {
     }
 
     #[test]
+    fn vector_augmentation_masks_precursor_atomically_and_keeps_target() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = AugmentingAutoencoderBatcher::new(
+            SpectrumAugmentationConfig {
+                precursor_mask_probability: 1.0,
+                ..SpectrumAugmentationConfig::default()
+            },
+            23,
+        );
+        let batch: AutoencoderBatch<B> = batcher.batch(
+            vec![AutoencoderSample {
+                spectrum: vec![0.1, 0.8],
+                conditions: vec![0.25, 1.0],
+            }],
+            &device,
+        );
+
+        assert_eq!(
+            batch.conditions.into_data().to_vec::<f32>().expect("input"),
+            vec![0.0, 0.0]
+        );
+        assert_eq!(
+            batch
+                .target_conditions
+                .into_data()
+                .to_vec::<f32>()
+                .expect("target"),
+            vec![0.25, 1.0]
+        );
+        assert_eq!(
+            batch
+                .masked_precursor_mask
+                .into_data()
+                .to_vec::<f32>()
+                .expect("masked precursor"),
+            vec![1.0]
+        );
+    }
+
+    #[test]
+    fn token_augmentation_masks_precursor_atomically_and_keeps_target() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let batcher = AugmentingTokenizedAutoencoderBatcher::new(
+            SpectrumAugmentationConfig {
+                precursor_mask_probability: 1.0,
+                ..SpectrumAugmentationConfig::default()
+            },
+            29,
+        );
+        let batch: TokenizedAutoencoderBatch<B> = batcher.batch(
+            vec![TokenizedAutoencoderSample {
+                token_features: vec![0.1, 0.8, 1.0],
+                target_pairs: vec![0.1, 0.8],
+                peak_mask: vec![1.0],
+                padding_mask: vec![false],
+                conditions: vec![0.25, 1.0],
+            }],
+            &device,
+        );
+
+        assert_eq!(
+            batch.conditions.into_data().to_vec::<f32>().expect("input"),
+            vec![0.0, 0.0]
+        );
+        assert_eq!(
+            batch
+                .target_conditions
+                .into_data()
+                .to_vec::<f32>()
+                .expect("target"),
+            vec![0.25, 1.0]
+        );
+        assert_eq!(
+            batch
+                .masked_precursor_mask
+                .into_data()
+                .to_vec::<f32>()
+                .expect("masked precursor"),
+            vec![1.0]
+        );
+    }
+
+    #[test]
     fn vector_intruders_fill_empty_slots_and_keep_targets_clean() {
         type B = burn::backend::NdArray<f32, i64>;
         let device = burn::backend::ndarray::NdArrayDevice::default();
@@ -776,7 +904,6 @@ mod tests {
             vec![AutoencoderSample {
                 spectrum: vec![0.2, 0.7, 0.0, 0.0],
                 conditions: vec![1.0],
-                metadata: Default::default(),
             }],
             &device,
         );
@@ -819,7 +946,6 @@ mod tests {
             vec![AutoencoderSample {
                 spectrum: vec![0.2, 0.7, 0.3, 0.4],
                 conditions: vec![1.0],
-                metadata: Default::default(),
             }],
             &device,
         );
@@ -852,7 +978,6 @@ mod tests {
                 peak_mask: vec![1.0, 0.0],
                 padding_mask: vec![false, true],
                 conditions: vec![1.0],
-                metadata: Default::default(),
             }],
             &device,
         );

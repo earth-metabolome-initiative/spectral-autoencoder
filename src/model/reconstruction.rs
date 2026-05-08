@@ -265,6 +265,56 @@ pub fn flat_vector_reconstruction_loss_from_vectors_with_mask<B: Backend>(
     }
 }
 
+/// Clean and masked flat-vector reconstruction losses with shared alignment work.
+pub fn flat_vector_reconstruction_losses_from_vectors_with_masks<B: Backend>(
+    reconstruction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    target_mask: Tensor<B, 2>,
+    masked_target_mask: Tensor<B, 2>,
+    config: SetReconstructionLossConfig,
+    ordering: FlatVectorReconstructionOrdering,
+) -> (Tensor<B, 1>, Tensor<B, 1>) {
+    match ordering {
+        FlatVectorReconstructionOrdering::Slot => (
+            slot_reconstruction_loss_from_vectors_with_mask(
+                reconstruction.clone(),
+                target.clone(),
+                target_mask,
+                config,
+            ),
+            slot_reconstruction_loss_from_vectors_with_mask(
+                reconstruction,
+                target,
+                masked_target_mask,
+                config,
+            ),
+        ),
+        FlatVectorReconstructionOrdering::IntensityDescending => {
+            let (reconstruction, target, target_mask, masked_target_mask) =
+                sort_flat_vectors_by_intensity_with_two_masks(
+                    reconstruction,
+                    target,
+                    target_mask,
+                    masked_target_mask,
+                );
+            (
+                slot_reconstruction_loss_from_vectors_with_mask(
+                    reconstruction.clone(),
+                    target.clone(),
+                    target_mask,
+                    config,
+                ),
+                slot_reconstruction_loss_from_vectors_with_mask(
+                    reconstruction,
+                    target,
+                    masked_target_mask,
+                    config,
+                ),
+            )
+        }
+    }
+}
+
 /// Backward-compatible set reconstruction loss for flat vectors shaped as `[batch, peaks * 2]`.
 pub fn set_reconstruction_loss_from_vectors<B: Backend>(
     reconstruction: Tensor<B, 2>,
@@ -380,6 +430,45 @@ fn sort_flat_vectors_by_intensity<B: Backend>(
     let sorted_target_mask = target_mask.gather(1, target_order);
 
     (sorted_reconstruction, sorted_target, sorted_target_mask)
+}
+
+fn sort_flat_vectors_by_intensity_with_two_masks<B: Backend>(
+    reconstruction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    target_mask: Tensor<B, 2>,
+    masked_target_mask: Tensor<B, 2>,
+) -> (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
+    let [batch_size, vector_width] = reconstruction.dims();
+    let max_peaks = vector_width / 2;
+    debug_assert_eq!(vector_width % 2, 0);
+
+    let predicted_pairs = reconstruction.reshape([batch_size, max_peaks, 2]);
+    let target_pairs = target.reshape([batch_size, max_peaks, 2]);
+    let predicted_intensity = predicted_pairs
+        .clone()
+        .narrow(2, 1, 1)
+        .reshape([batch_size, max_peaks]);
+    let target_intensity = target_pairs
+        .clone()
+        .narrow(2, 1, 1)
+        .reshape([batch_size, max_peaks]);
+    let predicted_order = predicted_intensity.argsort_descending(1);
+    let target_order = target_intensity.argsort_descending(1);
+    let sorted_reconstruction =
+        gather_peak_pairs(predicted_pairs, predicted_order, batch_size, max_peaks)
+            .reshape([batch_size, vector_width]);
+    let sorted_target =
+        gather_peak_pairs(target_pairs, target_order.clone(), batch_size, max_peaks)
+            .reshape([batch_size, vector_width]);
+    let sorted_target_mask = target_mask.gather(1, target_order.clone());
+    let sorted_masked_target_mask = masked_target_mask.gather(1, target_order);
+
+    (
+        sorted_reconstruction,
+        sorted_target,
+        sorted_target_mask,
+        sorted_masked_target_mask,
+    )
 }
 
 fn gather_peak_pairs<B: Backend>(
@@ -530,6 +619,48 @@ mod tests {
         .into_scalar();
 
         assert!((loss_a - loss_b).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn paired_intensity_ordered_losses_match_separate_calls() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let config = SetReconstructionLossConfig::default();
+        let reconstruction =
+            Tensor::<B, 2>::from_floats([[0.8, 0.4, 0.2, 1.0, 0.5, 0.6, 0.0, 0.0]], &device);
+        let target =
+            Tensor::<B, 2>::from_floats([[0.2, 1.0, 0.5, 0.6, 0.8, 0.4, 0.0, 0.0]], &device);
+        let target_mask = vector_target_mask(target.clone());
+        let masked_target_mask = Tensor::<B, 2>::from_floats([[1.0, 0.0, 1.0, 0.0]], &device);
+
+        let clean_separate = flat_vector_reconstruction_loss_from_vectors_with_mask(
+            reconstruction.clone(),
+            target.clone(),
+            target_mask.clone(),
+            config,
+            FlatVectorReconstructionOrdering::IntensityDescending,
+        )
+        .into_scalar();
+        let masked_separate = flat_vector_reconstruction_loss_from_vectors_with_mask(
+            reconstruction.clone(),
+            target.clone(),
+            masked_target_mask.clone(),
+            config,
+            FlatVectorReconstructionOrdering::IntensityDescending,
+        )
+        .into_scalar();
+        let (clean_paired, masked_paired) =
+            flat_vector_reconstruction_losses_from_vectors_with_masks(
+                reconstruction,
+                target,
+                target_mask,
+                masked_target_mask,
+                config,
+                FlatVectorReconstructionOrdering::IntensityDescending,
+            );
+
+        assert!((clean_separate - clean_paired.into_scalar()).abs() < 1.0e-6);
+        assert!((masked_separate - masked_paired.into_scalar()).abs() < 1.0e-6);
     }
 
     #[test]

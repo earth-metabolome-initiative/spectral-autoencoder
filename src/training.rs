@@ -26,6 +26,10 @@ pub struct AutoencoderLossBreakdown<B: Backend> {
     pub consistency: Tensor<B, 1>,
     /// Synthetic intruder-peak detection contribution to the total loss.
     pub intruder: Tensor<B, 1>,
+    /// Precursor m/z reconstruction contribution to the total loss.
+    pub precursor: Tensor<B, 1>,
+    /// Masked precursor m/z reconstruction contribution to the total loss.
+    pub masked_precursor: Tensor<B, 1>,
     /// In-batch clean-spectrum similarity-ranking contribution to the total loss.
     pub similarity_ranking: Tensor<B, 1>,
     /// Optional explicit model-parameter regularization contribution.
@@ -40,6 +44,8 @@ impl<B: Backend> AutoencoderLossBreakdown<B> {
             masked: Tensor::zeros([1], device),
             consistency: Tensor::zeros([1], device),
             intruder: Tensor::zeros([1], device),
+            precursor: Tensor::zeros([1], device),
+            masked_precursor: Tensor::zeros([1], device),
             similarity_ranking: Tensor::zeros([1], device),
             regularization: Tensor::zeros([1], device),
         }
@@ -51,6 +57,8 @@ impl<B: Backend> AutoencoderLossBreakdown<B> {
             + self.masked.clone()
             + self.consistency.clone()
             + self.intruder.clone()
+            + self.precursor.clone()
+            + self.masked_precursor.clone()
             + self.similarity_ranking.clone()
             + self.regularization.clone()
     }
@@ -62,6 +70,8 @@ pub struct AutoencoderDiagnostics<B: Backend> {
     pub similarity_ranking_pairs: Tensor<B, 1>,
     /// Latent-vs-target ordering accuracy over valid similarity-ranking pairs.
     pub similarity_ranking_accuracy: Tensor<B, 1>,
+    /// Mean absolute precursor m/z reconstruction error in Da.
+    pub precursor_mae_da: Tensor<B, 1>,
 }
 
 impl<B: Backend> AutoencoderDiagnostics<B> {
@@ -70,6 +80,7 @@ impl<B: Backend> AutoencoderDiagnostics<B> {
         Self {
             similarity_ranking_pairs: Tensor::zeros([1], device),
             similarity_ranking_accuracy: Tensor::zeros([1], device),
+            precursor_mae_da: Tensor::zeros([1], device),
         }
     }
 }
@@ -130,9 +141,12 @@ impl<B: Backend> Adaptor<AutoencoderLossComponentsInput<B>> for AutoencoderTrain
             masked: self.losses.masked.clone(),
             consistency: self.losses.consistency.clone(),
             intruder: self.losses.intruder.clone(),
+            precursor: self.losses.precursor.clone(),
+            masked_precursor: self.losses.masked_precursor.clone(),
             similarity_ranking: self.losses.similarity_ranking.clone(),
             similarity_ranking_pairs: self.diagnostics.similarity_ranking_pairs.clone(),
             similarity_ranking_accuracy: self.diagnostics.similarity_ranking_accuracy.clone(),
+            precursor_mae_da: self.diagnostics.precursor_mae_da.clone(),
         }
     }
 }
@@ -147,20 +161,26 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             masked,
             consistency,
             intruder,
+            precursor,
+            masked_precursor,
             similarity_ranking,
             regularization,
             similarity_ranking_pairs,
             similarity_ranking_accuracy,
+            precursor_mae_da,
         ] = Transaction::default()
             .register(self.loss)
             .register(self.losses.reconstruction)
             .register(self.losses.masked)
             .register(self.losses.consistency)
             .register(self.losses.intruder)
+            .register(self.losses.precursor)
+            .register(self.losses.masked_precursor)
             .register(self.losses.similarity_ranking)
             .register(self.losses.regularization)
             .register(self.diagnostics.similarity_ranking_pairs)
             .register(self.diagnostics.similarity_ranking_accuracy)
+            .register(self.diagnostics.precursor_mae_da)
             .execute()
             .try_into()
             .expect("Correct amount of tensor data");
@@ -175,12 +195,15 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
                 masked: Tensor::from_data(masked, device),
                 consistency: Tensor::from_data(consistency, device),
                 intruder: Tensor::from_data(intruder, device),
+                precursor: Tensor::from_data(precursor, device),
+                masked_precursor: Tensor::from_data(masked_precursor, device),
                 similarity_ranking: Tensor::from_data(similarity_ranking, device),
                 regularization: Tensor::from_data(regularization, device),
             },
             diagnostics: AutoencoderDiagnostics {
                 similarity_ranking_pairs: Tensor::from_data(similarity_ranking_pairs, device),
                 similarity_ranking_accuracy: Tensor::from_data(similarity_ranking_accuracy, device),
+                precursor_mae_da: Tensor::from_data(precursor_mae_da, device),
             },
         }
     }
@@ -193,9 +216,12 @@ pub struct AutoencoderLossComponentsInput<B: Backend> {
     masked: Tensor<B, 1>,
     consistency: Tensor<B, 1>,
     intruder: Tensor<B, 1>,
+    precursor: Tensor<B, 1>,
+    masked_precursor: Tensor<B, 1>,
     similarity_ranking: Tensor<B, 1>,
     similarity_ranking_pairs: Tensor<B, 1>,
     similarity_ranking_accuracy: Tensor<B, 1>,
+    precursor_mae_da: Tensor<B, 1>,
 }
 
 /// A numeric TUI metric for one autoencoder loss component or diagnostic.
@@ -233,14 +259,24 @@ impl<B: Backend> AutoencoderLossComponentMetric<B> {
         Self::new(AutoencoderLossComponent::Intruder)
     }
 
+    /// Precursor m/z reconstruction loss contribution.
+    pub fn precursor() -> Self {
+        Self::new(AutoencoderLossComponent::Precursor)
+    }
+
+    /// Masked precursor m/z reconstruction loss contribution.
+    pub fn masked_precursor() -> Self {
+        Self::new(AutoencoderLossComponent::MaskedPrecursor)
+    }
+
+    /// Mean absolute precursor reconstruction error in Da.
+    pub fn precursor_mae_da() -> Self {
+        Self::new(AutoencoderLossComponent::PrecursorMaeDa)
+    }
+
     /// In-batch clean-spectrum similarity-ranking loss contribution.
     pub fn similarity_ranking() -> Self {
         Self::new(AutoencoderLossComponent::SimilarityRanking)
-    }
-
-    /// Number of valid similarity-ranking pairs.
-    pub fn similarity_ranking_pairs() -> Self {
-        Self::new(AutoencoderLossComponent::SimilarityRankingPairs)
     }
 
     /// Similarity-ranking latent-vs-target ordering accuracy.
@@ -287,10 +323,10 @@ impl<B: Backend> Metric for AutoencoderLossComponentMetric<B> {
             AutoencoderLossComponent::Masked => item.masked.clone(),
             AutoencoderLossComponent::Consistency => item.consistency.clone(),
             AutoencoderLossComponent::Intruder => item.intruder.clone(),
+            AutoencoderLossComponent::Precursor => item.precursor.clone(),
+            AutoencoderLossComponent::MaskedPrecursor => item.masked_precursor.clone(),
+            AutoencoderLossComponent::PrecursorMaeDa => item.precursor_mae_da.clone(),
             AutoencoderLossComponent::SimilarityRanking => item.similarity_ranking.clone(),
-            AutoencoderLossComponent::SimilarityRankingPairs => {
-                item.similarity_ranking_pairs.clone()
-            }
             AutoencoderLossComponent::SimilarityRankingAccuracy => {
                 item.similarity_ranking_accuracy.clone()
             }
@@ -332,8 +368,10 @@ enum AutoencoderLossComponent {
     Masked,
     Consistency,
     Intruder,
+    Precursor,
+    MaskedPrecursor,
+    PrecursorMaeDa,
     SimilarityRanking,
-    SimilarityRankingPairs,
     SimilarityRankingAccuracy,
 }
 
@@ -345,8 +383,10 @@ impl AutoencoderLossComponent {
             Self::Masked => "Masked Loss",
             Self::Consistency => "Consistency Loss",
             Self::Intruder => "Intruder Loss",
+            Self::Precursor => "Precursor Loss",
+            Self::MaskedPrecursor => "Masked Precursor Loss",
+            Self::PrecursorMaeDa => "Precursor MAE Da",
             Self::SimilarityRanking => "Similarity Ranking Loss",
-            Self::SimilarityRankingPairs => "Similarity Ranking Pairs",
             Self::SimilarityRankingAccuracy => "Similarity Ranking Accuracy",
         }
     }
@@ -358,8 +398,10 @@ impl AutoencoderLossComponent {
             Self::Masked => "masked-peak",
             Self::Consistency => "latent-consistency",
             Self::Intruder => "intruder-peak detection",
+            Self::Precursor => "precursor reconstruction",
+            Self::MaskedPrecursor => "masked precursor reconstruction",
+            Self::PrecursorMaeDa => "precursor reconstruction mean absolute error in Da",
             Self::SimilarityRanking => "teacher similarity ranking",
-            Self::SimilarityRankingPairs => "teacher similarity-ranking valid pairs",
             Self::SimilarityRankingAccuracy => "teacher similarity-ranking ordering accuracy",
         }
     }
@@ -427,14 +469,13 @@ where
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::consistency())
             .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::consistency())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::intruder())
+            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::precursor())
+            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::precursor())
+            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::masked_precursor())
+            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::precursor_mae_da())
+            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::precursor_mae_da())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::similarity_ranking())
             .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::similarity_ranking())
-            .metric_train_numeric(
-                AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_pairs(),
-            )
-            .metric_valid_numeric(
-                AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_pairs(),
-            )
             .metric_train_numeric(
                 AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_accuracy(),
             )

@@ -20,6 +20,10 @@ pub struct AuxiliaryLossConfig {
     pub consistency_weight: f64,
     /// Weight for detecting synthetic intruder peaks inserted into input spectra.
     pub intruder_peak_weight: f64,
+    /// Weight for reconstructing precursor m/z and its presence flag.
+    pub precursor_reconstruction_weight: f64,
+    /// Weight for reconstructing precursor m/z when it was masked from the encoder input.
+    pub masked_precursor_weight: f64,
     /// Weight for preserving clean-spectrum similarity order in latent space.
     pub similarity_ranking_weight: f64,
     /// Margin applied to latent cosine ordering for the similarity-ranking loss.
@@ -44,6 +48,8 @@ impl Default for AuxiliaryLossConfig {
             masked_peak_weight: 0.25,
             consistency_weight: 0.05,
             intruder_peak_weight: 0.05,
+            precursor_reconstruction_weight: 0.05,
+            masked_precursor_weight: 0.05,
             similarity_ranking_weight: 0.05,
             similarity_ranking_margin: 0.05,
             similarity_ranking_min_gap: 0.05,
@@ -204,6 +210,140 @@ where
     }
 }
 
+/// Precursor reconstruction objective result and diagnostics.
+pub struct PrecursorReconstructionOutput<B: Backend> {
+    /// Weighted or unweighted precursor reconstruction loss, depending on caller.
+    pub loss: Tensor<B, 1>,
+    /// Mean absolute precursor m/z error in Da, gated by the target presence flag.
+    pub mae_da: Tensor<B, 1>,
+}
+
+/// Reconstructs normalized precursor m/z plus its presence flag from decoder output.
+pub fn precursor_reconstruction_output<B: Backend>(
+    prediction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    precursor_mz_scale: f64,
+) -> PrecursorReconstructionOutput<B> {
+    let predicted_mz = prediction
+        .clone()
+        .narrow(1, 0, 1)
+        .clamp_min(0.0)
+        .clamp_max(1.0);
+    let predicted_present = prediction
+        .narrow(1, 1, 1)
+        .clamp_min(1.0e-6)
+        .clamp_max(1.0 - 1.0e-6);
+    let target_mz = target.clone().narrow(1, 0, 1).clamp_min(0.0).clamp_max(1.0);
+    let target_present = target.narrow(1, 1, 1).clamp_min(0.0).clamp_max(1.0);
+    let present_count = target_present.clone().sum().clamp_min(1.0);
+
+    let mz_delta = predicted_mz - target_mz;
+    let mz_loss =
+        (mz_delta.clone().powf_scalar(2.0) * target_present.clone()).sum() / present_count.clone();
+    let mae_da =
+        (mz_delta.abs() * target_present.clone()).sum() / present_count * precursor_mz_scale;
+
+    let inverse_target = target_present.ones_like() - target_present.clone();
+    let inverse_prediction = predicted_present.ones_like() - predicted_present.clone();
+    let presence_bce = (target_present * predicted_present.log()
+        + inverse_target * inverse_prediction.log())
+        * -1.0;
+
+    PrecursorReconstructionOutput {
+        loss: mz_loss + presence_bce.mean(),
+        mae_da,
+    }
+}
+
+/// Weighted precursor reconstruction loss, or zero when the weight is disabled.
+pub fn weighted_precursor_reconstruction_output<B: Backend>(
+    prediction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    precursor_mz_scale: f64,
+    weight: f64,
+) -> PrecursorReconstructionOutput<B> {
+    if weight > 0.0 {
+        let mut output = precursor_reconstruction_output(prediction, target, precursor_mz_scale);
+        output.loss = output.loss * weight;
+        output
+    } else {
+        zero_precursor_reconstruction_output(&prediction.device())
+    }
+}
+
+/// Reconstructs precursor conditions only for rows whose precursor was masked in the input.
+pub fn masked_precursor_reconstruction_output<B: Backend>(
+    prediction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    masked_precursor_mask: Tensor<B, 2>,
+    precursor_mz_scale: f64,
+) -> PrecursorReconstructionOutput<B> {
+    let predicted_mz = prediction
+        .clone()
+        .narrow(1, 0, 1)
+        .clamp_min(0.0)
+        .clamp_max(1.0);
+    let predicted_present = prediction
+        .narrow(1, 1, 1)
+        .clamp_min(1.0e-6)
+        .clamp_max(1.0 - 1.0e-6);
+    let target_mz = target.clone().narrow(1, 0, 1).clamp_min(0.0).clamp_max(1.0);
+    let target_present = target.narrow(1, 1, 1).clamp_min(0.0).clamp_max(1.0);
+    let effective_mask = masked_precursor_mask.clamp_min(0.0).clamp_max(1.0) * target_present;
+    let masked_count = effective_mask.clone().sum();
+    let has_masked = masked_count.clone().greater_elem(0.0).float();
+    let masked_count = masked_count.clamp_min(1.0);
+
+    let mz_delta = predicted_mz - target_mz;
+    let mz_loss =
+        (mz_delta.clone().powf_scalar(2.0) * effective_mask.clone()).sum() / masked_count.clone();
+    let mae_da =
+        (mz_delta.abs() * effective_mask.clone()).sum() / masked_count.clone() * precursor_mz_scale;
+
+    let inverse_target = effective_mask.ones_like() - effective_mask.clone();
+    let inverse_prediction = predicted_present.ones_like() - predicted_present.clone();
+    let presence_bce = (effective_mask.clone() * predicted_present.log()
+        + inverse_target * inverse_prediction.log())
+        * -1.0;
+    let presence_loss = (presence_bce * effective_mask).sum() / masked_count;
+
+    PrecursorReconstructionOutput {
+        loss: (mz_loss + presence_loss) * has_masked.clone(),
+        mae_da: mae_da * has_masked,
+    }
+}
+
+/// Weighted masked-precursor reconstruction loss, or zero when the weight is disabled.
+pub fn weighted_masked_precursor_reconstruction_output<B: Backend>(
+    prediction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    masked_precursor_mask: Tensor<B, 2>,
+    precursor_mz_scale: f64,
+    weight: f64,
+) -> PrecursorReconstructionOutput<B> {
+    if weight > 0.0 {
+        let mut output = masked_precursor_reconstruction_output(
+            prediction,
+            target,
+            masked_precursor_mask,
+            precursor_mz_scale,
+        );
+        output.loss = output.loss * weight;
+        output
+    } else {
+        zero_precursor_reconstruction_output(&prediction.device())
+    }
+}
+
+fn zero_precursor_reconstruction_output<B: Backend>(
+    device: &B::Device,
+) -> PrecursorReconstructionOutput<B> {
+    PrecursorReconstructionOutput {
+        loss: Tensor::zeros([1], device),
+        mae_da: Tensor::zeros([1], device),
+    }
+}
+
 /// Similarity-ranking objective result and diagnostics.
 pub struct SimilarityRankingOutput<B: Backend> {
     /// Weighted or unweighted similarity-ranking loss, depending on caller.
@@ -262,15 +402,17 @@ pub fn similarity_ranking_output<B: Backend>(
     let target_delta = batch.target_delta.narrow(0, 0, pair_count).detach();
     let target_gap = target_delta.clone().abs();
     let target_direction = target_delta / (target_gap.clone() + 1.0e-6);
-    let valid = target_gap.greater_elem(min_gap).float();
+    let valid = target_gap.clone().greater_elem(min_gap).float();
     let valid_pairs = valid.clone().sum();
+    let gap_weights = target_gap * valid.clone();
+    let gap_weight_sum = gap_weights.clone().sum().clamp_min(1.0e-6);
     let ordered_delta = target_direction * latent_delta;
     let hinge = (margin - ordered_delta.clone()).clamp_min(0.0);
     let accuracy = (ordered_delta.greater_elem(0.0).float() * valid.clone()).sum()
         / valid_pairs.clone().clamp_min(1.0);
 
     SimilarityRankingOutput {
-        loss: (hinge * valid).sum() / valid_pairs.clone().clamp_min(1.0),
+        loss: (hinge * gap_weights).sum() / gap_weight_sum,
         valid_pairs,
         accuracy,
     }
@@ -444,6 +586,65 @@ mod tests {
     }
 
     #[test]
+    fn precursor_reconstruction_prefers_accurate_predictions() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let target = Tensor::<B, 2>::from_floats([[0.25, 1.0], [0.50, 1.0]], &device);
+        let accurate = Tensor::<B, 2>::from_floats([[0.25, 1.0], [0.50, 1.0]], &device);
+        let inaccurate = Tensor::<B, 2>::from_floats([[0.75, 0.5], [0.10, 0.5]], &device);
+
+        let accurate = precursor_reconstruction_output(accurate, target.clone(), 2_000.0);
+        let inaccurate = precursor_reconstruction_output(inaccurate, target, 2_000.0);
+
+        assert!(accurate.loss.into_scalar() < inaccurate.loss.into_scalar());
+        assert!(accurate.mae_da.into_scalar() < inaccurate.mae_da.into_scalar());
+    }
+
+    #[test]
+    fn precursor_reconstruction_ignores_missing_mz_value_for_mae() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let target = Tensor::<B, 2>::from_floats([[0.0, 0.0]], &device);
+        let prediction = Tensor::<B, 2>::from_floats([[0.75, 0.0]], &device);
+
+        let output = precursor_reconstruction_output(prediction, target, 2_000.0);
+
+        assert_eq!(output.mae_da.into_scalar(), 0.0);
+        assert!(output.loss.into_scalar().is_finite());
+    }
+
+    #[test]
+    fn masked_precursor_reconstruction_is_zero_without_masked_rows() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let target = Tensor::<B, 2>::from_floats([[0.25, 1.0]], &device);
+        let prediction = Tensor::<B, 2>::from_floats([[0.75, 0.5]], &device);
+        let mask = Tensor::<B, 2>::zeros([1, 1], &device);
+
+        let output = masked_precursor_reconstruction_output(prediction, target, mask, 2_000.0);
+
+        assert_eq!(output.loss.into_scalar(), 0.0);
+        assert_eq!(output.mae_da.into_scalar(), 0.0);
+    }
+
+    #[test]
+    fn masked_precursor_reconstruction_is_finite_for_masked_rows() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let target = Tensor::<B, 2>::from_floats([[0.25, 1.0], [0.50, 1.0]], &device);
+        let prediction = Tensor::<B, 2>::from_floats([[0.75, 0.5], [0.50, 1.0]], &device);
+        let mask = Tensor::<B, 2>::from_floats([[1.0], [0.0]], &device);
+
+        let output = masked_precursor_reconstruction_output(prediction, target, mask, 2_000.0);
+        let loss = output.loss.into_scalar();
+        let mae = output.mae_da.into_scalar();
+
+        assert!(loss.is_finite());
+        assert!(loss > 0.0);
+        assert_eq!(mae, 1_000.0);
+    }
+
+    #[test]
     fn similarity_ranking_loss_is_finite_for_ordered_targets() {
         type B = burn::backend::NdArray<f32, i64>;
         let device = burn::backend::ndarray::NdArrayDevice::default();
@@ -491,6 +692,31 @@ mod tests {
         assert!(output.valid_pairs.into_scalar() > 0.0);
         assert!(accuracy.is_finite());
         assert!((0.0..=1.0).contains(&accuracy));
+    }
+
+    #[test]
+    fn similarity_ranking_loss_weights_hinge_by_metric_gap() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let latent = Tensor::<B, 2>::from_floats([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], &device);
+        let batch = SimilarityRankingBatch {
+            partner_a_index: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![1_i64, 2, 0], [3]),
+                &device,
+            ),
+            partner_b_index: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![2_i64, 0, 1], [3]),
+                &device,
+            ),
+            target_delta: Tensor::<B, 2>::from_floats([[0.9], [0.1], [0.0]], &device),
+        };
+
+        let loss = similarity_ranking_loss(latent, batch, 0, 0.5, 0.01).into_scalar();
+
+        assert!(
+            (loss - 0.15).abs() < 1.0e-3,
+            "expected gap-weighted hinge loss near 0.15, got {loss}"
+        );
     }
 
     #[test]

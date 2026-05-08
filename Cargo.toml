@@ -40,7 +40,6 @@ serde = { version = "1", default-features = false, features = ["derive"] }
 thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
-approx = "0.5"
 indicatif = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 

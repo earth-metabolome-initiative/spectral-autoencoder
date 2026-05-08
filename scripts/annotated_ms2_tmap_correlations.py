@@ -22,7 +22,6 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
-
 HOVER_COLUMNS = [
     "feature_id",
     "spectrum_id",
@@ -59,7 +58,10 @@ def main() -> None:
 
     print(f"reading metrics: {args.metrics}")
     metrics = pd.read_csv(args.metrics, sep="\t", low_memory=False).sort_values("index")
-    if not np.array_equal(metrics["index"].to_numpy(dtype=np.int64), coordinates["index"].to_numpy(dtype=np.int64)):
+    if not np.array_equal(
+        metrics["index"].to_numpy(dtype=np.int64),
+        coordinates["index"].to_numpy(dtype=np.int64),
+    ):
         raise ValueError("metrics and TMAP coordinate indexes do not match")
     if len(metrics) != len(tmap_index):
         raise ValueError(
@@ -133,7 +135,9 @@ def read_edge_rows(path: Path, row_xy: np.ndarray) -> list[tuple[int, int, float
     return rows
 
 
-def extract_tmap(path: Path) -> tuple[np.ndarray, np.ndarray, list[list[Any]], list[Any], list[Any]]:
+def extract_tmap(
+    path: Path,
+) -> tuple[np.ndarray, np.ndarray, list[list[Any]], list[Any], list[Any]]:
     data = read_plotly_data(path)
     edge_trace = next(
         trace for trace in data if trace.get("mode") == "lines" and "customdata" not in trace
@@ -305,7 +309,9 @@ def normalize_key_value(value: Any) -> str:
     return text
 
 
-def edge_rows(edge_x: list[Any], edge_y: list[Any], row_xy: np.ndarray) -> list[tuple[int, int, float]]:
+def edge_rows(
+    edge_x: list[Any], edge_y: list[Any], row_xy: np.ndarray
+) -> list[tuple[int, int, float]]:
     coord_to_row: dict[tuple[str, str], int] = {}
     for row_index, (x, y) in enumerate(row_xy):
         key = coord_key(x, y)

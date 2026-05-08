@@ -6,7 +6,7 @@ use mascot_rs::mascot_generic_format::MGFPathIter;
 use mascot_rs::prelude::{MGFIter, MascotGenericFormat};
 use mass_spectrometry::prelude::Spectrum;
 
-use crate::batch::{AutoencoderSample, SampleMetadata, TokenizedAutoencoderSample};
+use crate::batch::{AutoencoderSample, TokenizedAutoencoderSample};
 use crate::conditioning::ConditioningEncoder;
 use crate::error::{Error, Result};
 use crate::tokenize::SpectrumTokenizer;
@@ -242,7 +242,6 @@ impl VectorizedMgfIter {
         Ok(AutoencoderSample {
             spectrum: self.vectorizer.encode(record)?.values,
             conditions: self.conditioning.encode(record),
-            metadata: SampleMetadata,
         })
     }
 }
@@ -307,7 +306,6 @@ impl TokenizedMgfIter {
             peak_mask: tokens.peak_mask,
             padding_mask: tokens.padding_mask,
             conditions: self.conditioning.encode(record),
-            metadata: SampleMetadata,
         })
     }
 }

@@ -10,8 +10,8 @@ Burn models, training metrics, and GeMS-A10 training examples.
 The models operate on cleaned top-N MS/MS peak lists, not binned spectra. The
 library preprocessing default keeps 60 peaks per spectrum; the GeMS examples
 select the peak count with `GEMS_MAX_PEAKS` and currently default to 128.
-Optional metadata is encoded with explicit unknown buckets so the same models
-can run when precursor or instrument fields are missing.
+GeMS conditioning is limited to normalized precursor m/z plus a presence flag;
+the decoders reconstruct that precursor condition alongside the MS2 spectrum.
 
 Spectra are read through
 [`mascot-rs`](https://github.com/LucaCappelletti94/mascot-rs). Evaluation
@@ -38,6 +38,8 @@ training examples use AdamW weight decay for L2 regularization.
 The GeMS training examples use these losses:
 
 - clean-spectrum reconstruction
+- precursor m/z reconstruction
+- masked precursor m/z reconstruction
 - masked-peak reconstruction
 - latent consistency between two augmented input views
 - synthetic intruder-peak detection

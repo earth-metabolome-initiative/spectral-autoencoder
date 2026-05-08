@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Check minimal features
+        run: cargo check --no-default-features
+
+      - name: Check std features
+        run: cargo check --no-default-features --features std
+
+      - name: Check training targets
+        run: cargo check --all-targets --no-default-features --features std,train
+
+      - name: Check examples
+        run: cargo check --examples --no-default-features --features std,train,tui
+
+      - name: Clippy minimal features
+        run: cargo clippy --no-default-features -- -D warnings
+
+      - name: Clippy training targets
+        run: cargo clippy --all-targets --no-default-features --features std,train -- -D warnings
+
+      - name: Clippy examples
+        run: cargo clippy --examples --no-default-features --features std,train,tui -- -D warnings
+
+      - name: Test library
+        run: cargo test --lib --no-default-features --features std,train
+
+      - name: Test MGF vectorization
+        run: cargo test --test mgf_vectorization --no-default-features --features std,train
+
+  python:
+    name: Python scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ruff format
+        run: uv run --no-project --with ruff ruff format --config pyproject.toml --check scripts
+
+      - name: Ruff lint
+        run: uv run --no-project --with ruff ruff check --config pyproject.toml scripts
+
+      - name: Compile scripts
+        run: >
+          uv run --no-project python -m py_compile
+          scripts/annotated_ms2_coordinate_correlations.py
+          scripts/annotated_ms2_metric_heatmaps.py
+          scripts/annotated_ms2_png_plots.py
+          scripts/annotated_ms2_tmap_correlations.py

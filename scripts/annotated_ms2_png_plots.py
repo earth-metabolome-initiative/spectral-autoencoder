@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from pathlib import Path
-from typing import Iterable
 
 import matplotlib
 
@@ -26,6 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from MulticoreTSNE import MulticoreTSNE as TSNE
+from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 EXCLUDED_CLASSYFIRE_LABELS = {"Other", "Unannotated"}
@@ -144,6 +144,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npc-column", default="npc_pathway")
     parser.add_argument("--classyfire-column", default="classyfire_class")
     parser.add_argument("--tsne-perplexity", type=float, default=50.0)
+    parser.add_argument(
+        "--tsne-pca-dim",
+        type=int,
+        default=50,
+        help="Reduce embeddings to at most this many PCA dimensions before t-SNE; 0 disables PCA.",
+    )
     parser.add_argument("--tsne-iterations", type=int, default=1_000)
     parser.add_argument("--tsne-learning-rate", type=float, default=None)
     parser.add_argument("--tsne-jobs", type=int, default=-1)
@@ -238,6 +244,7 @@ def write_count_png(path: Path, counts: Counter[str], title: str, title_suffix: 
 
 
 def compute_tsne(embeddings: np.ndarray, args: argparse.Namespace) -> np.ndarray:
+    embeddings = pca_for_tsne(embeddings, args.tsne_pca_dim, args.seed)
     perplexity = min(args.tsne_perplexity, max(5.0, (len(embeddings) - 1) / 3.0))
     learning_rate = args.tsne_learning_rate
     if learning_rate is None:
@@ -253,6 +260,25 @@ def compute_tsne(embeddings: np.ndarray, args: argparse.Namespace) -> np.ndarray
         "n_iter": args.tsne_iterations,
     }
     return TSNE(**kwargs).fit_transform(embeddings)
+
+
+def pca_for_tsne(embeddings: np.ndarray, requested_dim: int, seed: int) -> np.ndarray:
+    if requested_dim <= 0:
+        return embeddings
+    n_samples, n_features = embeddings.shape
+    output_dim = min(requested_dim, n_features, n_samples - 1)
+    if output_dim >= n_features:
+        return embeddings
+    print(f"running PCA before t-SNE: {n_features} -> {output_dim} dimensions")
+    return (
+        PCA(
+            n_components=output_dim,
+            svd_solver="randomized",
+            random_state=seed,
+        )
+        .fit_transform(embeddings)
+        .astype(np.float32, copy=False)
+    )
 
 
 def compute_tmap(
@@ -392,7 +418,9 @@ def color_cycle(count: int) -> list[object]:
     if count <= len(colors):
         return colors[:count]
     extra = plt.get_cmap("hsv")
-    colors.extend(extra(index / max(1, count - len(colors))) for index in range(count - len(colors)))
+    colors.extend(
+        extra(index / max(1, count - len(colors))) for index in range(count - len(colors))
+    )
     return colors[:count]
 
 

@@ -21,14 +21,14 @@ pub mod tokenize;
 pub mod training;
 pub mod vectorize;
 
-pub use augmentation::{
-    AugmentingAutoencoderBatcher, AugmentingTokenizedAutoencoderBatcher,
-    SpectrumAugmentationConfig, SpectrumAugmenter,
-};
+#[cfg(feature = "std")]
+pub use augmentation::{AugmentingAutoencoderBatcher, AugmentingTokenizedAutoencoderBatcher};
+pub use augmentation::{SpectrumAugmentationConfig, SpectrumAugmenter};
 pub use batch::{
-    AutoencoderBatch, AutoencoderBatcher, AutoencoderSample, SampleMetadata,
-    TokenizedAutoencoderBatch, TokenizedAutoencoderBatcher, TokenizedAutoencoderSample,
+    AutoencoderBatch, AutoencoderSample, TokenizedAutoencoderBatch, TokenizedAutoencoderSample,
 };
+#[cfg(feature = "std")]
+pub use batch::{AutoencoderBatcher, TokenizedAutoencoderBatcher};
 pub use conditioning::{ConditioningConfig, ConditioningEncoder};
 pub use data::{
     MgfSummary, TokenizedMgfIter, VectorizedMgfIter, summarize_mgf_path, tokenized_mgf_iter,

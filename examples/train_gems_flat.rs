@@ -3,6 +3,10 @@
 mod gems_common;
 
 #[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[path = "support/gems_flat.rs"]
+mod gems_flat;
+
+#[cfg(all(feature = "cuda-fusion", feature = "train"))]
 mod app {
     use std::sync::Arc;
 
@@ -19,10 +23,10 @@ mod app {
 
     use crate::gems_common::{
         CachedTrainingLoaderConfig, GeMSProgress, InnerBackend, RunArgs, TrainingBackend,
-        augmentation_config_from_env, auxiliary_loss_config_from_env, cached_vectorized_loader,
-        flat_vector_config_from_env, print_run_header, save_model_record,
-        similarity_teacher_config_from_env, warm_start_model,
+        augmentation_config_from_env, auxiliary_loss_config_from_env, print_run_header,
+        save_model_record, similarity_teacher_config_from_env, warm_start_model,
     };
+    use crate::gems_flat::{cached_vectorized_loader, flat_vector_config_from_env};
 
     const FLAT_CACHE_DEFAULT_PERCENT: f64 = 100.0;
 

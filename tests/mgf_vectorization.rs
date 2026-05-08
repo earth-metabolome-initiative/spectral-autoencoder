@@ -37,11 +37,9 @@ fn vectorizes_mgf_record_with_conditions() -> Result<()> {
     assert_eq!(tokens.retained_peaks, 3);
     assert_eq!(&tokens.padding_mask[..3], &[false, false, false]);
     assert!(tokens.padding_mask[3]);
-    assert_eq!(conditions.len(), 16);
-    assert_eq!(conditions[5], 0.0);
-    assert_eq!(conditions[6], 1.0);
-    assert_eq!(conditions[8], 0.0);
-    assert_eq!(conditions[9], 1.0);
+    assert_eq!(conditions.len(), 2);
+    assert_eq!(conditions[0], 0.125);
+    assert_eq!(conditions[1], 1.0);
 
     Ok(())
 }
@@ -66,11 +64,17 @@ fn vectorized_iterator_streams_multiple_mgf_paths() -> Result<()> {
     )?;
     let first = iter.next().expect("first path should yield one record")?;
     assert_eq!(first.spectrum.len(), 120);
-    assert_eq!(first.metadata, Default::default());
+    assert_eq!(
+        first.conditions.len(),
+        ConditioningEncoder::default().vector_width()
+    );
 
     let second = iter.next().expect("second path should yield one record")?;
     assert_eq!(second.spectrum.len(), 120);
-    assert_eq!(second.metadata, Default::default());
+    assert_eq!(
+        second.conditions.len(),
+        ConditioningEncoder::default().vector_width()
+    );
     assert!(iter.next().is_none());
 
     std::fs::remove_file(first_path).ok();
