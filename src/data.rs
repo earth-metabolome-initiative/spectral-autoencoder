@@ -5,10 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use mascot_rs::{
-    mascot_generic_format::MGFLineSource,
-    prelude::{Dataset, MGFIter, MascotError, MascotGenericFormat},
-};
+use mascot_rs::prelude::{Dataset, MGFIter, MascotError, MascotGenericFormat};
 use mass_spectrometry::prelude::{Spectrum, SpectrumFloat};
 
 use crate::batch::{AutoencoderSample, TokenizedAutoencoderSample};
@@ -24,8 +21,6 @@ pub struct MgfSummary {
     pub path: PathBuf,
     /// Number of valid records observed.
     pub records: usize,
-    /// Number of malformed records skipped by tolerant parsing.
-    pub skipped_records: usize,
     /// Total number of peaks in valid records.
     pub peaks: usize,
     /// Minimum peaks per valid record.
@@ -46,10 +41,10 @@ impl MgfSummary {
     }
 }
 
-/// Summarizes an MGF file with tolerant parsing.
+/// Summarizes an MGF file.
 pub fn summarize_mgf_path(path: impl AsRef<Path>, limit: Option<usize>) -> Result<MgfSummary> {
     let path = path.as_ref();
-    let mut iter = MGFIter::<f32, _>::from_path(path)?.skipping_invalid_records();
+    let mut iter = MGFIter::<f32, _>::from_path(path)?;
     let mut records = 0usize;
     let mut peaks = 0usize;
     let mut min_peaks = usize::MAX;
@@ -76,48 +71,21 @@ pub fn summarize_mgf_path(path: impl AsRef<Path>, limit: Option<usize>) -> Resul
     Ok(MgfSummary {
         path: path.to_path_buf(),
         records,
-        skipped_records: iter.skipped_records(),
         peaks,
         min_peaks,
         max_peaks,
     })
 }
 
-/// Mascot MGF record stream accepted by the vectorized and tokenized wrappers.
-pub trait MgfRecordStream<P>:
-    Iterator<Item = std::result::Result<MascotGenericFormat<P>, MascotError>>
-where
-    P: SpectrumFloat,
-{
-    /// Returns the number of malformed records skipped so far.
-    fn skipped_records(&self) -> usize;
-}
-
-impl<P, S> MgfRecordStream<P> for MGFIter<P, S>
-where
-    P: SpectrumFloat,
-    S: MGFLineSource,
-{
-    fn skipped_records(&self) -> usize {
-        MGFIter::skipped_records(self)
-    }
-}
-
-impl<P> MgfRecordStream<P> for Box<dyn MgfRecordStream<P>>
-where
-    P: SpectrumFloat,
-{
-    fn skipped_records(&self) -> usize {
-        self.as_ref().skipped_records()
-    }
-}
+type MascotRecordResult<P> = std::result::Result<MascotGenericFormat<P>, MascotError>;
+type MascotRecordIter<P> = dyn Iterator<Item = MascotRecordResult<P>>;
 
 /// Iterator over vectorized spectra loaded from a mascot MGF stream.
 pub struct VectorizedMgfIter<P = f32>
 where
     P: SpectrumFloat,
 {
-    records: Box<dyn MgfRecordStream<P>>,
+    records: Box<MascotRecordIter<P>>,
     vectorizer: SpectrumVectorizer,
     conditioning: ConditioningEncoder,
     precision: PhantomData<P>,
@@ -128,7 +96,7 @@ pub struct TokenizedMgfIter<P = f32>
 where
     P: SpectrumFloat,
 {
-    records: Box<dyn MgfRecordStream<P>>,
+    records: Box<MascotRecordIter<P>>,
     tokenizer: SpectrumTokenizer,
     conditioning: ConditioningEncoder,
     precision: PhantomData<P>,
@@ -145,7 +113,7 @@ where
         conditioning: ConditioningEncoder,
     ) -> Self
     where
-        R: MgfRecordStream<P> + 'static,
+        R: Iterator<Item = MascotRecordResult<P>> + 'static,
     {
         Self {
             records: Box::new(records),
@@ -161,14 +129,8 @@ where
         vectorizer: SpectrumVectorizer,
         conditioning: ConditioningEncoder,
     ) -> Result<Self> {
-        let records = MGFIter::<P, _>::from_path(path)?.skipping_invalid_records();
+        let records = MGFIter::<P, _>::from_path(path)?;
         Ok(Self::from_records(records, vectorizer, conditioning))
-    }
-
-    /// Returns the number of invalid records skipped so far.
-    #[must_use]
-    pub fn skipped_records(&self) -> usize {
-        self.records.skipped_records()
     }
 
     fn encode_record(&mut self, record: &MascotGenericFormat<P>) -> Result<AutoencoderSample> {
@@ -205,7 +167,7 @@ where
         conditioning: ConditioningEncoder,
     ) -> Self
     where
-        R: MgfRecordStream<P> + 'static,
+        R: Iterator<Item = MascotRecordResult<P>> + 'static,
     {
         Self {
             records: Box::new(records),
@@ -221,14 +183,8 @@ where
         tokenizer: SpectrumTokenizer,
         conditioning: ConditioningEncoder,
     ) -> Result<Self> {
-        let records = MGFIter::<P, _>::from_path(path)?.skipping_invalid_records();
+        let records = MGFIter::<P, _>::from_path(path)?;
         Ok(Self::from_records(records, tokenizer, conditioning))
-    }
-
-    /// Returns the number of invalid records skipped so far.
-    #[must_use]
-    pub fn skipped_records(&self) -> usize {
-        self.records.skipped_records()
     }
 
     fn encode_record(
@@ -278,7 +234,7 @@ pub async fn vectorized_dataset_iter<D>(
 ) -> Result<VectorizedMgfIter>
 where
     D: Dataset,
-    D::Iter: MgfRecordStream<f32> + 'static,
+    D::Iter: Iterator<Item = MascotRecordResult<f32>> + 'static,
 {
     let records = dataset.mgf_iter().await?;
     Ok(VectorizedMgfIter::from_records(
@@ -305,7 +261,7 @@ pub async fn tokenized_dataset_iter<D>(
 ) -> Result<TokenizedMgfIter>
 where
     D: Dataset,
-    D::Iter: MgfRecordStream<f32> + 'static,
+    D::Iter: Iterator<Item = MascotRecordResult<f32>> + 'static,
 {
     let records = dataset.mgf_iter().await?;
     Ok(TokenizedMgfIter::from_records(

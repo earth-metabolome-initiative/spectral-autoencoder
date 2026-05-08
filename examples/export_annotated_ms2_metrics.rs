@@ -85,10 +85,7 @@ mod app {
         }
 
         writer.flush()?;
-        bar.finish_with_message(format!(
-            "wrote {written} spectra, skipped {} malformed records",
-            records.skipped_records()
-        ));
+        bar.finish_with_message(format!("wrote {written} spectra"));
         println!("wrote metrics: {}", args.output.display());
         Ok(())
     }

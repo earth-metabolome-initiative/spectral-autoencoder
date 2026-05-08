@@ -47,7 +47,7 @@ fn vectorizes_mgf_record_with_conditions() -> Result<()> {
 
 #[test]
 fn vectorized_iterator_wraps_mascot_mgf_stream() -> Result<()> {
-    let records = MGFIter::<f32>::from_document(MGF).skipping_invalid_records();
+    let records = MGFIter::<f32>::from_document(MGF);
     let mut iter = VectorizedMgfIter::from_records(
         records,
         SpectrumVectorizer::default(),
@@ -61,7 +61,6 @@ fn vectorized_iterator_wraps_mascot_mgf_stream() -> Result<()> {
     );
 
     assert!(iter.next().is_none());
-    assert_eq!(iter.skipped_records(), 0);
     Ok(())
 }
 
@@ -77,7 +76,7 @@ impl Dataset for InlineDataset {
     }
 
     fn mgf_iter(self) -> DatasetFuture<Self::Iter> {
-        Box::pin(async { Ok(MGFIter::<f32>::from_document(MGF).skipping_invalid_records()) })
+        Box::pin(async { Ok(MGFIter::<f32>::from_document(MGF)) })
     }
 
     fn load(self) -> DatasetFuture<Self::Load> {

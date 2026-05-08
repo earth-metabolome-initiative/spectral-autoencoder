@@ -22,16 +22,14 @@ use mascot_rs::prelude::{
     Dataset, GEMS_A10_TOP_60_ZENODO_DOI, GEMS_A10_TOP_128_ZENODO_DOI, GemsA10Builder, GemsA10Iter,
     MGFVec, MascotError,
 };
-use mass_spectrometry::prelude::SpectrumFloat;
 #[cfg(feature = "cuda")]
 use spectral_autoencoder::linear_cosine_cuda::{
     LinearCosineKernelBackend, SimilarityRankingKernelConfig,
     linear_cosine_similarity_ranking_kernel,
 };
 use spectral_autoencoder::{
-    AutoencoderSample, AuxiliaryLossConfig, FlatVectorReconstructionOrdering,
-    SimilarityRankingBatch, SpectralMetricConfig, SpectrumAugmentationConfig,
-    TokenizedAutoencoderSample, TokenizedMgfIter, VectorizedMgfIter,
+    AuxiliaryLossConfig, FlatVectorReconstructionOrdering, SimilarityRankingBatch,
+    SpectralMetricConfig, SpectrumAugmentationConfig,
 };
 
 pub type InnerBackend = Cuda<f32, i32>;
@@ -721,14 +719,13 @@ pub(crate) fn finish_loader_once(
     progress: &LoaderProgress,
     items_processed: usize,
     batches_processed: usize,
-    skipped_records: usize,
     finished: &mut bool,
 ) {
     if *finished {
         return;
     }
     *finished = true;
-    progress.finish(items_processed, batches_processed, skipped_records);
+    progress.finish(items_processed, batches_processed);
 }
 
 fn pair_sampling_seed(epoch_index: u64, batch_index: usize, item_offset: usize) -> u64 {
@@ -1026,37 +1023,13 @@ pub(crate) fn signed_random<B: Backend, const D: usize>(
     (Tensor::<B, D>::random(shape, Distribution::Uniform(0.0, 1.0), device) * 2.0 - 1.0) * range
 }
 
-pub(crate) trait SampleRecordIter<I>:
-    Iterator<Item = spectral_autoencoder::Result<I>>
-{
-    fn skipped_records(&self) -> usize;
-}
-
-impl<P> SampleRecordIter<TokenizedAutoencoderSample> for TokenizedMgfIter<P>
-where
-    P: SpectrumFloat + 'static,
-{
-    fn skipped_records(&self) -> usize {
-        self.skipped_records()
-    }
-}
-
-impl<P> SampleRecordIter<AutoencoderSample> for VectorizedMgfIter<P>
-where
-    P: SpectrumFloat + 'static,
-{
-    fn skipped_records(&self) -> usize {
-        self.skipped_records()
-    }
-}
-
 pub(crate) fn skip_split_records<I, R>(
     records: &mut R,
     start_item: usize,
     progress: &LoaderProgress,
     preload_bar: Option<&ProgressBar>,
 ) where
-    R: SampleRecordIter<I>,
+    R: Iterator<Item = spectral_autoencoder::Result<I>>,
 {
     if start_item == 0 {
         return;
@@ -1074,18 +1047,14 @@ pub(crate) fn skip_split_records<I, R>(
                         bar.inc((skipped_items - reported_items) as u64);
                         reported_items = skipped_items;
                         bar.set_message(format!(
-                            "seeking split offset {skipped_items}/{start_item}; skipped malformed {}",
-                            records.skipped_records()
+                            "seeking split offset {skipped_items}/{start_item}"
                         ));
                     }
-                    progress.split_skipping(skipped_items, start_item, records.skipped_records());
+                    progress.split_skipping(skipped_items, start_item);
                 }
             }
             Some(Err(error)) => {
-                progress.set_skipped(records.skipped_records());
-                if progress.visible() {
-                    eprintln!("skipping MGF record while seeking split offset: {error}");
-                }
+                panic!("failed to read MGF record while seeking split offset: {error}");
             }
             None => break,
         }
@@ -1178,10 +1147,6 @@ impl LoaderProgress {
         }
     }
 
-    pub(crate) fn visible(&self) -> bool {
-        self.progress_mode.visible()
-    }
-
     pub(crate) fn clone_for_slice(&self) -> Self {
         Self {
             bar: self.bar.clone(),
@@ -1198,21 +1163,9 @@ impl LoaderProgress {
         self.bar.set_length(total_items as u64);
         self.bar.set_prefix(self.label.clone());
         self.bar.set_message(format!(
-            "opening MGF stream; target batches 0/{} skipped 0",
+            "opening MGF stream; target batches 0/{}",
             self.max_batches
         ));
-    }
-
-    pub(crate) fn set_skipped(&self, skipped_records: usize) {
-        if skipped_records > 0 {
-            self.bar.set_message(format!(
-                "{}; target batches {}/{} skipped {}",
-                self.action,
-                self.bar.position() as usize / self.batch_size,
-                self.max_batches,
-                skipped_records
-            ));
-        }
     }
 
     pub(crate) fn batch_loaded(
@@ -1220,12 +1173,11 @@ impl LoaderProgress {
         batch_items: usize,
         batches_processed: usize,
         max_batches: usize,
-        skipped_records: usize,
     ) {
         self.bar.inc(batch_items as u64);
         self.bar.set_message(format!(
-            "{} batches {batches_processed}/{max_batches} skipped {skipped_records}",
-            self.action
+            "{} batches {batches_processed}/{max_batches}",
+            self.action,
         ));
     }
 
@@ -1235,33 +1187,22 @@ impl LoaderProgress {
         target_items: usize,
         batches_processed: usize,
         max_batches: usize,
-        skipped_records: usize,
     ) {
         self.bar.set_message(format!(
-            "{} cache window {cached_items}/{target_items}; target batches {batches_processed}/{max_batches} skipped {skipped_records}",
-            self.action
+            "{} cache window {cached_items}/{target_items}; target batches {batches_processed}/{max_batches}",
+            self.action,
         ));
     }
 
-    pub(crate) fn split_skipping(
-        &self,
-        skipped_items: usize,
-        target_items: usize,
-        skipped_records: usize,
-    ) {
+    pub(crate) fn split_skipping(&self, skipped_items: usize, target_items: usize) {
         self.bar.set_message(format!(
-            "seeking split offset {skipped_items}/{target_items}; skipped malformed {skipped_records}",
+            "seeking split offset {skipped_items}/{target_items}",
         ));
     }
 
-    pub(crate) fn finish(
-        &self,
-        items_processed: usize,
-        batches_processed: usize,
-        skipped_records: usize,
-    ) {
+    pub(crate) fn finish(&self, items_processed: usize, batches_processed: usize) {
         self.bar.finish_with_message(format!(
-            "{} {items_processed} spectra in {batches_processed} batches; skipped {skipped_records}",
+            "{} {items_processed} spectra in {batches_processed} batches",
             self.action
         ));
     }

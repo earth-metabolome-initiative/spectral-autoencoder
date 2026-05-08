@@ -595,7 +595,6 @@ where
             batch_items,
             self.batches_processed,
             self.loader.max_batches,
-            self.skipped_records(),
         );
 
         Some(TokenizedAutoencoderBatch {
@@ -652,11 +651,7 @@ where
             let sample = match records.next() {
                 Some(Ok(sample)) => sample,
                 Some(Err(error)) => {
-                    self.loader.progress.set_skipped(records.skipped_records());
-                    if self.loader.progress.visible() {
-                        eprintln!("skipping MGF record: {error}");
-                    }
-                    continue;
+                    panic!("failed to tokenize MGF record: {error}");
                 }
                 None => break,
             };
@@ -689,7 +684,6 @@ where
                     target_items,
                     self.batches_processed,
                     self.loader.max_batches,
-                    records.skipped_records(),
                 );
             }
         }
@@ -753,15 +747,8 @@ where
             &self.loader.progress,
             self.items_processed,
             self.batches_processed,
-            self.skipped_records(),
             &mut self.finished,
         );
-    }
-
-    fn skipped_records(&self) -> usize {
-        self.records
-            .as_ref()
-            .map_or(0, TokenizedMgfIter::skipped_records)
     }
 }
 

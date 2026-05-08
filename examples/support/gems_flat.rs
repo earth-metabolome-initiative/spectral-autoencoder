@@ -541,12 +541,10 @@ where
                     return Some(cpu_cache);
                 }
                 Err(error) => {
-                    if self.progress.visible() {
-                        eprintln!(
-                            "ignoring preprocessed flat cache {}: {error}",
-                            path.display()
-                        );
-                    }
+                    eprintln!(
+                        "ignoring preprocessed flat cache {}: {error}",
+                        path.display()
+                    );
                 }
             }
         }
@@ -573,7 +571,6 @@ where
                         &cpu_cache,
                         format!("{} disk", self.progress.label),
                     )
-                    && self.progress.visible()
                 {
                     eprintln!(
                         "could not write preprocessed flat cache {}: {error}",
@@ -655,11 +652,7 @@ where
             let sample = match records.next() {
                 Some(Ok(sample)) => sample,
                 Some(Err(error)) => {
-                    self.progress.set_skipped(records.skipped_records());
-                    if self.progress.visible() {
-                        eprintln!("skipping MGF record: {error}");
-                    }
-                    continue;
+                    panic!("failed to vectorize MGF record: {error}");
                 }
                 None => break,
             };
@@ -681,10 +674,9 @@ where
                     bar.inc((items - reported_items) as u64);
                     reported_items = items;
                     bar.set_message(format!(
-                        "CPU vectorizing batches {}/{} skipped {}",
+                        "CPU vectorizing batches {}/{}",
                         items / self.batch_size,
                         self.max_batches,
-                        records.skipped_records()
                     ));
                 }
                 self.progress.cache_filling(
@@ -692,7 +684,6 @@ where
                     target_items,
                     batches_processed,
                     self.max_batches,
-                    records.skipped_records(),
                 );
             }
         }
@@ -1293,7 +1284,6 @@ where
             batch_items,
             self.batches_processed,
             self.loader.max_batches,
-            self.skipped_records(),
         );
 
         Some(AutoencoderBatch {
@@ -1361,15 +1351,8 @@ where
             &self.loader.progress,
             self.items_processed,
             self.batches_processed,
-            self.skipped_records(),
             &mut self.finished,
         );
-    }
-
-    fn skipped_records(&self) -> usize {
-        self.records
-            .as_ref()
-            .map_or(0, VectorizedMgfIter::skipped_records)
     }
 }
 
