@@ -136,8 +136,8 @@ impl SpectralAutoencoderConfig {
     /// Starting flat-vector baseline configuration for the 20M-spectrum run.
     ///
     /// This intentionally remains a compressive baseline over top-N
-    /// `(m/z, intensity)` pairs. The latent width is kept compact rather than
-    /// mirroring transformer-scale embeddings.
+    /// `(m/z, intensity)` pairs, but uses enough width for the harder
+    /// top-128 reconstruction and similarity-ranking setup.
     #[must_use]
     pub fn twenty_million_run() -> Self {
         Self::twenty_million_run_with_peaks(SpectrumVectorizerConfig::default().max_peaks)
@@ -153,8 +153,8 @@ impl SpectralAutoencoderConfig {
             }
             .vector_width(),
             ConditioningConfig::default().vector_width(),
-            96,
-            vec![2048, 1024, 512, 256],
+            256,
+            vec![4096, 2048, 1024, 512],
         )
         .with_reconstruction_ordering(FlatVectorReconstructionOrdering::IntensityDescending)
     }
@@ -656,9 +656,9 @@ mod tests {
         assert_eq!(config.encoder.condition_width, 2);
         assert_eq!(config.decoder.condition_width, 0);
         assert_eq!(config.decoder.condition_output_width, 2);
-        assert_eq!(config.encoder.latent_width, 96);
-        assert_eq!(config.encoder.hidden_widths, vec![2048, 1024, 512, 256]);
-        assert_eq!(config.decoder.hidden_widths, vec![256, 512, 1024, 2048]);
+        assert_eq!(config.encoder.latent_width, 256);
+        assert_eq!(config.encoder.hidden_widths, vec![4096, 2048, 1024, 512]);
+        assert_eq!(config.decoder.hidden_widths, vec![512, 1024, 2048, 4096]);
         assert_eq!(
             config.reconstruction_ordering,
             FlatVectorReconstructionOrdering::IntensityDescending
@@ -671,7 +671,7 @@ mod tests {
         assert_eq!(config.auxiliary.masked_precursor_weight, 0.05);
         assert_eq!(config.auxiliary.similarity_ranking_weight, 0.05);
         assert_eq!(config.auxiliary.latent_noise_std, 0.02);
-        assert_eq!(model.num_params(), 6_082_011);
+        assert_eq!(model.num_params(), 23_338_107);
     }
 
     #[test]
@@ -681,7 +681,7 @@ mod tests {
         assert_eq!(config.encoder.spectrum_width, 256);
         assert_eq!(config.decoder.spectrum_width, 256);
         assert_eq!(config.decoder.condition_width, 0);
-        assert_eq!(config.encoder.latent_width, 96);
+        assert_eq!(config.encoder.latent_width, 256);
         assert_eq!(
             config.reconstruction_ordering,
             FlatVectorReconstructionOrdering::IntensityDescending

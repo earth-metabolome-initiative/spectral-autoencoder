@@ -25,10 +25,10 @@ Both model families expose a `twenty_million_run()` preset for GeMS-A10:
 
 - `SpectralAutoencoderConfig::twenty_million_run()` is the flat-vector model:
   top-N `(m/z, intensity)` pairs, deep MLP encoder/decoder, and a
-  96-dimensional latent.
+  256-dimensional latent.
 - `PeakSetAutoencoderConfig::twenty_million_run()` is the peak-set model:
   top-N masked peak tokens, transformer encoder, learned-query set decoder,
-  and a 96-dimensional latent.
+  and a 256-dimensional latent.
 
 Explicit global L1/L2 parameter penalties are disabled in these presets. The
 training examples use AdamW weight decay for L2 regularization.

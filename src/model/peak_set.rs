@@ -206,13 +206,10 @@ pub struct PeakSetAutoencoderConfig {
 impl PeakSetAutoencoderConfig {
     /// Starting peak-set transformer configuration for the 20M-spectrum run.
     ///
-    /// This is the recommended first large-run configuration: top-N peak tokens,
-    /// a 512-wide encoder/decoder, six transformer encoder layers, four set
-    /// decoder layers, and an 8-head attention layout. It is substantially
-    /// larger than the smoke-test-sized defaults while staying below
-    /// DreaMS-scale memory pressure on a single RTX 4090/5090-class GPU. The
-    /// transformer internals stay 512-wide, while the deliverable embedding is
-    /// a compact 96-dimensional latent.
+    /// This is the recommended large-run configuration: top-N peak tokens,
+    /// a 768-wide encoder/decoder, six transformer encoder layers, four set
+    /// decoder layers, a 12-head attention layout, and a 256-dimensional
+    /// latent embedding.
     #[must_use]
     pub fn twenty_million_run() -> Self {
         Self::twenty_million_run_with_peaks(SpectrumTokenizerConfig::default().max_peaks)
@@ -226,7 +223,8 @@ impl PeakSetAutoencoderConfig {
             ..SpectrumTokenizerConfig::default()
         };
         let condition_width = ConditioningConfig::default().vector_width();
-        let token_embedding_width = 512;
+        let token_embedding_width = 768;
+        let latent_width = 256;
 
         Self {
             encoder: PeakSetEncoderConfig {
@@ -234,19 +232,19 @@ impl PeakSetAutoencoderConfig {
                 token_feature_width: tokenizer.feature_width(),
                 condition_width,
                 token_embedding_width,
-                attention_heads: 8,
+                attention_heads: 12,
                 transformer_layers: 6,
                 transformer_feed_forward_width: token_embedding_width * 4,
                 dropout: 0.1,
-                hidden_widths: vec![2048, 1024],
-                latent_width: 96,
+                hidden_widths: vec![4096, 2048],
+                latent_width,
             },
             decoder: PeakSetDecoderConfig {
                 max_peaks: tokenizer.max_peaks,
-                latent_width: 96,
+                latent_width,
                 condition_width: 0,
                 query_width: token_embedding_width,
-                attention_heads: 8,
+                attention_heads: 12,
                 decoder_layers: 4,
                 decoder_feed_forward_width: token_embedding_width * 4,
                 dropout: 0.1,
@@ -829,13 +827,13 @@ mod tests {
         assert_eq!(config.encoder.condition_width, 2);
         assert_eq!(config.decoder.condition_width, 0);
         assert_eq!(config.decoder.condition_output_width, 2);
-        assert_eq!(config.encoder.token_embedding_width, 512);
-        assert_eq!(config.encoder.attention_heads, 8);
+        assert_eq!(config.encoder.token_embedding_width, 768);
+        assert_eq!(config.encoder.attention_heads, 12);
         assert_eq!(config.encoder.transformer_layers, 6);
         assert_eq!(config.decoder.decoder_layers, 4);
-        assert_eq!(config.encoder.hidden_widths, vec![2048, 1024]);
-        assert_eq!(config.encoder.latent_width, 96);
-        assert_eq!(config.decoder.latent_width, 96);
+        assert_eq!(config.encoder.hidden_widths, vec![4096, 2048]);
+        assert_eq!(config.encoder.latent_width, 256);
+        assert_eq!(config.decoder.latent_width, 256);
         assert_eq!(config.regularization.l1, 0.0);
         assert_eq!(config.regularization.l2, 0.0);
         assert_eq!(config.auxiliary.masked_peak_weight, 0.25);
@@ -844,7 +842,7 @@ mod tests {
         assert_eq!(config.auxiliary.masked_precursor_weight, 0.05);
         assert_eq!(config.auxiliary.similarity_ranking_weight, 0.05);
         assert_eq!(config.auxiliary.latent_noise_std, 0.02);
-        assert_eq!(model.num_params(), 39_095_142);
+        assert_eq!(model.num_params(), 92_710_918);
     }
 
     #[test]
@@ -855,7 +853,7 @@ mod tests {
         assert_eq!(config.decoder.max_peaks, 128);
         assert_eq!(config.decoder.condition_width, 0);
         assert_eq!(config.encoder.token_feature_width, 19);
-        assert_eq!(config.encoder.latent_width, 96);
+        assert_eq!(config.encoder.latent_width, 256);
     }
 
     #[test]
