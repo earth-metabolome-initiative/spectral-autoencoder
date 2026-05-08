@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -52,16 +53,18 @@ def main() -> None:
 
     npc_labels = split_label_series(df, args.npc_column)
     classyfire_labels = clean_label_series(df, args.classyfire_column)
+    npc_stem = column_stem(args.npc_column)
+    npc_title = column_title(args.npc_column)
     npc_counts = Counter(label for labels in npc_labels for label in labels)
     classyfire_counts = Counter(
         label for label in classyfire_labels if label not in EXCLUDED_CLASSYFIRE_LABELS
     )
-    write_counts(args.output_dir / "npc_pathway_counts.tsv", npc_counts)
+    write_counts(args.output_dir / f"{npc_stem}_counts.tsv", npc_counts)
     write_counts(args.output_dir / f"{args.classyfire_column}_counts.tsv", classyfire_counts)
     write_count_png(
-        args.output_dir / "npc_pathway_counts.png",
+        args.output_dir / f"{npc_stem}_counts.png",
         npc_counts,
-        "NPC pathway",
+        npc_title,
         title_suffix,
     )
     write_count_png(
@@ -79,10 +82,10 @@ def main() -> None:
             tsne_xy = compute_tsne(embeddings, args)
             write_coordinates(tsne_coordinates, tsne_xy)
         write_multilabel_scatter_png(
-            args.output_dir / "tsne_npc_pathway.png",
+            args.output_dir / f"tsne_{npc_stem}.png",
             tsne_xy,
             npc_labels,
-            "t-SNE colored by NPC pathway",
+            f"t-SNE colored by {npc_title}",
             title_suffix,
             args.top_labels,
             args.png_dpi,
@@ -106,10 +109,10 @@ def main() -> None:
             write_coordinates(tmap_coordinates, tmap_xy)
             write_edges(args.output_dir / "tmap_edges.tsv", edges)
         write_multilabel_scatter_png(
-            args.output_dir / "tmap_npc_pathway.png",
+            args.output_dir / f"tmap_{npc_stem}.png",
             tmap_xy,
             npc_labels,
-            "TMAP colored by NPC pathway",
+            f"TMAP colored by {npc_title}",
             title_suffix,
             args.top_labels,
             args.png_dpi,
@@ -192,6 +195,14 @@ def normalize_embeddings(embeddings: np.ndarray, normalization: str) -> np.ndarr
 
 def embedding_title_suffix(dimension: int) -> str:
     return f"from {dimension} dimensional embeddings from the spectral autoencoder"
+
+
+def column_stem(column: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", column.lower()).strip("_")
+
+
+def column_title(column: str) -> str:
+    return column.replace("_", " ")
 
 
 def split_label_series(df: pd.DataFrame, column: str) -> list[list[str]]:

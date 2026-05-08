@@ -57,75 +57,18 @@ mod app {
         "instrument",
     ];
 
-    const SPECTRUM_ID_KEYS: &[&str] = &["SPECTRUMID", "SPECTRUM_ID", "USI", "IDENTIFIER"];
-    const NAME_KEYS: &[&str] = &["NAME", "COMPOUND_NAME", "COMPOUND", "TITLE"];
-    const INCHIKEY_KEYS: &[&str] = &["INCHIKEY", "INCHI_KEY", "INCHIKEY2D"];
-    const SOURCE_KEYS: &[&str] = &[
-        "SOURCE_DATASET",
-        "SOURCE",
-        "DATASET",
-        "ORIGIN",
-        "LIBRARY",
-        "PROVENANCE",
-    ];
-    const NPC_PATHWAY_KEYS: &[&str] = &[
-        "NPC_PATHWAY",
-        "NPC_PATHWAYS",
-        "NPCLASSIFIER_PATHWAY",
-        "NP_CLASSIFIER_PATHWAY",
-        "NPCPathway",
-        "npc_pathway",
-        "pathway",
-    ];
-    const NPC_SUPERCLASS_KEYS: &[&str] = &[
-        "NPC_SUPERCLASS",
-        "NPCLASSIFIER_SUPERCLASS",
-        "NP_CLASSIFIER_SUPERCLASS",
-        "NPCSuperclass",
-        "npc_superclass",
-    ];
-    const NPC_CLASS_KEYS: &[&str] = &[
-        "NPC_CLASS",
-        "NPCLASSIFIER_CLASS",
-        "NP_CLASSIFIER_CLASS",
-        "NPCClass",
-        "npc_class",
-    ];
-    const CLASSYFIRE_KINGDOM_KEYS: &[&str] = &[
-        "CHEMONT_KINGDOM",
-        "CLASSYFIRE_KINGDOM",
-        "CLASSYFIRE_KINGDOM_NAME",
-        "CF_KINGDOM",
-        "kingdom",
-    ];
-    const CLASSYFIRE_SUPERCLASS_KEYS: &[&str] = &[
-        "CHEMONT_SUPERCLASS",
-        "CLASSYFIRE_SUPERCLASS",
-        "CLASSYFIRE_SUPERCLASS_NAME",
-        "CF_SUPERCLASS",
-        "superclass",
-    ];
-    const CLASSYFIRE_CLASS_KEYS: &[&str] = &[
-        "CHEMONT_CLASS",
-        "CLASSYFIRE_CLASS",
-        "CLASSYFIRE_CLASS_NAME",
-        "CF_CLASS",
-        "class",
-    ];
-    const CLASSYFIRE_SUBCLASS_KEYS: &[&str] = &[
-        "CHEMONT_SUBCLASS",
-        "CLASSYFIRE_SUBCLASS",
-        "CLASSYFIRE_SUBCLASS_NAME",
-        "CF_SUBCLASS",
-        "subclass",
-    ];
-    const CLASSYFIRE_DIRECT_PARENT_KEYS: &[&str] = &[
-        "CHEMONT_DIRECT_PARENT",
-        "CLASSYFIRE_DIRECT_PARENT",
-        "CLASSYFIRE_DIRECT_PARENT_NAME",
-        "CF_DIRECT_PARENT",
-        "direct_parent",
-    ];
+    const SPECTRUM_ID_KEY: &str = "SPECTRUMID";
+    const NAME_KEY: &str = "NAME";
+    const INCHIKEY_KEY: &str = "INCHIKEY";
+    const SOURCE_KEY: &str = "SOURCE_DATASET";
+    const NPC_PATHWAY_KEY: &str = "NPC_PATHWAYS";
+    const NPC_SUPERCLASS_KEY: &str = "NPC_SUPERCLASSES";
+    const NPC_CLASS_KEY: &str = "NPC_CLASSES";
+    const CLASSYFIRE_KINGDOM_KEY: &str = "CHEMONT_KINGDOM";
+    const CLASSYFIRE_SUPERCLASS_KEY: &str = "CHEMONT_SUPERCLASS";
+    const CLASSYFIRE_CLASS_KEY: &str = "CHEMONT_CLASS";
+    const CLASSYFIRE_SUBCLASS_KEY: &str = "CHEMONT_SUBCLASS";
+    const CLASSYFIRE_DIRECT_PARENT_KEY: &str = "CHEMONT_DIRECT_PARENT";
 
     pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let args = Args::from_env()?;
@@ -344,20 +287,20 @@ mod app {
             index.to_string(),
             clean_option(record.feature_id()),
             clean_option(record.scans()),
-            metadata_value(record, SPECTRUM_ID_KEYS),
-            metadata_value(record, NAME_KEYS),
+            metadata_value(record, SPECTRUM_ID_KEY),
+            metadata_value(record, NAME_KEY),
             clean_owned(smiles),
-            metadata_value(record, INCHIKEY_KEYS),
+            metadata_value(record, INCHIKEY_KEY),
             clean_owned(formula),
-            metadata_value(record, NPC_PATHWAY_KEYS),
-            metadata_value(record, NPC_SUPERCLASS_KEYS),
-            metadata_value(record, NPC_CLASS_KEYS),
-            metadata_value(record, CLASSYFIRE_KINGDOM_KEYS),
-            metadata_value(record, CLASSYFIRE_SUPERCLASS_KEYS),
-            metadata_value(record, CLASSYFIRE_CLASS_KEYS),
-            metadata_value(record, CLASSYFIRE_SUBCLASS_KEYS),
-            metadata_value(record, CLASSYFIRE_DIRECT_PARENT_KEYS),
-            metadata_value(record, SOURCE_KEYS),
+            metadata_value(record, NPC_PATHWAY_KEY),
+            metadata_value(record, NPC_SUPERCLASS_KEY),
+            metadata_value(record, NPC_CLASS_KEY),
+            metadata_value(record, CLASSYFIRE_KINGDOM_KEY),
+            metadata_value(record, CLASSYFIRE_SUPERCLASS_KEY),
+            metadata_value(record, CLASSYFIRE_CLASS_KEY),
+            metadata_value(record, CLASSYFIRE_SUBCLASS_KEY),
+            metadata_value(record, CLASSYFIRE_DIRECT_PARENT_KEY),
+            metadata_value(record, SOURCE_KEY),
             clean_owned(retention_time),
             clean_owned(precursor_mz),
             clean_owned(charge),
@@ -366,50 +309,24 @@ mod app {
         ]
     }
 
-    fn metadata_value(record: &MascotGenericFormat<f32>, keys: &[&str]) -> String {
+    fn metadata_value(record: &MascotGenericFormat<f32>, key: &str) -> String {
         let metadata = record.metadata();
-        for key in keys {
-            if let Some(value) = metadata.arbitrary_metadata_value(key).and_then(clean_label) {
-                return value.to_owned();
-            }
-        }
-        for (observed_key, value) in metadata.arbitrary_metadata() {
-            if keys
-                .iter()
-                .any(|key| observed_key.eq_ignore_ascii_case(key))
-                && let Some(value) = clean_label(value)
-            {
-                return value.to_owned();
-            }
-        }
-        String::new()
+        metadata
+            .arbitrary_metadata_value(key)
+            .map(clean_value)
+            .unwrap_or_default()
     }
 
     fn clean_option(value: Option<&str>) -> String {
-        value.and_then(clean_label).unwrap_or_default().to_owned()
+        value.map(clean_value).unwrap_or_default()
     }
 
     fn clean_owned(value: Option<String>) -> String {
-        value
-            .as_deref()
-            .and_then(clean_label)
-            .unwrap_or_default()
-            .to_owned()
+        value.as_deref().map(clean_value).unwrap_or_default()
     }
 
-    fn clean_label(value: &str) -> Option<&str> {
-        let value = value.trim();
-        if value.is_empty()
-            || value.eq_ignore_ascii_case("n/a")
-            || value.eq_ignore_ascii_case("na")
-            || value.eq_ignore_ascii_case("none")
-            || value.eq_ignore_ascii_case("null")
-            || value.eq_ignore_ascii_case("unknown")
-        {
-            None
-        } else {
-            Some(value)
-        }
+    fn clean_value(value: &str) -> String {
+        value.trim().to_owned()
     }
 
     fn write_tsv_fields<W: Write>(writer: &mut W, fields: &[String]) -> io::Result<()> {
