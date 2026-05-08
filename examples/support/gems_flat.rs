@@ -7,10 +7,7 @@ use std::{
     io,
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::UNIX_EPOCH,
 };
 
@@ -25,9 +22,10 @@ use spectral_autoencoder::{
 };
 
 use crate::gems_common::{
-    CachedLoaderOptions, CachedTrainingLoaderConfig, LoaderProgress, RunArgs,
+    CachedLoaderOptions, CachedTrainingLoaderConfig, LoaderProgress, PairSamplingEpoch, RunArgs,
     SimilarityTeacherBackend, SimilarityTeacherConfig, TeacherGpuCache, TeacherSpectraBuilder,
-    TeacherSpectraCache, bool_var, cache_items, mask_precursor_conditions, probability_mask,
+    TeacherSpectraCache, bool_var, cache_items, finish_loader_once, is_full_gpu_cache,
+    loader_epoch_items, mask_precursor_conditions, open_records_or_panic, probability_mask,
     signed_random, similarity_pair_seed, skip_split_records, teacher_similarity_ranking_batch,
     tokenization_style, usize_var,
 };
@@ -372,8 +370,7 @@ where
     cpu_cache: Arc<Mutex<Option<Arc<FlatCpuCache>>>>,
     initial_cache: Arc<Mutex<Option<FlatGpuCache<B>>>>,
     full_cache: Arc<Mutex<Option<FlatGpuCache<B>>>>,
-    randomize_pair_sampling: bool,
-    pair_sampling_epoch: Arc<AtomicU64>,
+    pair_sampling_epoch: PairSamplingEpoch,
 }
 
 impl<B, Open> Clone for CachedVectorizedMgfLoader<B, Open>
@@ -398,7 +395,6 @@ where
             cpu_cache: self.cpu_cache.clone(),
             initial_cache: self.initial_cache.clone(),
             full_cache: self.full_cache.clone(),
-            randomize_pair_sampling: self.randomize_pair_sampling,
             pair_sampling_epoch: self.pair_sampling_epoch.clone(),
         }
     }
@@ -428,21 +424,12 @@ where
             cpu_cache: Arc::new(Mutex::new(None)),
             initial_cache: Arc::new(Mutex::new(None)),
             full_cache: Arc::new(Mutex::new(None)),
-            randomize_pair_sampling: options.randomize_pair_sampling,
-            pair_sampling_epoch: Arc::new(AtomicU64::new(0)),
+            pair_sampling_epoch: PairSamplingEpoch::new(options.randomize_pair_sampling),
         }
     }
 
     fn is_full_cache(&self) -> bool {
-        self.cache_items >= self.batch_size.saturating_mul(self.max_batches)
-    }
-
-    fn next_pair_sampling_epoch(&self) -> u64 {
-        if self.randomize_pair_sampling {
-            self.pair_sampling_epoch.fetch_add(1, Ordering::Relaxed) + 1
-        } else {
-            0
-        }
+        is_full_gpu_cache(self.cache_items, self.batch_size, self.max_batches)
     }
 
     fn gpu_transfer_stages(&self) -> usize {
@@ -533,7 +520,7 @@ where
             return Some(cache);
         }
 
-        let total_items = self.batch_size.saturating_mul(self.max_batches);
+        let total_items = loader_epoch_items(self.batch_size, self.max_batches);
         if let Some(path) = &self.preprocessed_cache_path
             && !bool_var("GEMS_FLAT_PREPROCESSED_CACHE_REFRESH", false)
             && path.try_exists().unwrap_or(false)
@@ -564,12 +551,7 @@ where
             }
         }
 
-        let mut records = (self.open_records)().unwrap_or_else(|error| {
-            panic!(
-                "failed to open cached vectorized MGF iterator for {}: {error}",
-                self.mgf_source
-            )
-        });
+        let mut records = open_records_or_panic(&self.open_records, "vectorized", &self.mgf_source);
         self.skip_preload_offset(&mut records);
 
         let bar = preload_bar(
@@ -841,8 +823,8 @@ where
 {
     fn iter<'a>(&'a self) -> Box<dyn DataLoaderIterator<AutoencoderBatch<B>> + 'a> {
         self.progress
-            .start_epoch(self.batch_size * self.max_batches);
-        let epoch_index = self.next_pair_sampling_epoch();
+            .start_epoch(loader_epoch_items(self.batch_size, self.max_batches));
+        let epoch_index = self.pair_sampling_epoch.next();
 
         if self.is_full_cache()
             && let Some(cache) = self
@@ -886,12 +868,7 @@ where
             });
         }
 
-        let mut records = (self.open_records)().unwrap_or_else(|error| {
-            panic!(
-                "failed to open cached vectorized MGF iterator for {}: {error}",
-                self.mgf_source
-            )
-        });
+        let mut records = open_records_or_panic(&self.open_records, "vectorized", &self.mgf_source);
         skip_split_records(&mut records, self.start_item, &self.progress, None);
 
         Box::new(CachedVectorizedMgfIter {
@@ -907,7 +884,7 @@ where
     }
 
     fn num_items(&self) -> usize {
-        self.batch_size * self.max_batches
+        loader_epoch_items(self.batch_size, self.max_batches)
     }
 
     fn to_device(&self, device: &B::Device) -> Arc<dyn DataLoader<B, AutoencoderBatch<B>>> {
@@ -1340,10 +1317,7 @@ where
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn fill_cache(&mut self) -> Option<FlatGpuCache<B>> {
-        let remaining_items = self
-            .loader
-            .batch_size
-            .saturating_mul(self.loader.max_batches)
+        let remaining_items = loader_epoch_items(self.loader.batch_size, self.loader.max_batches)
             .saturating_sub(self.items_processed);
         let target_items = self.loader.cache_items.min(remaining_items);
         if target_items == 0 {
@@ -1383,14 +1357,13 @@ where
     }
 
     fn finish(&mut self) {
-        if !self.finished {
-            self.finished = true;
-            self.loader.progress.finish(
-                self.items_processed,
-                self.batches_processed,
-                self.skipped_records(),
-            );
-        }
+        finish_loader_once(
+            &self.loader.progress,
+            self.items_processed,
+            self.batches_processed,
+            self.skipped_records(),
+            &mut self.finished,
+        );
     }
 
     fn skipped_records(&self) -> usize {
@@ -1408,7 +1381,7 @@ where
     fn progress(&self) -> Progress {
         Progress {
             items_processed: self.items_processed,
-            items_total: self.loader.batch_size * self.loader.max_batches,
+            items_total: loader_epoch_items(self.loader.batch_size, self.loader.max_batches),
         }
     }
 }

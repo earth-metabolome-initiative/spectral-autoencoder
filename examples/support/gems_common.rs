@@ -1,9 +1,13 @@
 use std::{
     env,
     error::Error as StdError,
+    fmt::Display,
     io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -658,7 +662,7 @@ pub(crate) struct CachedLoaderOptions<B: Backend> {
 }
 
 pub(crate) fn cache_items(batch_size: usize, max_batches: usize, cache_percent: f64) -> usize {
-    let epoch_items = batch_size.saturating_mul(max_batches);
+    let epoch_items = loader_epoch_items(batch_size, max_batches);
     if epoch_items == 0 {
         return 0;
     }
@@ -666,6 +670,65 @@ pub(crate) fn cache_items(batch_size: usize, max_batches: usize, cache_percent: 
     let requested = ((epoch_items as f64) * cache_percent / 100.0).ceil() as usize;
     let requested = requested.max(batch_size).min(epoch_items);
     requested.div_ceil(batch_size) * batch_size
+}
+
+pub(crate) fn loader_epoch_items(batch_size: usize, max_batches: usize) -> usize {
+    batch_size.saturating_mul(max_batches)
+}
+
+pub(crate) fn is_full_gpu_cache(cache_items: usize, batch_size: usize, max_batches: usize) -> bool {
+    cache_items >= loader_epoch_items(batch_size, max_batches)
+}
+
+#[derive(Clone)]
+pub(crate) struct PairSamplingEpoch {
+    randomize: bool,
+    epoch: Arc<AtomicU64>,
+}
+
+impl PairSamplingEpoch {
+    pub(crate) fn new(randomize: bool) -> Self {
+        Self {
+            randomize,
+            epoch: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub(crate) fn next(&self) -> u64 {
+        if self.randomize {
+            self.epoch.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            0
+        }
+    }
+}
+
+pub(crate) fn open_records_or_panic<I, E, Open>(
+    open_records: &Open,
+    kind: &str,
+    mgf_source: &str,
+) -> I
+where
+    Open: Fn() -> Result<I, E>,
+    E: Display,
+{
+    open_records().unwrap_or_else(|error| {
+        panic!("failed to open cached {kind} MGF iterator for {mgf_source}: {error}")
+    })
+}
+
+pub(crate) fn finish_loader_once(
+    progress: &LoaderProgress,
+    items_processed: usize,
+    batches_processed: usize,
+    skipped_records: usize,
+    finished: &mut bool,
+) {
+    if *finished {
+        return;
+    }
+    *finished = true;
+    progress.finish(items_processed, batches_processed, skipped_records);
 }
 
 fn pair_sampling_seed(epoch_index: u64, batch_index: usize, item_offset: usize) -> u64 {
