@@ -7,7 +7,9 @@ mod app {
     };
 
     use indicatif::{ProgressBar, ProgressStyle};
-    use mascot_rs::prelude::{ANNOTATED_MS2_TOP_128_SPECTRA_COUNT, MGFIter, MGFVec};
+    use mascot_rs::prelude::{
+        ANNOTATED_MS2_TOP_128_SPECTRA_COUNT, AnnotatedMs2Builder, Dataset, MGFVec,
+    };
     use mass_spectrometry::prelude::{Spectrum, SpectrumFloat};
 
     const DEFAULT_OUTPUT: &str =
@@ -48,21 +50,20 @@ mod app {
         fs::create_dir_all(&args.dataset_dir)?;
 
         let runtime = tokio::runtime::Runtime::new()?;
-        let download = runtime.block_on(
-            MGFVec::<f64>::annotated_ms2_top_128_peaks()
-                .target_directory(&args.dataset_dir)
-                .force_download(args.force_download)
-                .verbose()
-                .download(),
-        )?;
+        let builder = MGFVec::<f32>::annotated_ms2_top_128_peaks()
+            .target_directory(&args.dataset_dir)
+            .force_download(args.force_download)
+            .verbose();
+        let dataset_path = builder.path();
+        let mut records =
+            runtime.block_on(<AnnotatedMs2Builder<f32> as Dataset>::mgf_iter(builder))?;
 
-        println!("annotated MS2 MGF: {}", download.path().display());
+        println!("annotated MS2 MGF: {}", dataset_path.display());
         println!("output: {}", args.output.display());
         if let Some(limit) = args.limit {
             println!("limit: {limit}");
         }
 
-        let mut records = MGFIter::<f64, _>::from_path(download.path())?.skipping_invalid_records();
         let mut writer = BufWriter::new(fs::File::create(&args.output)?);
         write_header(&mut writer)?;
 
@@ -132,7 +133,8 @@ mod app {
     impl SpectrumMetrics {
         fn from_spectrum<S>(index: usize, spectrum: &S) -> Self
         where
-            S: Spectrum<Precision = f64> + HasCharge,
+            S: Spectrum + HasCharge,
+            S::Precision: SpectrumFloat,
         {
             let peaks: Vec<(f64, f64)> = spectrum
                 .peaks()
@@ -236,7 +238,7 @@ mod app {
         fn charge(&self) -> Option<i8>;
     }
 
-    impl HasCharge for mascot_rs::prelude::MascotGenericFormat<f64> {
+    impl HasCharge for mascot_rs::prelude::MascotGenericFormat<f32> {
         fn charge(&self) -> Option<i8> {
             self.charge()
         }

@@ -14,7 +14,8 @@ mod app {
     };
     use indicatif::{ProgressBar, ProgressStyle};
     use mascot_rs::prelude::{
-        ANNOTATED_MS2_TOP_128_SPECTRA_COUNT, MGFIter, MGFVec, MascotGenericFormat,
+        ANNOTATED_MS2_TOP_128_SPECTRA_COUNT, AnnotatedMs2Builder, Dataset, MGFVec,
+        MascotGenericFormat,
     };
     use mass_spectrometry::prelude::{Spectrum, SpectrumFloat};
     use spectral_autoencoder::{
@@ -134,15 +135,15 @@ mod app {
         fs::create_dir_all(&args.dataset_dir)?;
 
         let runtime = tokio::runtime::Runtime::new()?;
-        let download = runtime.block_on(
-            MGFVec::<f64>::annotated_ms2_top_128_peaks()
-                .target_directory(&args.dataset_dir)
-                .force_download(args.force_download)
-                .verbose()
-                .download(),
-        )?;
+        let builder = MGFVec::<f32>::annotated_ms2_top_128_peaks()
+            .target_directory(&args.dataset_dir)
+            .force_download(args.force_download)
+            .verbose();
+        let dataset_path = builder.path();
+        let mut records =
+            runtime.block_on(<AnnotatedMs2Builder<f32> as Dataset>::mgf_iter(builder))?;
 
-        println!("annotated MS2 MGF: {}", download.path().display());
+        println!("annotated MS2 MGF: {}", dataset_path.display());
         println!("model: {}", args.model.display());
         println!("output: {}", args.output.display());
         println!("device: cuda:{}", args.device);
@@ -165,7 +166,6 @@ mod app {
             ..SpectrumVectorizerConfig::default()
         });
         let conditioning = ConditioningEncoder::default();
-        let mut records = MGFIter::<f64, _>::from_path(download.path())?.skipping_invalid_records();
         let mut writer = BufWriter::new(fs::File::create(&args.output)?);
         write_header(&mut writer, config.encoder.latent_width)?;
 
@@ -330,7 +330,7 @@ mod app {
         writer.write_all(b"\n")
     }
 
-    fn annotation_fields(index: usize, record: &MascotGenericFormat<f64>) -> Vec<String> {
+    fn annotation_fields(index: usize, record: &MascotGenericFormat<f32>) -> Vec<String> {
         let metadata = record.metadata();
         let retention_time = metadata
             .retention_time()
@@ -369,7 +369,7 @@ mod app {
         ]
     }
 
-    fn metadata_value(record: &MascotGenericFormat<f64>, keys: &[&str]) -> String {
+    fn metadata_value(record: &MascotGenericFormat<f32>, keys: &[&str]) -> String {
         let metadata = record.metadata();
         for key in keys {
             if let Some(value) = metadata.arbitrary_metadata_value(key).and_then(clean_label) {
