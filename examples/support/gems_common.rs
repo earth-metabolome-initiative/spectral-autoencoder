@@ -24,12 +24,13 @@ use mascot_rs::prelude::{
 };
 #[cfg(feature = "cuda")]
 use spectral_autoencoder::linear_cosine_cuda::{
-    LinearCosineKernelBackend, SimilarityRankingKernelConfig,
+    LinearCosineKernelBackend, SIMILARITY_METRIC_LINEAR_COSINE,
+    SIMILARITY_METRIC_MODIFIED_LINEAR_COSINE, SimilarityRankingKernelConfig,
     linear_cosine_similarity_ranking_kernel,
 };
 use spectral_autoencoder::{
-    AuxiliaryLossConfig, FlatVectorReconstructionOrdering, SimilarityRankingBatch,
-    SpectralMetricConfig, SpectrumAugmentationConfig,
+    AuxiliaryLossConfig, ConditioningConfig, FlatVectorReconstructionOrdering,
+    SimilarityRankingBatch, SpectralMetricConfig, SpectrumAugmentationConfig,
 };
 
 pub type InnerBackend = Cuda<f32, i32>;
@@ -414,30 +415,54 @@ pub fn auxiliary_loss_config_from_env(default: AuxiliaryLossConfig) -> Auxiliary
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum SimilarityTeacherMetric {
+    LinearCosine,
+    ModifiedLinearCosine,
+}
+
+impl SimilarityTeacherMetric {
+    fn from_env() -> Result<Self, Box<dyn StdError>> {
+        let Ok(value) = env::var("GEMS_SIMILARITY_RANKING_METRIC") else {
+            return Ok(Self::LinearCosine);
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "cosine" | "linear-cosine" | "linear_cosine" => Ok(Self::LinearCosine),
+            "modified-cosine" | "modified-linear-cosine" | "modified_linear_cosine" => {
+                Ok(Self::ModifiedLinearCosine)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "GEMS_SIMILARITY_RANKING_METRIC must be linear-cosine or modified-linear-cosine",
+            )
+            .into()),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::LinearCosine => "linear cosine",
+            Self::ModifiedLinearCosine => "modified linear cosine",
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn kernel_code(self) -> u32 {
+        match self {
+            Self::LinearCosine => SIMILARITY_METRIC_LINEAR_COSINE,
+            Self::ModifiedLinearCosine => SIMILARITY_METRIC_MODIFIED_LINEAR_COSINE,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct SimilarityTeacherConfig {
     enabled: bool,
+    metric: SimilarityTeacherMetric,
     mz_tolerance: f64,
     max_mz: f64,
     cosine_mz_power: f64,
     cosine_intensity_power: f64,
     candidates_per_anchor: usize,
-}
-
-fn require_linear_cosine_teacher_metric() -> Result<(), Box<dyn StdError>> {
-    if let Ok(value) = env::var("GEMS_SIMILARITY_RANKING_METRIC") {
-        let value = value.to_ascii_lowercase();
-        match value.as_str() {
-            "cosine" | "linear-cosine" | "linear_cosine" => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "GEMS_SIMILARITY_RANKING_METRIC must be linear-cosine; CPU and entropy teachers have been removed",
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
 }
 
 fn require_cuda_similarity_teacher() -> Result<(), Box<dyn StdError>> {
@@ -460,7 +485,6 @@ fn require_cuda_similarity_teacher() -> Result<(), Box<dyn StdError>> {
 impl SimilarityTeacherConfig {
     fn from_env(auxiliary: AuxiliaryLossConfig) -> Result<Self, Box<dyn StdError>> {
         let metrics = SpectralMetricConfig::default();
-        require_linear_cosine_teacher_metric()?;
         require_cuda_similarity_teacher()?;
         reject_similarity_teacher_blend_weight("GEMS_SIMILARITY_RANKING_COSINE_WEIGHT")?;
         reject_similarity_teacher_blend_weight("GEMS_SIMILARITY_RANKING_ENTROPY_WEIGHT")?;
@@ -469,6 +493,7 @@ impl SimilarityTeacherConfig {
         reject_similarity_teacher_env_var("GEMS_SIMILARITY_RANKING_WEIGHTED_ENTROPY")?;
         let mut config = Self {
             enabled: auxiliary.similarity_ranking_weight > 0.0,
+            metric: SimilarityTeacherMetric::from_env()?,
             mz_tolerance: f64_var("GEMS_SIMILARITY_RANKING_MZ_TOLERANCE", metrics.mz_tolerance),
             max_mz: f64_var("GEMS_SIMILARITY_RANKING_MAX_MZ", 2_000.0),
             cosine_mz_power: f64_var(
@@ -497,8 +522,10 @@ impl SimilarityTeacherConfig {
             return "disabled".to_string();
         }
         format!(
-            "online linear cosine teacher on CUDA, tolerance {} Da, candidates/anchor {}",
-            self.mz_tolerance, self.candidates_per_anchor
+            "online {} teacher on CUDA, tolerance {} Da, candidates/anchor {}",
+            self.metric.label(),
+            self.mz_tolerance,
+            self.candidates_per_anchor
         )
     }
 
@@ -562,7 +589,7 @@ fn reject_similarity_teacher_env_var(name: &str) -> Result<(), Box<dyn StdError>
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
-        format!("{name} is no longer supported; the similarity-ranking teacher is GPU linear-cosine only"),
+        format!("{name} is no longer supported; the similarity-ranking teacher uses one GPU metric at a time"),
     )
     .into())
 }
@@ -756,6 +783,7 @@ pub(crate) fn similarity_pair_seed(
 pub(crate) struct TeacherSpectraCache {
     fixed_mz: Vec<f32>,
     fixed_intensity: Vec<f32>,
+    precursor_mz: Vec<f32>,
     fixed_peak_width: usize,
     items: usize,
 }
@@ -770,6 +798,7 @@ pub(crate) struct TeacherSpectraBuilder {
     config: SimilarityTeacherConfig,
     fixed_mz: Vec<f32>,
     fixed_intensity: Vec<f32>,
+    precursor_mz: Vec<f32>,
     fixed_peak_width: usize,
     expected_items: usize,
     items: usize,
@@ -781,19 +810,21 @@ impl TeacherSpectraBuilder {
             config,
             fixed_mz: Vec::new(),
             fixed_intensity: Vec::new(),
+            precursor_mz: Vec::new(),
             fixed_peak_width: 0,
             expected_items: items,
             items: 0,
         }
     }
 
-    pub(crate) fn push_pairs(&mut self, target_pairs: &[f32]) {
+    pub(crate) fn push_pairs(&mut self, target_pairs: &[f32], conditions: &[f32]) {
         if self.fixed_peak_width == 0 {
             self.fixed_peak_width = target_pairs.len() / 2;
             self.fixed_mz
                 .reserve(self.expected_items.saturating_mul(self.fixed_peak_width));
             self.fixed_intensity
                 .reserve(self.expected_items.saturating_mul(self.fixed_peak_width));
+            self.precursor_mz.reserve(self.expected_items);
         }
         let peaks = preprocess_teacher_pairs(target_pairs, self.config);
         for peak_index in 0..self.fixed_peak_width {
@@ -801,6 +832,8 @@ impl TeacherSpectraBuilder {
             self.fixed_mz.push(mz);
             self.fixed_intensity.push(intensity);
         }
+        self.precursor_mz
+            .push(teacher_precursor_from_conditions(conditions));
         self.items += 1;
     }
 
@@ -808,6 +841,7 @@ impl TeacherSpectraBuilder {
         TeacherSpectraCache {
             fixed_mz: self.fixed_mz,
             fixed_intensity: self.fixed_intensity,
+            precursor_mz: self.precursor_mz,
             fixed_peak_width: self.fixed_peak_width,
             items: self.items,
         }
@@ -818,6 +852,7 @@ impl TeacherSpectraBuilder {
 pub(crate) struct TeacherGpuCache<B: Backend> {
     mz: Tensor<B, 2>,
     intensity: Tensor<B, 2>,
+    precursor: Tensor<B, 1>,
     peak_width: usize,
 }
 
@@ -850,8 +885,22 @@ impl<B: Backend> TeacherGpuCache<B> {
                 ),
                 device,
             ),
+            precursor: Tensor::<B, 1>::from_data(
+                TensorData::new(cache.precursor_mz[start..end].to_vec(), [items]),
+                device,
+            ),
             peak_width,
         })
+    }
+}
+
+fn teacher_precursor_from_conditions(conditions: &[f32]) -> f32 {
+    let precursor = conditions.first().copied().unwrap_or(0.0);
+    let present = conditions.get(1).copied().unwrap_or(0.0);
+    if present > 0.0 && precursor.is_finite() && precursor > 0.0 {
+        precursor * ConditioningConfig::default().precursor_mz_scale() as f32
+    } else {
+        panic!("similarity ranking requires finite precursor m/z conditions");
     }
 }
 
@@ -955,6 +1004,7 @@ pub(crate) fn teacher_similarity_ranking_batch<B: SimilarityTeacherBackend>(
             linear_cosine_similarity_ranking_kernel(
                 teacher_gpu.mz.clone(),
                 teacher_gpu.intensity.clone(),
+                teacher_gpu.precursor.clone(),
                 SimilarityRankingKernelConfig {
                     batch_start,
                     batch_items,
@@ -962,6 +1012,8 @@ pub(crate) fn teacher_similarity_ranking_batch<B: SimilarityTeacherBackend>(
                     mz_power: config.cosine_mz_power,
                     intensity_power: config.cosine_intensity_power,
                     mz_tolerance: config.mz_tolerance,
+                    metric: config.metric.kernel_code(),
+                    max_peaks: teacher_gpu.peak_width,
                     seed,
                     epsilon: 1.0e-8,
                 },

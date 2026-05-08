@@ -618,8 +618,10 @@ where
         let teacher = teacher_spectra_cache_from_target_pairs(
             self.similarity_teacher,
             &cpu_cache.spectra,
+            &cpu_cache.conditions,
             cpu_cache.items,
             cpu_cache.spectrum_width,
+            cpu_cache.condition_width,
             Some(&bar),
         );
         bar.finish_with_message(format!("preprocessed {} teacher spectra", cpu_cache.items));
@@ -664,7 +666,7 @@ where
                 conditions.reserve(target_items * condition_width);
             }
             if let Some(builder) = &mut teacher_builder {
-                builder.push_pairs(&sample.spectrum);
+                builder.push_pairs(&sample.spectrum, &sample.conditions);
             }
             spectra.extend(sample.spectrum);
             conditions.extend(sample.conditions);
@@ -788,15 +790,22 @@ where
 fn teacher_spectra_cache_from_target_pairs(
     config: SimilarityTeacherConfig,
     target_pairs: &[f32],
+    conditions: &[f32],
     items: usize,
     target_width: usize,
+    condition_width: usize,
     progress: Option<&ProgressBar>,
 ) -> TeacherSpectraCache {
     let mut builder = TeacherSpectraBuilder::new(config, items);
     for item in 0..items {
         let start = item * target_width;
         let end = start + target_width;
-        builder.push_pairs(&target_pairs[start..end]);
+        let condition_start = item * condition_width;
+        let condition_end = condition_start + condition_width;
+        builder.push_pairs(
+            &target_pairs[start..end],
+            &conditions[condition_start..condition_end],
+        );
         if let Some(bar) = progress
             && ((item + 1).is_multiple_of(8192) || item + 1 == items)
         {

@@ -669,7 +669,7 @@ where
                 conditions.reserve(target_items * condition_width);
             }
             if let Some(builder) = &mut teacher_builder {
-                builder.push_pairs(&sample.target_pairs);
+                builder.push_pairs(&sample.target_pairs, &sample.conditions);
             }
             token_features.extend(sample.token_features);
             target_pairs.extend(sample.target_pairs);
