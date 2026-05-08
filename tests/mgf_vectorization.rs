@@ -1,6 +1,7 @@
-use mascot_rs::prelude::MGFIter;
+use mascot_rs::prelude::{Dataset, DatasetFuture, MGFIter};
 use spectral_autoencoder::{
-    ConditioningEncoder, Result, SpectrumTokenizer, SpectrumVectorizer, vectorized_mgf_paths_iter,
+    ConditioningEncoder, Result, SpectrumTokenizer, SpectrumVectorizer, VectorizedMgfIter,
+    tokenized_dataset_iter, vectorized_dataset_iter,
 };
 
 const MGF: &str = r#"BEGIN IONS
@@ -20,7 +21,7 @@ END IONS
 
 #[test]
 fn vectorizes_mgf_record_with_conditions() -> Result<()> {
-    let mut records = MGFIter::<f64>::from_document(MGF);
+    let mut records = MGFIter::<f32>::from_document(MGF);
     let record = match records.next() {
         Some(record) => record?,
         None => panic!("test MGF should contain one record"),
@@ -45,40 +46,81 @@ fn vectorizes_mgf_record_with_conditions() -> Result<()> {
 }
 
 #[test]
-fn vectorized_iterator_streams_multiple_mgf_paths() -> Result<()> {
-    let directory = std::env::temp_dir().join(format!(
-        "spectral-autoencoder-mgf-paths-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&directory).expect("temporary directory should be writable");
-    let first_path = directory.join("first.mgf");
-    let second_path = directory.join("second.mgf");
-    std::fs::write(&first_path, MGF).expect("test MGF should be writable");
-    std::fs::write(&second_path, MGF.replace("FEATURE_ID=1", "FEATURE_ID=2"))
-        .expect("test MGF should be writable");
-
-    let mut iter = vectorized_mgf_paths_iter(
-        [&first_path, &second_path],
+fn vectorized_iterator_wraps_mascot_mgf_stream() -> Result<()> {
+    let records = MGFIter::<f32>::from_document(MGF).skipping_invalid_records();
+    let mut iter = VectorizedMgfIter::from_records(
+        records,
         SpectrumVectorizer::default(),
         ConditioningEncoder::default(),
-    )?;
-    let first = iter.next().expect("first path should yield one record")?;
+    );
+    let first = iter.next().expect("stream should yield one record")?;
     assert_eq!(first.spectrum.len(), 120);
     assert_eq!(
         first.conditions.len(),
         ConditioningEncoder::default().vector_width()
     );
 
-    let second = iter.next().expect("second path should yield one record")?;
-    assert_eq!(second.spectrum.len(), 120);
-    assert_eq!(
-        second.conditions.len(),
-        ConditioningEncoder::default().vector_width()
-    );
     assert!(iter.next().is_none());
+    assert_eq!(iter.skipped_records(), 0);
+    Ok(())
+}
 
-    std::fs::remove_file(first_path).ok();
-    std::fs::remove_file(second_path).ok();
-    std::fs::remove_dir(directory).ok();
+struct InlineDataset;
+
+impl Dataset for InlineDataset {
+    type Download = ();
+    type Iter = MGFIter<f32>;
+    type Load = ();
+
+    fn download(self) -> DatasetFuture<Self::Download> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn mgf_iter(self) -> DatasetFuture<Self::Iter> {
+        Box::pin(async { Ok(MGFIter::<f32>::from_document(MGF).skipping_invalid_records()) })
+    }
+
+    fn load(self) -> DatasetFuture<Self::Load> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[test]
+fn vectorized_dataset_iterator_uses_mascot_dataset_stream() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should be created");
+    let mut iter = runtime.block_on(vectorized_dataset_iter(
+        InlineDataset,
+        SpectrumVectorizer::default(),
+        ConditioningEncoder::default(),
+    ))?;
+
+    let sample = iter
+        .next()
+        .expect("dataset stream should yield one record")?;
+    assert_eq!(sample.spectrum.len(), 120);
+    assert!(iter.next().is_none());
+    Ok(())
+}
+
+#[test]
+fn tokenized_dataset_iterator_uses_mascot_dataset_stream() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should be created");
+    let mut iter = runtime.block_on(tokenized_dataset_iter(
+        InlineDataset,
+        SpectrumTokenizer::default(),
+        ConditioningEncoder::default(),
+    ))?;
+
+    let sample = iter
+        .next()
+        .expect("dataset stream should yield one record")?;
+    assert_eq!(sample.target_pairs.len(), 120);
+    assert!(iter.next().is_none());
     Ok(())
 }

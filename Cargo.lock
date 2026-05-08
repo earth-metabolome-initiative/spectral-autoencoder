@@ -111,28 +111,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "aws-lc-rs"
-version = "1.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
-dependencies = [
- "aws-lc-sys",
- "zeroize",
-]
-
-[[package]]
-name = "aws-lc-sys"
-version = "0.40.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
-dependencies = [
- "cc",
- "cmake",
- "dunce",
- "fs_extra",
-]
-
-[[package]]
 name = "backtrace"
 version = "0.3.76"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -771,15 +749,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93e798ac3dcc76ddca3e24d91a43f27e4db744074e90b6130a1ea0c1491a2f5d"
 dependencies = [
  "url",
-]
-
-[[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
 ]
 
 [[package]]
@@ -1713,12 +1682,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dunce"
-version = "1.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
-
-[[package]]
 name = "dyn-stack"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2022,12 +1985,6 @@ checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
 ]
-
-[[package]]
-name = "fs_extra"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "funty"
@@ -2631,7 +2588,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.61.2",
 ]
 
 [[package]]
@@ -3113,7 +3070,7 @@ dependencies = [
 [[package]]
 name = "mascot-rs"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/mascot-rs#6f11bdb4f57b592e5eae29675ce21735537eb236"
+source = "git+https://github.com/LucaCappelletti94/mascot-rs#2bb7b9b37ba64cb39314d95a1fe5f3ced6df5d68"
 dependencies = [
  "flate2",
  "indicatif",
@@ -3130,7 +3087,7 @@ dependencies = [
 [[package]]
 name = "mass_spectrometry"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/mass-spectrometry-traits#937bdee730be861c4ca94285f7c478c719b4835e"
+source = "git+https://github.com/earth-metabolome-initiative/mass-spectrometry-traits#a4e181ca8925cf8c50fcd1a1a0f1698a3fb1d086"
 dependencies = [
  "arbitrary",
  "geometric-traits 0.1.0 (git+https://github.com/earth-metabolome-initiative/geometric-traits)",
@@ -3755,7 +3712,6 @@ version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
- "aws-lc-rs",
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
@@ -4072,7 +4028,6 @@ dependencies = [
  "log",
  "percent-encoding",
  "pin-project-lite",
- "quinn",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
@@ -4220,7 +4175,6 @@ version = "0.23.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
- "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
@@ -4285,7 +4239,6 @@ version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
- "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted",
@@ -4982,9 +4935,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.52.1"
+version = "1.52.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67dee974fe86fd92cc45b7a95fdd2f99a36a6d7b0d431a231178d3d670bbcc6"
+checksum = "110a78583f19d5cdb2c5ccf321d1290344e71313c6c37d43520d386027d18386"
 dependencies = [
  "bytes",
  "libc",
@@ -6367,9 +6320,9 @@ dependencies = [
 
 [[package]]
 name = "zenodo-rs"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "022d38e4270ff6d987bf3d8cc489a0ffad7602474d90998d98f07e42e4c05daa"
+checksum = "9779ed15ca4a50b27826fc0bf60051597d1bdf58985934ca69c61df7ce8d0df3"
 dependencies = [
  "bytes",
  "chrono",
@@ -6381,6 +6334,7 @@ dependencies = [
  "mime",
  "mime_guess",
  "reqwest 0.13.3",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",

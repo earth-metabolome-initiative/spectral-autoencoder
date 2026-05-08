@@ -31,8 +31,8 @@ pub use batch::{
 pub use batch::{AutoencoderBatcher, TokenizedAutoencoderBatcher};
 pub use conditioning::{ConditioningConfig, ConditioningEncoder};
 pub use data::{
-    MgfSummary, TokenizedMgfIter, VectorizedMgfIter, summarize_mgf_path, tokenized_mgf_iter,
-    tokenized_mgf_paths_iter, vectorized_mgf_iter, vectorized_mgf_paths_iter,
+    MgfRecordStream, MgfSummary, TokenizedMgfIter, VectorizedMgfIter, summarize_mgf_path,
+    tokenized_dataset_iter, tokenized_mgf_iter, vectorized_dataset_iter, vectorized_mgf_iter,
 };
 pub use error::{Error, Result};
 pub use metrics::{DenseReconstructionMetrics, SpectralMetricConfig, SpectralMetrics};

@@ -15,8 +15,10 @@ use burn::{
 };
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use mascot_rs::prelude::{
-    GEMS_A10_TOP_60_ZENODO_DOI, GEMS_A10_TOP_128_ZENODO_DOI, GemsA10Builder, MGFVec,
+    Dataset, GEMS_A10_TOP_60_ZENODO_DOI, GEMS_A10_TOP_128_ZENODO_DOI, GemsA10Builder, GemsA10Iter,
+    MGFVec, MascotError,
 };
+use mass_spectrometry::prelude::SpectrumFloat;
 #[cfg(feature = "cuda")]
 use spectral_autoencoder::linear_cosine_cuda::{
     LinearCosineKernelBackend, SimilarityRankingKernelConfig,
@@ -45,6 +47,7 @@ impl<B> SimilarityTeacherBackend for B where B: Backend {}
 pub struct RunArgs {
     pub mgf_source: String,
     pub mgf_paths: Vec<PathBuf>,
+    pub gems_builder: GemsA10Builder<f32>,
     pub max_peaks: usize,
     pub output_dir: PathBuf,
     pub device: usize,
@@ -65,7 +68,7 @@ impl RunArgs {
         default_batch_size: usize,
     ) -> Result<Self, Box<dyn StdError>> {
         let max_peaks = usize_var("GEMS_MAX_PEAKS", 128);
-        let (mgf_source, mgf_paths) = resolve_mascot_gems_a10_paths(max_peaks)?;
+        let gems = resolve_mascot_gems_a10(max_peaks)?;
         let resume_epoch = optional_usize_var("GEMS_RESUME_EPOCH");
         if resume_epoch == Some(0) {
             return Err(io::Error::new(
@@ -92,8 +95,9 @@ impl RunArgs {
         }
 
         Ok(Self {
-            mgf_source,
-            mgf_paths,
+            mgf_source: gems.source,
+            mgf_paths: gems.paths,
+            gems_builder: gems.builder,
             max_peaks,
             output_dir: path_var("GEMS_RUN_DIR", default_output_dir),
             device: usize_var("GEMS_CUDA_DEVICE", 0),
@@ -142,17 +146,21 @@ impl RunArgs {
     }
 }
 
-fn resolve_mascot_gems_a10_paths(
-    max_peaks: usize,
-) -> Result<(String, Vec<PathBuf>), Box<dyn StdError>> {
+struct ResolvedGemsA10 {
+    source: String,
+    paths: Vec<PathBuf>,
+    builder: GemsA10Builder<f32>,
+}
+
+fn resolve_mascot_gems_a10(max_peaks: usize) -> Result<ResolvedGemsA10, Box<dyn StdError>> {
     let default_directory = format!("datasets/gems-a10-top-{max_peaks}-peaks");
     let target_directory = env::var_os("GEMS_A10_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(&default_directory));
     let force_download = bool_var("GEMS_A10_FORCE_DOWNLOAD", false);
     let builder = match max_peaks {
-        60 => MGFVec::<f64>::gems_a10_top_60_peaks(),
-        128 => MGFVec::<f64>::gems_a10_top_128_peaks(),
+        60 => MGFVec::<f32>::gems_a10_top_60_peaks(),
+        128 => MGFVec::<f32>::gems_a10_top_128_peaks(),
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -163,7 +171,7 @@ fn resolve_mascot_gems_a10_paths(
     };
     let mut builder = builder
         .target_directory(&target_directory)
-        .force_download(force_download);
+        .force_download(false);
     if let Some(parts) = gems_a10_parts_from_env()? {
         builder = builder.parts(parts)?;
     }
@@ -174,21 +182,25 @@ fn resolve_mascot_gems_a10_paths(
         builder = builder.verbose();
     }
 
-    ensure_mascot_gems_a10_files(&builder, force_download)?;
+    ensure_mascot_gems_a10_files(
+        &builder.clone().force_download(force_download),
+        force_download,
+    )?;
     let paths = builder.paths();
     let doi = match max_peaks {
         60 => GEMS_A10_TOP_60_ZENODO_DOI,
         128 => GEMS_A10_TOP_128_ZENODO_DOI,
         _ => unreachable!("unsupported GeMS peak count should already be rejected"),
     };
-    Ok((
-        format!(
+    Ok(ResolvedGemsA10 {
+        source: format!(
             "mascot-rs GeMS-A10 top-{max_peaks} {doi} ({} files in {})",
             paths.len(),
             target_directory.display()
         ),
         paths,
-    ))
+        builder,
+    })
 }
 
 fn gems_a10_parts_from_env() -> Result<Option<Vec<u8>>, Box<dyn StdError>> {
@@ -230,7 +242,7 @@ fn gems_a10_parts_from_env() -> Result<Option<Vec<u8>>, Box<dyn StdError>> {
 }
 
 fn ensure_mascot_gems_a10_files(
-    builder: &GemsA10Builder<f64>,
+    builder: &GemsA10Builder<f32>,
     force_download: bool,
 ) -> Result<(), Box<dyn StdError>> {
     let paths = builder.paths();
@@ -259,6 +271,17 @@ fn ensure_mascot_gems_a10_files(
         .build()?
         .block_on(builder.clone().download())?;
     Ok(())
+}
+
+pub fn open_gems_a10_iter(
+    builder: GemsA10Builder<f32>,
+) -> spectral_autoencoder::Result<GemsA10Iter<f32>> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|source| MascotError::InputIo { source })
+        .and_then(|runtime| runtime.block_on(<GemsA10Builder<f32> as Dataset>::mgf_iter(builder)))
+        .map_err(Into::into)
 }
 
 fn gems_a10_token() -> Option<String> {
@@ -940,17 +963,25 @@ pub(crate) fn signed_random<B: Backend, const D: usize>(
     (Tensor::<B, D>::random(shape, Distribution::Uniform(0.0, 1.0), device) * 2.0 - 1.0) * range
 }
 
-pub(crate) trait MgfRecordIter<I>: Iterator<Item = spectral_autoencoder::Result<I>> {
+pub(crate) trait SampleRecordIter<I>:
+    Iterator<Item = spectral_autoencoder::Result<I>>
+{
     fn skipped_records(&self) -> usize;
 }
 
-impl MgfRecordIter<TokenizedAutoencoderSample> for TokenizedMgfIter {
+impl<P> SampleRecordIter<TokenizedAutoencoderSample> for TokenizedMgfIter<P>
+where
+    P: SpectrumFloat + 'static,
+{
     fn skipped_records(&self) -> usize {
         self.skipped_records()
     }
 }
 
-impl MgfRecordIter<AutoencoderSample> for VectorizedMgfIter {
+impl<P> SampleRecordIter<AutoencoderSample> for VectorizedMgfIter<P>
+where
+    P: SpectrumFloat + 'static,
+{
     fn skipped_records(&self) -> usize {
         self.skipped_records()
     }
@@ -962,7 +993,7 @@ pub(crate) fn skip_split_records<I, R>(
     progress: &LoaderProgress,
     preload_bar: Option<&ProgressBar>,
 ) where
-    R: MgfRecordIter<I>,
+    R: SampleRecordIter<I>,
 {
     if start_item == 0 {
         return;

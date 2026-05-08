@@ -18,13 +18,13 @@ mod app {
     };
     use spectral_autoencoder::{
         AutoencoderTrainingMetricsExt, ConditioningEncoder, SpectrumAugmentationConfig,
-        SpectrumVectorizer, SpectrumVectorizerConfig, VectorizedMgfIter, vectorized_mgf_paths_iter,
+        SpectrumVectorizer, SpectrumVectorizerConfig, VectorizedMgfIter,
     };
 
     use crate::gems_common::{
         CachedTrainingLoaderConfig, GeMSProgress, InnerBackend, RunArgs, TrainingBackend,
-        augmentation_config_from_env, auxiliary_loss_config_from_env, print_run_header,
-        save_model_record, similarity_teacher_config_from_env, warm_start_model,
+        augmentation_config_from_env, auxiliary_loss_config_from_env, open_gems_a10_iter,
+        print_run_header, save_model_record, similarity_teacher_config_from_env, warm_start_model,
     };
     use crate::gems_flat::{cached_vectorized_loader, flat_vector_config_from_env};
 
@@ -58,7 +58,7 @@ mod app {
             args.valid_gpu_cache_percent(FLAT_CACHE_DEFAULT_PERCENT),
             similarity_teacher,
         );
-        let train_records_paths = args.mgf_paths.clone();
+        let train_builder = args.gems_builder.clone();
         let train_vectorizer_config = vectorizer_config.clone();
         let train_loader = cached_vectorized_loader::<TrainingBackend, _>(
             &args,
@@ -67,9 +67,9 @@ mod app {
             args.train_start_item(),
             Some(augmentation),
             train_loader_config,
-            move || open_records(&train_records_paths, train_vectorizer_config.clone()),
+            move || open_records(train_builder.clone(), train_vectorizer_config.clone()),
         );
-        let valid_records_paths = args.mgf_paths.clone();
+        let valid_builder = args.gems_builder.clone();
         let valid_vectorizer_config = vectorizer_config.clone();
         let valid_loader = cached_vectorized_loader::<InnerBackend, _>(
             &args,
@@ -78,7 +78,7 @@ mod app {
             args.valid_start_item(),
             None,
             valid_loader_config,
-            move || open_records(&valid_records_paths, valid_vectorizer_config.clone()),
+            move || open_records(valid_builder.clone(), valid_vectorizer_config.clone()),
         );
 
         let config = config.with_auxiliary(auxiliary);
@@ -133,14 +133,15 @@ mod app {
     }
 
     fn open_records(
-        paths: &[std::path::PathBuf],
+        builder: mascot_rs::prelude::GemsA10Builder<f32>,
         vectorizer_config: SpectrumVectorizerConfig,
     ) -> spectral_autoencoder::Result<VectorizedMgfIter> {
-        vectorized_mgf_paths_iter(
-            paths,
+        let records = open_gems_a10_iter(builder)?;
+        Ok(VectorizedMgfIter::from_records(
+            records,
             SpectrumVectorizer::new(vectorizer_config),
             ConditioningEncoder::default(),
-        )
+        ))
     }
 }
 
