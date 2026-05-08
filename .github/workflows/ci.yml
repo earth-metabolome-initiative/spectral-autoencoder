@@ -14,6 +14,9 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -55,6 +58,31 @@ jobs:
 
       - name: Test MGF vectorization
         run: cargo test --test mgf_vectorization --no-default-features --features std,train
+
+      - name: Install cargo-tarpaulin
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-tarpaulin
+
+      - name: Coverage
+        run: >
+          cargo tarpaulin
+          --engine llvm
+          --out Xml
+          --output-dir target/tarpaulin
+          --no-default-features
+          --features std,train
+          --lib
+          --test mgf_vectorization
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v5
+        with:
+          files: target/tarpaulin/cobertura.xml
+          flags: rust
+          name: rust-tarpaulin
+          use_oidc: true
+          fail_ci_if_error: true
 
   python:
     name: Python scripts

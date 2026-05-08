@@ -484,3 +484,319 @@ where
             )
     }
 }
+
+#[cfg(all(test, feature = "ndarray"))]
+mod tests {
+    use super::*;
+
+    use burn::data::dataloader::Progress;
+
+    type TestBackend = burn::backend::NdArray<f32, i64>;
+    type TestDevice = burn::backend::ndarray::NdArrayDevice;
+
+    fn device() -> TestDevice {
+        TestDevice::default()
+    }
+
+    fn scalar(value: f32, device: &TestDevice) -> Tensor<TestBackend, 1> {
+        Tensor::<TestBackend, 1>::from_floats([value], device)
+    }
+
+    fn matrix(device: &TestDevice) -> Tensor<TestBackend, 2> {
+        Tensor::<TestBackend, 2>::from_floats([[1.0, 2.0], [3.0, 4.0]], device)
+    }
+
+    fn losses(device: &TestDevice) -> AutoencoderLossBreakdown<TestBackend> {
+        AutoencoderLossBreakdown {
+            reconstruction: scalar(1.0, device),
+            masked: scalar(2.0, device),
+            consistency: scalar(3.0, device),
+            intruder: scalar(4.0, device),
+            precursor: scalar(5.0, device),
+            masked_precursor: scalar(6.0, device),
+            similarity_ranking: scalar(7.0, device),
+            regularization: scalar(8.0, device),
+        }
+    }
+
+    fn diagnostics(device: &TestDevice) -> AutoencoderDiagnostics<TestBackend> {
+        AutoencoderDiagnostics {
+            similarity_ranking_pairs: scalar(9.0, device),
+            similarity_ranking_accuracy: scalar(0.75, device),
+            precursor_mae_da: scalar(12.5, device),
+        }
+    }
+
+    fn metadata() -> MetricMetadata {
+        MetricMetadata {
+            progress: Progress {
+                items_processed: 1,
+                items_total: 1,
+            },
+            epoch: 0,
+            epoch_total: 1,
+            iteration: 0,
+            lr: None,
+        }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 1.0e-5,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_tensor_close(tensor: Tensor<TestBackend, 1>, expected: f32) {
+        assert_close(tensor.into_scalar(), expected);
+    }
+
+    fn assert_single_matrix_zero(tensor: Tensor<TestBackend, 2>) {
+        let values = tensor
+            .into_data()
+            .to_vec::<f32>()
+            .expect("synced placeholder tensor values");
+        assert_eq!(values, vec![0.0]);
+    }
+
+    fn assert_metric_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1.0e-8,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn output(device: &TestDevice) -> AutoencoderTrainingOutput<TestBackend> {
+        AutoencoderTrainingOutput::new_with_diagnostics(
+            matrix(device),
+            matrix(device),
+            losses(device),
+            diagnostics(device),
+        )
+    }
+
+    #[test]
+    fn loss_breakdown_total_sums_all_components() {
+        let device = device();
+        let total = losses(&device).total();
+
+        assert_tensor_close(total, 36.0);
+    }
+
+    #[test]
+    fn zeros_are_zero() {
+        let device = device();
+        let losses = AutoencoderLossBreakdown::<TestBackend>::zeros(&device);
+        let diagnostics = AutoencoderDiagnostics::<TestBackend>::zeros(&device);
+
+        assert_tensor_close(losses.total(), 0.0);
+        assert_tensor_close(diagnostics.similarity_ranking_pairs, 0.0);
+        assert_tensor_close(diagnostics.similarity_ranking_accuracy, 0.0);
+        assert_tensor_close(diagnostics.precursor_mae_da, 0.0);
+    }
+
+    #[test]
+    fn training_output_new_computes_total_loss() {
+        let device = device();
+        let output =
+            AutoencoderTrainingOutput::new(matrix(&device), matrix(&device), losses(&device));
+
+        assert_tensor_close(output.loss, 36.0);
+        assert_eq!(output.output.dims(), [2, 2]);
+        assert_eq!(output.targets.dims(), [2, 2]);
+        assert_tensor_close(output.diagnostics.similarity_ranking_pairs, 0.0);
+        assert_tensor_close(output.diagnostics.similarity_ranking_accuracy, 0.0);
+        assert_tensor_close(output.diagnostics.precursor_mae_da, 0.0);
+    }
+
+    #[test]
+    fn training_output_adapt_exposes_all_components() {
+        let device = device();
+        let adapted: AutoencoderLossComponentsInput<TestBackend> = output(&device).adapt();
+
+        assert_tensor_close(adapted.loss, 36.0);
+        assert_tensor_close(adapted.reconstruction, 1.0);
+        assert_tensor_close(adapted.masked, 2.0);
+        assert_tensor_close(adapted.consistency, 3.0);
+        assert_tensor_close(adapted.intruder, 4.0);
+        assert_tensor_close(adapted.precursor, 5.0);
+        assert_tensor_close(adapted.masked_precursor, 6.0);
+        assert_tensor_close(adapted.similarity_ranking, 7.0);
+        assert_tensor_close(adapted.similarity_ranking_pairs, 9.0);
+        assert_tensor_close(adapted.similarity_ranking_accuracy, 0.75);
+        assert_tensor_close(adapted.precursor_mae_da, 12.5);
+    }
+
+    #[test]
+    fn training_output_sync_preserves_metric_tensors() {
+        let device = device();
+        let synced = output(&device).sync();
+
+        assert_tensor_close(synced.loss, 36.0);
+        assert_eq!(synced.output.dims(), [1, 1]);
+        assert_eq!(synced.targets.dims(), [1, 1]);
+        assert_single_matrix_zero(synced.output);
+        assert_single_matrix_zero(synced.targets);
+        assert_tensor_close(synced.losses.reconstruction, 1.0);
+        assert_tensor_close(synced.losses.masked, 2.0);
+        assert_tensor_close(synced.losses.consistency, 3.0);
+        assert_tensor_close(synced.losses.intruder, 4.0);
+        assert_tensor_close(synced.losses.precursor, 5.0);
+        assert_tensor_close(synced.losses.masked_precursor, 6.0);
+        assert_tensor_close(synced.losses.similarity_ranking, 7.0);
+        assert_tensor_close(synced.losses.regularization, 8.0);
+        assert_tensor_close(synced.diagnostics.similarity_ranking_pairs, 9.0);
+        assert_tensor_close(synced.diagnostics.similarity_ranking_accuracy, 0.75);
+        assert_tensor_close(synced.diagnostics.precursor_mae_da, 12.5);
+    }
+
+    #[test]
+    fn component_metrics_report_expected_names_descriptions_and_attributes() {
+        let cases = [
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::loss(),
+                "Loss",
+                false,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::reconstruction(),
+                "Reconstruction Loss",
+                false,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::masked(),
+                "Masked Loss",
+                false,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::consistency(),
+                "Consistency Loss",
+                false,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::intruder(),
+                "Intruder Loss",
+                false,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::precursor(),
+                "Precursor Loss",
+                false,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::masked_precursor(),
+                "Masked Precursor Loss",
+                false,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::precursor_mae_da(),
+                "Precursor MAE Da",
+                false,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::similarity_ranking(),
+                "Similarity Ranking Loss",
+                false,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::similarity_ranking_accuracy(),
+                "Similarity Ranking Accuracy",
+                true,
+            ),
+        ];
+
+        for (metric, expected_name, higher_is_better) in cases {
+            assert_eq!(metric.name().as_str(), expected_name);
+            assert!(
+                metric
+                    .description()
+                    .expect("metric description")
+                    .contains("Autoencoder")
+            );
+
+            let MetricAttributes::Numeric(attributes) = metric.attributes() else {
+                panic!("autoencoder component metrics should be numeric");
+            };
+            assert_eq!(attributes.higher_is_better, higher_is_better);
+            assert_eq!(attributes.unit, None);
+        }
+    }
+
+    #[test]
+    fn component_metrics_update_from_expected_tensor() {
+        let device = device();
+        let item: AutoencoderLossComponentsInput<TestBackend> = output(&device).adapt();
+        let metadata = metadata();
+        let cases = [
+            (AutoencoderLossComponentMetric::<TestBackend>::loss(), 36.0),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::masked_precursor(),
+                6.0,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::precursor_mae_da(),
+                12.5,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::similarity_ranking(),
+                7.0,
+            ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::similarity_ranking_accuracy(),
+                0.75,
+            ),
+        ];
+
+        for (mut metric, expected) in cases {
+            let entry = metric.update(&item, &metadata);
+
+            assert_metric_close(metric.value().current(), expected);
+            assert_metric_close(metric.running_value().current(), expected);
+            assert_eq!(entry.serialized, metric.value().serialize());
+        }
+    }
+
+    #[test]
+    fn similarity_ranking_accuracy_uses_pair_count_for_aggregation() {
+        let device = device();
+        let item: AutoencoderLossComponentsInput<TestBackend> = output(&device).adapt();
+        let metadata = metadata();
+        let mut metric =
+            AutoencoderLossComponentMetric::<TestBackend>::similarity_ranking_accuracy();
+
+        metric.update(&item, &metadata);
+
+        match metric.value() {
+            NumericEntry::Aggregated {
+                aggregated_value,
+                count,
+            } => {
+                assert_metric_close(aggregated_value, 0.75);
+                assert_eq!(count, 9);
+            }
+            NumericEntry::Value(_) => panic!("similarity ranking accuracy should be aggregated"),
+        }
+    }
+
+    #[test]
+    fn component_metric_clear_resets_state() {
+        let device = device();
+        let item: AutoencoderLossComponentsInput<TestBackend> = output(&device).adapt();
+        let metadata = metadata();
+        let mut metric = AutoencoderLossComponentMetric::<TestBackend>::loss();
+
+        metric.update(&item, &metadata);
+        metric.clear();
+
+        match metric.value() {
+            NumericEntry::Aggregated {
+                aggregated_value,
+                count,
+            } => {
+                assert!(aggregated_value.is_nan());
+                assert_eq!(count, 0);
+            }
+            NumericEntry::Value(_) => panic!("cleared metric should be aggregated"),
+        }
+    }
+}
