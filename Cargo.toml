@@ -29,11 +29,11 @@ cuda-fusion = ["cuda", "burn/fusion", "burn/autotune", "dep:burn-fusion", "dep:b
 cuda-no-fusion = ["cuda", "burn/autotune"]
 
 [dependencies]
-burn = { version = "=0.20.1", default-features = false }
-burn-cubecl = { version = "=0.20.1", default-features = false, optional = true }
-burn-fusion = { version = "=0.20.1", default-features = false, optional = true }
-burn-ir = { version = "=0.20.1", default-features = false, optional = true }
-cubecl = { version = "=0.9.0", default-features = false, optional = true }
+burn = { version = "=0.21.0", default-features = false }
+burn-cubecl = { version = "=0.21.0", default-features = false, optional = true }
+burn-fusion = { version = "=0.21.0", default-features = false, optional = true }
+burn-ir = { version = "=0.21.0", default-features = false, optional = true }
+cubecl = { version = "=0.10.0", default-features = false, optional = true }
 mascot_rs = { package = "mascot-rs", git = "https://github.com/LucaCappelletti94/mascot-rs", default-features = false, features = ["std"] }
 mass_spectrometry = { git = "https://github.com/earth-metabolome-initiative/mass-spectrometry-traits", default-features = false, features = ["std"] }
 serde = { version = "1", default-features = false, features = ["derive"] }

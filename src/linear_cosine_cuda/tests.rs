@@ -390,8 +390,8 @@ where
     left_mz.assert_is_on_same_device(&right_intensity);
     left_mz.assert_is_on_same_device(&right_precursor);
 
-    let [batch_size, left_peaks] = left_mz.shape.dims();
-    let [right_rows, right_peaks] = right_mz.shape.dims();
+    let [batch_size, left_peaks] = left_mz.meta.shape().dims();
+    let [right_rows, right_peaks] = right_mz.meta.shape().dims();
     assert_eq!(
         batch_size, right_rows,
         "paired modified linear cosine requires the same number of left and right rows"
@@ -409,24 +409,24 @@ where
     let cube_dim = CubeDim::new(&left_mz.client, batch_size);
     let cube_count = calculate_cube_count_elemwise(&left_mz.client, batch_size, cube_dim);
 
+    let client = left_mz.client.clone();
     modified_linear_cosine_paired_test_forward::launch::<F, R>(
-        &left_mz.client,
+        &client,
         cube_count,
         cube_dim,
-        left_mz.as_tensor_arg(1),
-        left_intensity.as_tensor_arg(1),
-        left_precursor.as_tensor_arg(1),
-        right_mz.as_tensor_arg(1),
-        right_intensity.as_tensor_arg(1),
-        right_precursor.as_tensor_arg(1),
-        output.as_tensor_arg(1),
-        ScalarArg::new(config.mz_power),
-        ScalarArg::new(config.intensity_power),
-        ScalarArg::new(config.mz_tolerance),
-        ScalarArg::new(config.epsilon),
+        left_mz.into_tensor_arg(),
+        left_intensity.into_tensor_arg(),
+        left_precursor.into_tensor_arg(),
+        right_mz.into_tensor_arg(),
+        right_intensity.into_tensor_arg(),
+        right_precursor.into_tensor_arg(),
+        output.clone().into_tensor_arg(),
+        config.mz_power,
+        config.intensity_power,
+        config.mz_tolerance,
+        config.epsilon,
         config.max_peaks,
-    )
-    .expect("paired modified linear cosine forward kernel launch failed");
+    );
 
     BurnTensor::from_primitive(TensorPrimitive::Float(output))
 }

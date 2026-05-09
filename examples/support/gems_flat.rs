@@ -5,9 +5,13 @@ use std::{
     fs,
     hash::{Hash, Hasher},
     io,
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, SyncSender},
+    },
+    thread::{self, JoinHandle},
     time::UNIX_EPOCH,
 };
 
@@ -22,12 +26,12 @@ use spectral_autoencoder::{
 };
 
 use crate::gems_common::{
-    CachedLoaderOptions, CachedTrainingLoaderConfig, LoaderProgress, PairSamplingEpoch, RunArgs,
-    SimilarityTeacherBackend, SimilarityTeacherConfig, TeacherGpuCache, TeacherSpectraBuilder,
-    TeacherSpectraCache, bool_var, cache_items, finish_loader_once, is_full_gpu_cache,
-    loader_epoch_items, mask_precursor_conditions, open_records_or_panic, probability_mask,
-    signed_random, similarity_pair_seed, skip_split_records, teacher_similarity_ranking_batch,
-    tokenization_style, usize_var,
+    LoaderProgress, PairSamplingEpoch, RunArgs, SimilarityTeacherBackend, SimilarityTeacherConfig,
+    StreamingLoaderOptions, StreamingTrainingLoaderConfig, TeacherGpuCache, TeacherSpectraBuilder,
+    TeacherSpectraCache, bool_var, finish_loader_once, loader_epoch_items,
+    mask_precursor_conditions, open_records_or_panic, probability_mask, signed_random,
+    similarity_pair_seed, skip_split_records, teacher_similarity_ranking_batch, tokenization_style,
+    usize_var,
 };
 
 pub fn flat_vector_config_from_env(
@@ -69,13 +73,13 @@ fn flat_reconstruction_ordering_from_env(
     }
 }
 
-pub fn cached_vectorized_loader<B, Open>(
+pub fn streaming_vectorized_loader<B, Open>(
     args: &RunArgs,
     device: B::Device,
     progress: LoaderProgress,
     start_item: usize,
     augment: Option<SpectrumAugmentationConfig>,
-    loader_config: CachedTrainingLoaderConfig,
+    loader_config: StreamingTrainingLoaderConfig,
     open_records: Open,
 ) -> Arc<dyn DataLoader<B, AutoencoderBatch<B>>>
 where
@@ -84,17 +88,13 @@ where
 {
     let preprocessed_cache_path =
         flat_preprocessed_cache_path(args, start_item, progress.max_batches);
-    let loader = Arc::new(CachedVectorizedMgfLoader::new(
-        CachedLoaderOptions {
+    let loader = Arc::new(StreamingVectorizedMgfLoader::new(
+        StreamingLoaderOptions {
             mgf_source: args.mgf_source.clone(),
             batch_size: args.batch_size,
             max_batches: progress.max_batches,
             start_item,
-            cache_items: cache_items(
-                args.batch_size,
-                progress.max_batches,
-                loader_config.cache_percent,
-            ),
+            window_items: loader_config.window_items(args.batch_size, progress.max_batches),
             device,
             progress,
             augment,
@@ -102,9 +102,10 @@ where
             randomize_pair_sampling: augment.is_some(),
         },
         preprocessed_cache_path,
+        loader_config.prefetch_windows,
         open_records,
     ));
-    loader.preload_cache();
+    loader.ensure_preprocessed_cache_file();
     loader
 }
 
@@ -352,7 +353,7 @@ fn augment_flat_batch<B: Backend>(
     )
 }
 
-struct CachedVectorizedMgfLoader<B, Open>
+struct StreamingVectorizedMgfLoader<B, Open>
 where
     B: Backend,
 {
@@ -361,19 +362,18 @@ where
     batch_size: usize,
     max_batches: usize,
     start_item: usize,
-    cache_items: usize,
+    window_items: usize,
+    prefetch_windows: usize,
     preprocessed_cache_path: Option<PathBuf>,
     device: B::Device,
     augment: Option<SpectrumAugmentationConfig>,
     similarity_teacher: SimilarityTeacherConfig,
     open_records: Open,
-    cpu_cache: Arc<Mutex<Option<Arc<FlatCpuCache>>>>,
-    initial_cache: Arc<Mutex<Option<FlatGpuCache<B>>>>,
-    full_cache: Arc<Mutex<Option<FlatGpuCache<B>>>>,
+    disk_cache: Arc<Mutex<Option<FlatCacheFileMeta>>>,
     pair_sampling_epoch: PairSamplingEpoch,
 }
 
-impl<B, Open> Clone for CachedVectorizedMgfLoader<B, Open>
+impl<B, Open> Clone for StreamingVectorizedMgfLoader<B, Open>
 where
     B: Backend,
     B::Device: Clone,
@@ -386,27 +386,27 @@ where
             batch_size: self.batch_size,
             max_batches: self.max_batches,
             start_item: self.start_item,
-            cache_items: self.cache_items,
+            window_items: self.window_items,
+            prefetch_windows: self.prefetch_windows,
             preprocessed_cache_path: self.preprocessed_cache_path.clone(),
             device: self.device.clone(),
             augment: self.augment,
             similarity_teacher: self.similarity_teacher,
             open_records: self.open_records.clone(),
-            cpu_cache: self.cpu_cache.clone(),
-            initial_cache: self.initial_cache.clone(),
-            full_cache: self.full_cache.clone(),
+            disk_cache: self.disk_cache.clone(),
             pair_sampling_epoch: self.pair_sampling_epoch.clone(),
         }
     }
 }
 
-impl<B, Open> CachedVectorizedMgfLoader<B, Open>
+impl<B, Open> StreamingVectorizedMgfLoader<B, Open>
 where
     B: Backend,
 {
     fn new(
-        options: CachedLoaderOptions<B>,
+        options: StreamingLoaderOptions<B>,
         preprocessed_cache_path: Option<PathBuf>,
+        prefetch_windows: usize,
         open_records: Open,
     ) -> Self {
         Self {
@@ -415,179 +415,250 @@ where
             batch_size: options.batch_size,
             max_batches: options.max_batches,
             start_item: options.start_item,
-            cache_items: options.cache_items,
+            window_items: options.window_items,
+            prefetch_windows,
             preprocessed_cache_path,
             device: options.device,
             augment: options.augment,
             similarity_teacher: options.similarity_teacher,
             open_records,
-            cpu_cache: Arc::new(Mutex::new(None)),
-            initial_cache: Arc::new(Mutex::new(None)),
-            full_cache: Arc::new(Mutex::new(None)),
+            disk_cache: Arc::new(Mutex::new(None)),
             pair_sampling_epoch: PairSamplingEpoch::new(options.randomize_pair_sampling),
-        }
-    }
-
-    fn is_full_cache(&self) -> bool {
-        is_full_gpu_cache(self.cache_items, self.batch_size, self.max_batches)
-    }
-
-    fn gpu_transfer_stages(&self) -> usize {
-        if self.similarity_teacher.enabled() {
-            3
-        } else {
-            2
         }
     }
 }
 
-impl<B, Open> CachedVectorizedMgfLoader<B, Open>
+impl<B, Open> StreamingVectorizedMgfLoader<B, Open>
 where
     B: Backend,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
-    fn preload_cache(&self) {
-        let Some(cpu_cache) = self.preload_cpu_cache() else {
+    fn ensure_preprocessed_cache_file(&self) {
+        let Some(path) = &self.preprocessed_cache_path else {
             return;
         };
+        let total_items = loader_epoch_items(self.batch_size, self.max_batches);
+        let refresh = bool_var("GEMS_FLAT_PREPROCESSED_CACHE_REFRESH", false);
 
-        if self.is_full_cache() {
-            if self
-                .full_cache
-                .lock()
-                .expect("full vectorized cache lock should not be poisoned")
-                .is_some()
-            {
-                return;
+        if !refresh && path.try_exists().unwrap_or(false) {
+            if let Err(error) = self.flat_cache_file_meta(path, total_items) {
+                panic!(
+                    "invalid preprocessed flat cache {}: {error}; set GEMS_FLAT_PREPROCESSED_CACHE_REFRESH=1 to rebuild it",
+                    path.display()
+                );
             }
-            let transfer_bar = preload_transfer_bar(
-                format!("{} gpu", self.progress.label),
-                cpu_cache.items,
-                "moving full CPU cache to GPU",
-                self.gpu_transfer_stages(),
-            );
-            let cache = self.move_flat_cache_window_to_gpu(
-                &cpu_cache,
-                0,
-                cpu_cache.items,
-                Some(&transfer_bar),
-            );
-            transfer_bar.finish_with_message(format!("cached {} spectra on GPU", cache.items));
-            *self
-                .full_cache
-                .lock()
-                .expect("full vectorized cache lock should not be poisoned") = Some(cache);
-        } else {
-            if self
-                .initial_cache
-                .lock()
-                .expect("initial vectorized cache lock should not be poisoned")
-                .is_some()
-            {
-                return;
-            }
-            let target_items = self.cache_items.min(cpu_cache.items);
-            let transfer_bar = preload_transfer_bar(
-                format!("{} gpu", self.progress.label),
-                target_items,
-                "moving initial CPU cache window to GPU",
-                self.gpu_transfer_stages(),
-            );
-            let cache = self.move_flat_cache_window_to_gpu(
-                &cpu_cache,
-                0,
-                target_items,
-                Some(&transfer_bar),
-            );
-            transfer_bar.finish_with_message(format!(
-                "cached initial {} / {} spectra on GPU",
-                cache.items, cpu_cache.items
-            ));
-            *self
-                .initial_cache
-                .lock()
-                .expect("initial vectorized cache lock should not be poisoned") = Some(cache);
+            return;
         }
+
+        if let Err(error) = self.write_flat_cpu_cache_file_streaming(path, total_items) {
+            panic!(
+                "failed to prepare preprocessed flat cache {}: {error}",
+                path.display()
+            );
+        }
+        let metadata = self
+            .flat_cache_file_meta(path, total_items)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to reopen preprocessed flat cache {}: {error}",
+                    path.display()
+                )
+            });
+        *self
+            .disk_cache
+            .lock()
+            .expect("flat disk cache metadata lock should not be poisoned") = Some(metadata);
     }
 
-    fn preload_cpu_cache(&self) -> Option<Arc<FlatCpuCache>> {
-        if let Some(cache) = self
-            .cpu_cache
-            .lock()
-            .expect("CPU vectorized cache lock should not be poisoned")
-            .clone()
-        {
-            return Some(cache);
-        }
-
+    fn load_flat_cpu_window(
+        &self,
+        start_item: usize,
+        target_items: usize,
+        transfer_bar: Option<&ProgressBar>,
+    ) -> Option<FlatCpuCache> {
         let total_items = loader_epoch_items(self.batch_size, self.max_batches);
         if let Some(path) = &self.preprocessed_cache_path
             && !bool_var("GEMS_FLAT_PREPROCESSED_CACHE_REFRESH", false)
             && path.try_exists().unwrap_or(false)
         {
-            match read_flat_cpu_cache_file(
-                path,
-                total_items,
-                format!("{} disk", self.progress.label),
-            ) {
-                Ok(mut cpu_cache) => {
-                    self.attach_flat_teacher_cache(&mut cpu_cache);
-                    let cpu_cache = Arc::new(cpu_cache);
-                    *self
-                        .cpu_cache
-                        .lock()
-                        .expect("CPU vectorized cache lock should not be poisoned") =
-                        Some(cpu_cache.clone());
-                    return Some(cpu_cache);
-                }
-                Err(error) => {
-                    eprintln!(
-                        "ignoring preprocessed flat cache {}: {error}",
+            let metadata = self
+                .flat_cache_file_meta(path, total_items)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "invalid preprocessed flat cache {}: {error}",
                         path.display()
-                    );
-                }
-            }
+                    )
+                });
+            return Some(
+                read_flat_cpu_cache_window_file(
+                    &metadata,
+                    start_item,
+                    target_items,
+                    format!("{} disk", self.progress.label),
+                    transfer_bar,
+                    true,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "failed to read preprocessed flat cache window {}: {error}",
+                        path.display()
+                    )
+                }),
+            );
         }
+        None
+    }
 
+    fn flat_cache_file_meta(
+        &self,
+        path: &Path,
+        expected_items: usize,
+    ) -> io::Result<FlatCacheFileMeta> {
+        if let Some(metadata) = self
+            .disk_cache
+            .lock()
+            .expect("flat disk cache metadata lock should not be poisoned")
+            .clone()
+        {
+            return Ok(metadata);
+        }
+        let metadata = read_flat_cache_file_meta(path, expected_items)?;
+        *self
+            .disk_cache
+            .lock()
+            .expect("flat disk cache metadata lock should not be poisoned") =
+            Some(metadata.clone());
+        Ok(metadata)
+    }
+
+    fn disk_prefetcher(&self, start_item: usize) -> Option<FlatCpuWindowPrefetcher> {
+        let path = self.preprocessed_cache_path.as_ref()?;
+        if bool_var("GEMS_FLAT_PREPROCESSED_CACHE_REFRESH", false)
+            || !path.try_exists().unwrap_or(false)
+        {
+            return None;
+        }
+        let total_items = loader_epoch_items(self.batch_size, self.max_batches);
+        if start_item >= total_items {
+            return None;
+        }
+        let metadata = self
+            .flat_cache_file_meta(path, total_items)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "invalid preprocessed flat cache {}: {error}",
+                    path.display()
+                )
+            });
+        Some(FlatCpuWindowPrefetcher::new(
+            metadata,
+            start_item,
+            total_items,
+            self.window_items,
+            self.prefetch_windows,
+            format!("{} disk", self.progress.label),
+        ))
+    }
+
+    fn write_flat_cpu_cache_file_streaming(
+        &self,
+        path: &Path,
+        total_items: usize,
+    ) -> io::Result<()> {
         let mut records = open_records_or_panic(&self.open_records, "vectorized", &self.mgf_source);
         self.skip_preload_offset(&mut records);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("flat-cache.saefc");
+        let tmp_path = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
+        let tmp_conditions_path =
+            path.with_file_name(format!("{file_name}.conditions.tmp-{}", std::process::id()));
 
         let bar = preload_bar(
             format!("{} cpu", self.progress.label),
             total_items,
-            "decompressing MGF and vectorizing spectra into CPU memory",
+            "decompressing MGF and vectorizing spectra to disk cache",
         );
-        let cpu_cache = self.read_flat_cpu_cache(&mut records, total_items, 0, Some(&bar));
-        match cpu_cache {
-            Some(mut cpu_cache) => {
-                bar.finish_with_message(format!(
-                    "preprocessed {} spectra into CPU memory",
-                    cpu_cache.items
-                ));
-                self.attach_flat_teacher_cache(&mut cpu_cache);
-                if let Some(path) = &self.preprocessed_cache_path
-                    && let Err(error) = write_flat_cpu_cache_file(
-                        path,
-                        &cpu_cache,
-                        format!("{} disk", self.progress.label),
+
+        let result = (|| -> io::Result<()> {
+            let mut writer =
+                BufWriter::with_capacity(8 * 1024 * 1024, fs::File::create(&tmp_path)?);
+            let mut conditions_writer =
+                BufWriter::with_capacity(8 * 1024 * 1024, fs::File::create(&tmp_conditions_path)?);
+            let mut written_items = 0usize;
+            let mut spectrum_width = 0usize;
+            let mut condition_width = 0usize;
+
+            while written_items < total_items {
+                let target_items = self.window_items.min(total_items - written_items);
+                let cache = self
+                    .read_flat_cpu_cache(
+                        &mut records,
+                        target_items,
+                        written_items / self.batch_size,
+                        Some(&bar),
                     )
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            format!(
+                                "MGF ended after {written_items} spectra, expected {total_items}"
+                            ),
+                        )
+                    })?;
+
+                if written_items == 0 {
+                    spectrum_width = cache.spectrum_width;
+                    condition_width = cache.condition_width;
+                    writer.write_all(FLAT_CACHE_MAGIC)?;
+                    write_u32(&mut writer, FLAT_CACHE_VERSION)?;
+                    write_u64(&mut writer, total_items as u64)?;
+                    write_u64(&mut writer, spectrum_width as u64)?;
+                    write_u64(&mut writer, condition_width as u64)?;
+                } else if cache.spectrum_width != spectrum_width
+                    || cache.condition_width != condition_width
                 {
-                    eprintln!(
-                        "could not write preprocessed flat cache {}: {error}",
-                        path.display()
-                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "vectorized flat cache width changed within the MGF stream",
+                    ));
                 }
-                let cpu_cache = Arc::new(cpu_cache);
-                *self
-                    .cpu_cache
-                    .lock()
-                    .expect("CPU vectorized cache lock should not be poisoned") =
-                    Some(cpu_cache.clone());
-                Some(cpu_cache)
+
+                bar.set_message("writing spectra vector cache");
+                write_f32_slice_untracked(&mut writer, &cache.spectra)?;
+                bar.set_message("writing conditions vector cache");
+                write_f32_slice_untracked(&mut conditions_writer, &cache.conditions)?;
+                written_items += cache.items;
             }
-            None => {
-                bar.finish_with_message("no spectra cached");
-                None
+
+            conditions_writer.flush()?;
+            drop(conditions_writer);
+            let mut conditions_reader =
+                BufReader::with_capacity(8 * 1024 * 1024, fs::File::open(&tmp_conditions_path)?);
+            io::copy(&mut conditions_reader, &mut writer)?;
+            writer.flush()
+        })();
+
+        match result {
+            Ok(()) => {
+                fs::rename(&tmp_path, path)?;
+                let _ = fs::remove_file(&tmp_conditions_path);
+                bar.finish_with_message(format!(
+                    "wrote preprocessed vectors to {}",
+                    path.display()
+                ));
+                Ok(())
+            }
+            Err(error) => {
+                bar.finish_with_message(format!("failed writing preprocessed vectors: {error}"));
+                let _ = fs::remove_file(&tmp_path);
+                let _ = fs::remove_file(&tmp_conditions_path);
+                Err(error)
             }
         }
     }
@@ -604,28 +675,6 @@ where
         );
         skip_split_records(records, self.start_item, &self.progress, Some(&bar));
         bar.finish_with_message(format!("split offset reached at {}", self.start_item));
-    }
-
-    fn attach_flat_teacher_cache(&self, cpu_cache: &mut FlatCpuCache) {
-        if !self.similarity_teacher.enabled() || cpu_cache.teacher.is_some() {
-            return;
-        }
-        let bar = preload_bar(
-            format!("{} teacher", self.progress.label),
-            cpu_cache.items,
-            "preprocessing teacher spectra",
-        );
-        let teacher = teacher_spectra_cache_from_target_pairs(
-            self.similarity_teacher,
-            &cpu_cache.spectra,
-            &cpu_cache.conditions,
-            cpu_cache.items,
-            cpu_cache.spectrum_width,
-            cpu_cache.condition_width,
-            Some(&bar),
-        );
-        bar.finish_with_message(format!("preprocessed {} teacher spectra", cpu_cache.items));
-        cpu_cache.teacher = Some(Arc::new(teacher));
     }
 
     fn read_flat_cpu_cache(
@@ -645,10 +694,6 @@ where
         let mut condition_width = 0usize;
         let mut items = 0usize;
         let mut reported_items = 0usize;
-        let mut teacher_builder = self
-            .similarity_teacher
-            .enabled()
-            .then(|| TeacherSpectraBuilder::new(self.similarity_teacher, target_items));
 
         while items < target_items {
             let sample = match records.next() {
@@ -664,9 +709,6 @@ where
                 condition_width = sample.conditions.len();
                 spectra.reserve(target_items * spectrum_width);
                 conditions.reserve(target_items * condition_width);
-            }
-            if let Some(builder) = &mut teacher_builder {
-                builder.push_pairs(&sample.spectrum, &sample.conditions);
             }
             spectra.extend(sample.spectrum);
             conditions.extend(sample.conditions);
@@ -705,7 +747,6 @@ where
             items,
             spectrum_width,
             condition_width,
-            teacher: teacher_builder.map(|builder| Arc::new(builder.finish())),
         })
     }
 
@@ -716,75 +757,106 @@ where
         target_items: usize,
         transfer_bar: Option<&ProgressBar>,
     ) -> FlatGpuCache<B> {
-        let items = target_items.min(cpu_cache.items.saturating_sub(start_item));
-        let chunk_items = gpu_transfer_chunk_items(self.batch_size, items);
-        let chunk_count = items.div_ceil(chunk_items);
-        let mut chunks = Vec::with_capacity(chunk_count);
-        let end_item = start_item + items;
-
-        for (chunk_index, start) in (start_item..end_item).step_by(chunk_items).enumerate() {
-            let end = (start + chunk_items).min(end_item);
-            let chunk_len = end - start;
-            let chunk_label = format!("{}/{}", chunk_index + 1, chunk_count);
-
-            if let Some(bar) = transfer_bar {
-                bar.set_message(format!("moving spectra chunk {chunk_label} to GPU"));
-            }
-            let spectra_start = start * cpu_cache.spectrum_width;
-            let spectra_end = end * cpu_cache.spectrum_width;
-            let spectra = Tensor::<B, 2>::from_data(
-                TensorData::new(
-                    cpu_cache.spectra[spectra_start..spectra_end].to_vec(),
-                    [chunk_len, cpu_cache.spectrum_width],
-                ),
-                &self.device,
-            );
-            if let Some(bar) = transfer_bar {
-                bar.inc(chunk_len as u64);
-                bar.set_message(format!("moving condition chunk {chunk_label} to GPU"));
-            }
-            let conditions_start = start * cpu_cache.condition_width;
-            let conditions_end = end * cpu_cache.condition_width;
-            let conditions = Tensor::<B, 2>::from_data(
-                TensorData::new(
-                    cpu_cache.conditions[conditions_start..conditions_end].to_vec(),
-                    [chunk_len, cpu_cache.condition_width],
-                ),
-                &self.device,
-            );
-            if let Some(bar) = transfer_bar {
-                bar.inc(chunk_len as u64);
-            }
-            let teacher_gpu = self
-                .similarity_teacher
-                .enabled()
-                .then(|| {
-                    cpu_cache.teacher.as_ref().and_then(|teacher| {
-                        if let Some(bar) = transfer_bar {
-                            bar.set_message(format!("moving teacher chunk {chunk_label} to GPU"));
-                        }
-                        let cache =
-                            TeacherGpuCache::from_cpu_window(teacher, start, end, &self.device);
-                        if cache.is_some()
-                            && let Some(bar) = transfer_bar
-                        {
-                            bar.inc(chunk_len as u64);
-                        }
-                        cache
-                    })
-                })
-                .flatten();
-
-            chunks.push(FlatGpuCacheChunk {
-                spectra,
-                conditions,
-                teacher_gpu,
-                items: chunk_len,
-            });
-        }
-
-        FlatGpuCache { chunks, items }
+        move_flat_cache_window_to_gpu(
+            cpu_cache,
+            start_item,
+            target_items,
+            self.batch_size,
+            &self.device,
+            self.similarity_teacher,
+            transfer_bar,
+        )
     }
+}
+
+fn move_flat_cache_window_to_gpu<B: Backend>(
+    cpu_cache: &FlatCpuCache,
+    start_item: usize,
+    target_items: usize,
+    batch_size: usize,
+    device: &B::Device,
+    similarity_teacher: SimilarityTeacherConfig,
+    transfer_bar: Option<&ProgressBar>,
+) -> FlatGpuCache<B> {
+    let items = target_items.min(cpu_cache.items.saturating_sub(start_item));
+    if items == 0 {
+        return FlatGpuCache {
+            chunks: Vec::new(),
+            items,
+        };
+    }
+    let chunk_items = gpu_transfer_chunk_items(batch_size, items);
+    let chunk_count = items.div_ceil(chunk_items);
+    let mut chunks = Vec::with_capacity(chunk_count);
+    let end_item = start_item + items;
+
+    for (chunk_index, start) in (start_item..end_item).step_by(chunk_items).enumerate() {
+        let end = (start + chunk_items).min(end_item);
+        let chunk_len = end - start;
+        let chunk_label = format!("{}/{}", chunk_index + 1, chunk_count);
+
+        if let Some(bar) = transfer_bar {
+            bar.set_message(format!("moving spectra chunk {chunk_label} to GPU"));
+        }
+        let spectra_start = start * cpu_cache.spectrum_width;
+        let spectra_end = end * cpu_cache.spectrum_width;
+        let spectra = Tensor::<B, 2>::from_data(
+            TensorData::new(
+                cpu_cache.spectra[spectra_start..spectra_end].to_vec(),
+                [chunk_len, cpu_cache.spectrum_width],
+            ),
+            device,
+        );
+        if let Some(bar) = transfer_bar {
+            bar.inc(chunk_len as u64);
+            bar.set_message(format!("moving condition chunk {chunk_label} to GPU"));
+        }
+        let conditions_start = start * cpu_cache.condition_width;
+        let conditions_end = end * cpu_cache.condition_width;
+        let conditions = Tensor::<B, 2>::from_data(
+            TensorData::new(
+                cpu_cache.conditions[conditions_start..conditions_end].to_vec(),
+                [chunk_len, cpu_cache.condition_width],
+            ),
+            device,
+        );
+        if let Some(bar) = transfer_bar {
+            bar.inc(chunk_len as u64);
+        }
+        let teacher_gpu = similarity_teacher
+            .enabled()
+            .then(|| {
+                if let Some(bar) = transfer_bar {
+                    bar.set_message(format!("moving teacher chunk {chunk_label} to GPU"));
+                }
+                let teacher = teacher_spectra_cache_from_target_pairs(
+                    similarity_teacher,
+                    &cpu_cache.spectra[spectra_start..spectra_end],
+                    &cpu_cache.conditions[conditions_start..conditions_end],
+                    chunk_len,
+                    cpu_cache.spectrum_width,
+                    cpu_cache.condition_width,
+                    None,
+                );
+                let cache = TeacherGpuCache::from_cpu_window(&teacher, 0, chunk_len, device);
+                if cache.is_some()
+                    && let Some(bar) = transfer_bar
+                {
+                    bar.inc(chunk_len as u64);
+                }
+                cache
+            })
+            .flatten();
+
+        chunks.push(FlatGpuCacheChunk {
+            spectra,
+            conditions,
+            teacher_gpu,
+            items: chunk_len,
+        });
+    }
+
+    FlatGpuCache { chunks, items }
 }
 
 fn teacher_spectra_cache_from_target_pairs(
@@ -816,7 +888,7 @@ fn teacher_spectra_cache_from_target_pairs(
     builder.finish()
 }
 
-impl<B, Open> DataLoader<B, AutoencoderBatch<B>> for CachedVectorizedMgfLoader<B, Open>
+impl<B, Open> DataLoader<B, AutoencoderBatch<B>> for StreamingVectorizedMgfLoader<B, Open>
 where
     B: SimilarityTeacherBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
@@ -826,40 +898,12 @@ where
             .start_epoch(loader_epoch_items(self.batch_size, self.max_batches));
         let epoch_index = self.pair_sampling_epoch.next();
 
-        if self.is_full_cache()
-            && let Some(cache) = self
-                .full_cache
-                .lock()
-                .expect("full vectorized cache lock should not be poisoned")
-                .clone()
-        {
-            return Box::new(CachedVectorizedMgfIter {
+        if let Some(cpu_prefetcher) = self.disk_prefetcher(0) {
+            return Box::new(StreamingVectorizedMgfIter {
                 loader: self,
                 records: None,
-                cache: Some(cache),
-                cache_offset: 0,
-                batches_processed: 0,
-                items_processed: 0,
-                epoch_index,
-                finished: false,
-            });
-        }
-
-        if self
-            .cpu_cache
-            .lock()
-            .expect("CPU vectorized cache lock should not be poisoned")
-            .is_some()
-        {
-            let initial_cache = self
-                .initial_cache
-                .lock()
-                .expect("initial vectorized cache lock should not be poisoned")
-                .take();
-            return Box::new(CachedVectorizedMgfIter {
-                loader: self,
-                records: None,
-                cache: initial_cache,
+                cache: None,
+                cpu_prefetcher: Some(cpu_prefetcher),
                 cache_offset: 0,
                 batches_processed: 0,
                 items_processed: 0,
@@ -871,10 +915,11 @@ where
         let mut records = open_records_or_panic(&self.open_records, "vectorized", &self.mgf_source);
         skip_split_records(&mut records, self.start_item, &self.progress, None);
 
-        Box::new(CachedVectorizedMgfIter {
+        Box::new(StreamingVectorizedMgfIter {
             loader: self,
             records: Some(records),
             cache: None,
+            cpu_prefetcher: None,
             cache_offset: 0,
             batches_processed: 0,
             items_processed: 0,
@@ -890,8 +935,6 @@ where
     fn to_device(&self, device: &B::Device) -> Arc<dyn DataLoader<B, AutoencoderBatch<B>>> {
         Arc::new(Self {
             device: device.clone(),
-            initial_cache: Arc::new(Mutex::new(None)),
-            full_cache: Arc::new(Mutex::new(None)),
             ..self.clone()
         })
     }
@@ -902,9 +945,8 @@ where
         Arc::new(Self {
             max_batches: end_batch.saturating_sub(start_batch),
             start_item: self.start_item + start_batch * self.batch_size,
-            cpu_cache: Arc::new(Mutex::new(None)),
-            initial_cache: Arc::new(Mutex::new(None)),
-            full_cache: Arc::new(Mutex::new(None)),
+            preprocessed_cache_path: None,
+            disk_cache: Arc::new(Mutex::new(None)),
             progress: self.progress.clone_for_slice(),
             ..self.clone()
         })
@@ -914,24 +956,22 @@ where
 struct FlatCpuCache {
     spectra: Vec<f32>,
     conditions: Vec<f32>,
-    teacher: Option<Arc<TeacherSpectraCache>>,
     items: usize,
     spectrum_width: usize,
     condition_width: usize,
 }
 
-impl FlatCpuCache {
-    fn payload_bytes(&self) -> io::Result<u64> {
-        let floats = self.spectra.len().saturating_add(self.conditions.len());
-        bytes_for_floats(floats)
-    }
+#[derive(Clone)]
+struct FlatCacheFileMeta {
+    path: PathBuf,
+    items: usize,
+    spectrum_width: usize,
+    condition_width: usize,
+    spectra_offset: u64,
+    conditions_offset: u64,
 }
 
-fn read_flat_cpu_cache_file(
-    path: &Path,
-    expected_items: usize,
-    prefix: String,
-) -> io::Result<FlatCpuCache> {
+fn read_flat_cache_file_meta(path: &Path, expected_items: usize) -> io::Result<FlatCacheFileMeta> {
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, fs::File::open(path)?);
     let mut magic = [0_u8; 8];
     reader.read_exact(&mut magic)?;
@@ -960,90 +1000,81 @@ fn read_flat_cpu_cache_file(
         ));
     }
 
-    let payload_bytes = bytes_for_floats(
-        items
-            .saturating_mul(spectrum_width)
-            .saturating_add(items.saturating_mul(condition_width)),
-    )?;
-    let bar = preload_bytes_bar(prefix, payload_bytes, "loading preprocessed vector cache");
-    let spectra = read_f32_vec(
-        &mut reader,
-        items * spectrum_width,
-        &bar,
-        "loading spectra from vector cache",
-    )?;
-    let conditions = read_f32_vec(
-        &mut reader,
-        items * condition_width,
-        &bar,
-        "loading conditions from vector cache",
-    )?;
-    bar.finish_with_message(format!(
-        "loaded preprocessed vectors from {}",
-        path.display()
-    ));
-
-    Ok(FlatCpuCache {
-        spectra,
-        conditions,
-        teacher: None,
+    let spectra_offset = reader.stream_position()?;
+    let spectra_bytes = bytes_for_floats(items.saturating_mul(spectrum_width))?;
+    let conditions_offset = spectra_offset.checked_add(spectra_bytes).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "flat-cache condition offset overflow",
+        )
+    })?;
+    Ok(FlatCacheFileMeta {
+        path: path.to_path_buf(),
         items,
         spectrum_width,
         condition_width,
+        spectra_offset,
+        conditions_offset,
     })
 }
 
-fn write_flat_cpu_cache_file(path: &Path, cache: &FlatCpuCache, prefix: String) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+fn read_flat_cpu_cache_window_file(
+    metadata: &FlatCacheFileMeta,
+    start_item: usize,
+    target_items: usize,
+    prefix: String,
+    transfer_bar: Option<&ProgressBar>,
+    show_progress: bool,
+) -> io::Result<FlatCpuCache> {
+    let items = target_items.min(metadata.items.saturating_sub(start_item));
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, fs::File::open(&metadata.path)?);
+    let payload_bytes = bytes_for_floats(
+        items
+            .saturating_mul(metadata.spectrum_width)
+            .saturating_add(items.saturating_mul(metadata.condition_width)),
+    )?;
+    let bytes_bar = (show_progress && transfer_bar.is_none())
+        .then(|| preload_bytes_bar(prefix, payload_bytes, "loading vector cache window"));
+
+    if let Some(bar) = transfer_bar {
+        bar.set_message("reading spectra window from vector cache");
     }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("flat-cache.saefc");
-    let tmp_path = path.with_file_name(format!("{file_name}.tmp-{}", std::process::id()));
-
-    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, fs::File::create(&tmp_path)?);
-    writer.write_all(FLAT_CACHE_MAGIC)?;
-    write_u32(&mut writer, FLAT_CACHE_VERSION)?;
-    write_u64(&mut writer, cache.items as u64)?;
-    write_u64(&mut writer, cache.spectrum_width as u64)?;
-    write_u64(&mut writer, cache.condition_width as u64)?;
-
-    let bar = preload_bytes_bar(
-        prefix,
-        cache.payload_bytes()?,
-        "writing preprocessed vector cache",
-    );
-    let result = (|| -> io::Result<()> {
-        write_f32_slice(
-            &mut writer,
-            &cache.spectra,
-            &bar,
-            "writing spectra vector cache",
-        )?;
-        write_f32_slice(
-            &mut writer,
-            &cache.conditions,
-            &bar,
-            "writing conditions vector cache",
-        )?;
-        writer.flush()
-    })();
-
-    match result {
-        Ok(()) => {
-            drop(writer);
-            fs::rename(&tmp_path, path)?;
-            bar.finish_with_message(format!("wrote preprocessed vectors to {}", path.display()));
-            Ok(())
-        }
-        Err(error) => {
-            bar.finish_with_message(format!("failed writing preprocessed vectors: {error}"));
-            let _ = fs::remove_file(&tmp_path);
-            Err(error)
-        }
+    let spectra_start = metadata.spectra_offset
+        + bytes_for_floats(start_item.saturating_mul(metadata.spectrum_width))?;
+    let spectra = read_f32_vec_at(
+        &mut reader,
+        spectra_start,
+        items * metadata.spectrum_width,
+        bytes_bar.as_ref(),
+        "reading spectra window from vector cache",
+    )?;
+    if let Some(bar) = transfer_bar {
+        bar.set_message("reading condition window from vector cache");
     }
+    let conditions_start = metadata.conditions_offset
+        + bytes_for_floats(start_item.saturating_mul(metadata.condition_width))?;
+    let conditions = read_f32_vec_at(
+        &mut reader,
+        conditions_start,
+        items * metadata.condition_width,
+        bytes_bar.as_ref(),
+        "reading condition window from vector cache",
+    )?;
+
+    if let Some(bar) = bytes_bar {
+        bar.finish_with_message(format!(
+            "loaded {} vector-cache spectra from {}",
+            items,
+            metadata.path.display()
+        ));
+    }
+    Ok(FlatCpuCache {
+        spectra,
+        conditions,
+        items,
+        spectrum_width: metadata.spectrum_width,
+        condition_width: metadata.condition_width,
+    })
 }
 
 fn read_usize(reader: &mut impl Read, name: &'static str) -> io::Result<usize> {
@@ -1087,10 +1118,11 @@ fn bytes_for_floats(floats: usize) -> io::Result<u64> {
     })
 }
 
-fn read_f32_vec(
-    reader: &mut impl Read,
+fn read_f32_vec_at<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
     len: usize,
-    bar: &ProgressBar,
+    bar: Option<&ProgressBar>,
     message: &'static str,
 ) -> io::Result<Vec<f32>> {
     const CHUNK_FLOATS: usize = 1 << 20;
@@ -1098,37 +1130,35 @@ fn read_f32_vec(
     let mut remaining = len;
     let mut bytes = vec![0_u8; CHUNK_FLOATS * std::mem::size_of::<f32>()];
 
+    reader.seek(SeekFrom::Start(offset))?;
     while remaining > 0 {
         let chunk_len = remaining.min(CHUNK_FLOATS);
         let byte_len = chunk_len * std::mem::size_of::<f32>();
-        bar.set_message(message);
+        if let Some(bar) = bar {
+            bar.set_message(message);
+        }
         reader.read_exact(&mut bytes[..byte_len])?;
         values.extend(
             bytes[..byte_len]
                 .chunks_exact(4)
                 .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
         );
-        bar.inc(byte_len as u64);
+        if let Some(bar) = bar {
+            bar.inc(byte_len as u64);
+        }
         remaining -= chunk_len;
     }
 
     Ok(values)
 }
 
-fn write_f32_slice(
-    writer: &mut impl Write,
-    values: &[f32],
-    bar: &ProgressBar,
-    message: &'static str,
-) -> io::Result<()> {
+fn write_f32_slice_untracked(writer: &mut impl Write, values: &[f32]) -> io::Result<()> {
     const CHUNK_FLOATS: usize = 1 << 20;
     let mut bytes = Vec::with_capacity(CHUNK_FLOATS * std::mem::size_of::<f32>());
     for chunk in values.chunks(CHUNK_FLOATS) {
         bytes.clear();
         bytes.extend(chunk.iter().flat_map(|value| value.to_le_bytes()));
-        bar.set_message(message);
         writer.write_all(&bytes)?;
-        bar.inc(bytes.len() as u64);
     }
     Ok(())
 }
@@ -1159,13 +1189,80 @@ impl<B: Backend> FlatGpuCache<B> {
     }
 }
 
-struct CachedVectorizedMgfIter<'a, B, Open>
+struct FlatCpuWindowPrefetcher {
+    receiver: Receiver<io::Result<FlatCpuCache>>,
+    _join: JoinHandle<()>,
+}
+
+impl FlatCpuWindowPrefetcher {
+    fn new(
+        metadata: FlatCacheFileMeta,
+        start_item: usize,
+        total_items: usize,
+        window_items: usize,
+        prefetch_windows: usize,
+        prefix: String,
+    ) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(prefetch_windows.max(1));
+        let _join = thread::spawn(move || {
+            prefetch_flat_cpu_windows(
+                sender,
+                metadata,
+                start_item,
+                total_items,
+                window_items,
+                prefix,
+            );
+        });
+        Self { receiver, _join }
+    }
+
+    fn next_window(&self) -> Option<FlatCpuCache> {
+        match self.receiver.recv() {
+            Ok(Ok(cache)) => Some(cache),
+            Ok(Err(error)) => {
+                panic!("failed to prefetch flat vector cache window: {error}");
+            }
+            Err(_) => None,
+        }
+    }
+}
+
+fn prefetch_flat_cpu_windows(
+    sender: SyncSender<io::Result<FlatCpuCache>>,
+    metadata: FlatCacheFileMeta,
+    start_item: usize,
+    total_items: usize,
+    window_items: usize,
+    prefix: String,
+) {
+    let mut offset = start_item;
+    while offset < total_items {
+        let target_items = window_items.min(total_items - offset);
+        let result = read_flat_cpu_cache_window_file(
+            &metadata,
+            offset,
+            target_items,
+            prefix.clone(),
+            None,
+            false,
+        );
+        let done = result.as_ref().is_err() || target_items == 0;
+        if sender.send(result).is_err() || done {
+            break;
+        }
+        offset += target_items;
+    }
+}
+
+struct StreamingVectorizedMgfIter<'a, B, Open>
 where
     B: Backend,
 {
-    loader: &'a CachedVectorizedMgfLoader<B, Open>,
+    loader: &'a StreamingVectorizedMgfLoader<B, Open>,
     records: Option<VectorizedMgfIter>,
     cache: Option<FlatGpuCache<B>>,
+    cpu_prefetcher: Option<FlatCpuWindowPrefetcher>,
     cache_offset: usize,
     batches_processed: usize,
     items_processed: usize,
@@ -1173,7 +1270,7 @@ where
     finished: bool,
 }
 
-impl<B, Open> Iterator for CachedVectorizedMgfIter<'_, B, Open>
+impl<B, Open> Iterator for StreamingVectorizedMgfIter<'_, B, Open>
 where
     B: SimilarityTeacherBackend,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
@@ -1310,7 +1407,7 @@ where
     }
 }
 
-impl<B, Open> CachedVectorizedMgfIter<'_, B, Open>
+impl<B, Open> StreamingVectorizedMgfIter<'_, B, Open>
 where
     B: Backend,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
@@ -1318,22 +1415,30 @@ where
     fn fill_cache(&mut self) -> Option<FlatGpuCache<B>> {
         let remaining_items = loader_epoch_items(self.loader.batch_size, self.loader.max_batches)
             .saturating_sub(self.items_processed);
-        let target_items = self.loader.cache_items.min(remaining_items);
+        let target_items = self.loader.window_items.min(remaining_items);
         if target_items == 0 {
             return None;
         }
 
-        if let Some(cpu_cache) = self
-            .loader
-            .cpu_cache
-            .lock()
-            .expect("CPU vectorized cache lock should not be poisoned")
-            .clone()
+        if let Some(prefetcher) = &self.cpu_prefetcher
+            && let Some(cpu_cache) = prefetcher.next_window()
         {
             return Some(self.loader.move_flat_cache_window_to_gpu(
                 &cpu_cache,
-                self.items_processed,
-                target_items,
+                0,
+                cpu_cache.items,
+                None,
+            ));
+        }
+
+        if let Some(cpu_cache) =
+            self.loader
+                .load_flat_cpu_window(self.items_processed, target_items, None)
+        {
+            return Some(self.loader.move_flat_cache_window_to_gpu(
+                &cpu_cache,
+                0,
+                cpu_cache.items,
                 None,
             ));
         }
@@ -1342,17 +1447,10 @@ where
         let cpu_cache =
             self.loader
                 .read_flat_cpu_cache(records, target_items, self.batches_processed, None)?;
-        let cache = self
-            .loader
-            .move_flat_cache_window_to_gpu(&cpu_cache, 0, cpu_cache.items, None);
-        if self.loader.is_full_cache() {
-            *self
-                .loader
-                .full_cache
-                .lock()
-                .expect("full vectorized cache lock should not be poisoned") = Some(cache.clone());
-        }
-        Some(cache)
+        Some(
+            self.loader
+                .move_flat_cache_window_to_gpu(&cpu_cache, 0, cpu_cache.items, None),
+        )
     }
 
     fn finish(&mut self) {
@@ -1365,7 +1463,7 @@ where
     }
 }
 
-impl<B, Open> DataLoaderIterator<AutoencoderBatch<B>> for CachedVectorizedMgfIter<'_, B, Open>
+impl<B, Open> DataLoaderIterator<AutoencoderBatch<B>> for StreamingVectorizedMgfIter<'_, B, Open>
 where
     B: SimilarityTeacherBackend,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
@@ -1381,22 +1479,6 @@ where
 fn preload_bar(prefix: String, total_items: usize, message: &'static str) -> ProgressBar {
     let bar = ProgressBar::with_draw_target(
         Some(total_items as u64),
-        ProgressDrawTarget::stderr_with_hz(10),
-    );
-    bar.set_style(tokenization_style());
-    bar.set_prefix(prefix);
-    bar.set_message(message);
-    bar
-}
-
-fn preload_transfer_bar(
-    prefix: String,
-    items: usize,
-    message: &'static str,
-    stages: usize,
-) -> ProgressBar {
-    let bar = ProgressBar::with_draw_target(
-        Some((items * stages) as u64),
         ProgressDrawTarget::stderr_with_hz(10),
     );
     bar.set_style(tokenization_style());

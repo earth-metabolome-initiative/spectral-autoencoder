@@ -22,13 +22,12 @@ mod app {
     };
 
     use crate::gems_common::{
-        CachedTrainingLoaderConfig, GeMSProgress, InnerBackend, RunArgs, TrainingBackend,
+        GeMSProgress, InnerBackend, RunArgs, StreamingTrainingLoaderConfig, TrainingBackend,
         augmentation_config_from_env, auxiliary_loss_config_from_env, open_gems_a10_iter,
-        print_run_header, save_model_record, similarity_teacher_config_from_env, warm_start_model,
+        print_streaming_run_header, save_model_record, similarity_teacher_config_from_env,
+        warm_start_model,
     };
-    use crate::gems_peak_set::cached_tokenized_loader;
-
-    const PEAK_CACHE_DEFAULT_PERCENT: f64 = 100.0;
+    use crate::gems_peak_set::streaming_tokenized_loader;
 
     pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let args = RunArgs::from_env("runs/gems-a10-smoke", 32)?;
@@ -50,34 +49,27 @@ mod app {
         let config = PeakSetAutoencoderConfig::twenty_million_run_with_peaks(args.max_peaks);
         let auxiliary = auxiliary_loss_config_from_env(config.auxiliary);
         let similarity_teacher = similarity_teacher_config_from_env(auxiliary)?;
-        let train_loader_config = CachedTrainingLoaderConfig::new(
-            args.train_gpu_cache_percent(PEAK_CACHE_DEFAULT_PERCENT),
-            similarity_teacher,
-        );
-        let valid_loader_config = CachedTrainingLoaderConfig::new(
-            args.valid_gpu_cache_percent(PEAK_CACHE_DEFAULT_PERCENT),
-            similarity_teacher,
-        );
+        let loader_config = StreamingTrainingLoaderConfig::from_env(similarity_teacher)?;
         let train_builder = args.gems_builder.clone();
         let train_tokenizer_config = tokenizer_config.clone();
-        let train_loader = cached_tokenized_loader::<TrainingBackend, _>(
+        let train_loader = streaming_tokenized_loader::<TrainingBackend, _>(
             &args,
             device.clone(),
             progress.train.clone(),
             args.train_start_item(),
             Some(augmentation),
-            train_loader_config,
+            loader_config,
             move || open_records(train_builder.clone(), train_tokenizer_config.clone()),
         );
         let valid_builder = args.gems_builder.clone();
         let valid_tokenizer_config = tokenizer_config.clone();
-        let valid_loader = cached_tokenized_loader::<InnerBackend, _>(
+        let valid_loader = streaming_tokenized_loader::<InnerBackend, _>(
             &args,
             device.clone(),
             progress.valid.clone(),
             args.valid_start_item(),
             None,
-            valid_loader_config,
+            loader_config,
             move || open_records(valid_builder.clone(), valid_tokenizer_config.clone()),
         );
 
@@ -96,16 +88,16 @@ mod app {
             .init();
         let learner = Learner::new(model, optim, ConstantLr::new(args.learning_rate));
 
-        print_run_header(
+        print_streaming_run_header(
             "peak-set",
             &args,
             parameter_count,
-            PEAK_CACHE_DEFAULT_PERCENT,
+            loader_config,
             auxiliary,
             similarity_teacher,
             None,
         );
-        progress.start_training("starting GeMS peak-set cached training");
+        progress.start_training("starting GeMS peak-set streaming training");
         let training = SupervisedTraining::new(&args.output_dir, train_loader, valid_loader)
             .num_epochs(args.epochs)
             .with_autoencoder_metrics()
@@ -121,7 +113,7 @@ mod app {
             training
         };
         let trained = training.launch(learner);
-        progress.finish_training("finished GeMS peak-set cached training");
+        progress.finish_training("finished GeMS peak-set streaming training");
 
         save_model_record(
             &progress,

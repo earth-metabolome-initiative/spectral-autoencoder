@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use burn::{
     data::dataloader::{DataLoader, DataLoaderIterator, Progress},
@@ -9,37 +9,33 @@ use spectral_autoencoder::{
 };
 
 use crate::gems_common::{
-    CachedLoaderOptions, CachedTrainingLoaderConfig, LoaderProgress, PairSamplingEpoch, RunArgs,
-    SimilarityTeacherBackend, SimilarityTeacherConfig, TeacherGpuCache, TeacherSpectraBuilder,
-    cache_items, finish_loader_once, is_full_gpu_cache, loader_epoch_items,
-    mask_precursor_conditions, open_records_or_panic, probability_mask, signed_random,
-    similarity_pair_seed, skip_split_records, teacher_similarity_ranking_batch,
+    LoaderProgress, PairSamplingEpoch, RunArgs, SimilarityTeacherBackend, SimilarityTeacherConfig,
+    StreamingLoaderOptions, StreamingTrainingLoaderConfig, TeacherGpuCache, TeacherSpectraBuilder,
+    finish_loader_once, loader_epoch_items, mask_precursor_conditions, open_records_or_panic,
+    probability_mask, signed_random, similarity_pair_seed, skip_split_records,
+    teacher_similarity_ranking_batch,
 };
 
-pub fn cached_tokenized_loader<B, Open>(
+pub fn streaming_tokenized_loader<B, Open>(
     args: &RunArgs,
     device: B::Device,
     progress: LoaderProgress,
     start_item: usize,
     augment: Option<SpectrumAugmentationConfig>,
-    loader_config: CachedTrainingLoaderConfig,
+    loader_config: StreamingTrainingLoaderConfig,
     open_records: Open,
 ) -> Arc<dyn DataLoader<B, TokenizedAutoencoderBatch<B>>>
 where
     B: SimilarityTeacherBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
 {
-    Arc::new(CachedTokenizedMgfLoader::new(
-        CachedLoaderOptions {
+    Arc::new(StreamingTokenizedMgfLoader::new(
+        StreamingLoaderOptions {
             mgf_source: args.mgf_source.clone(),
             batch_size: args.batch_size,
             max_batches: progress.max_batches,
             start_item,
-            cache_items: cache_items(
-                args.batch_size,
-                progress.max_batches,
-                loader_config.cache_percent,
-            ),
+            window_items: loader_config.window_items(args.batch_size, progress.max_batches),
             device,
             progress,
             augment,
@@ -261,7 +257,7 @@ fn fourier_features<B: Backend>(
     Tensor::cat(features, 2).mask_fill(active.bool_not(), 0.0)
 }
 
-struct CachedTokenizedMgfLoader<B, Open>
+struct StreamingTokenizedMgfLoader<B, Open>
 where
     B: Backend,
 {
@@ -270,16 +266,15 @@ where
     batch_size: usize,
     max_batches: usize,
     start_item: usize,
-    cache_items: usize,
+    window_items: usize,
     device: B::Device,
     augment: Option<SpectrumAugmentationConfig>,
     similarity_teacher: SimilarityTeacherConfig,
     open_records: Open,
-    full_cache: Arc<Mutex<Option<TokenGpuCache<B>>>>,
     pair_sampling_epoch: PairSamplingEpoch,
 }
 
-impl<B, Open> Clone for CachedTokenizedMgfLoader<B, Open>
+impl<B, Open> Clone for StreamingTokenizedMgfLoader<B, Open>
 where
     B: Backend,
     B::Device: Clone,
@@ -292,44 +287,38 @@ where
             batch_size: self.batch_size,
             max_batches: self.max_batches,
             start_item: self.start_item,
-            cache_items: self.cache_items,
+            window_items: self.window_items,
             device: self.device.clone(),
             augment: self.augment,
             similarity_teacher: self.similarity_teacher,
             open_records: self.open_records.clone(),
-            full_cache: self.full_cache.clone(),
             pair_sampling_epoch: self.pair_sampling_epoch.clone(),
         }
     }
 }
 
-impl<B, Open> CachedTokenizedMgfLoader<B, Open>
+impl<B, Open> StreamingTokenizedMgfLoader<B, Open>
 where
     B: Backend,
 {
-    fn new(options: CachedLoaderOptions<B>, open_records: Open) -> Self {
+    fn new(options: StreamingLoaderOptions<B>, open_records: Open) -> Self {
         Self {
             mgf_source: options.mgf_source,
             progress: options.progress,
             batch_size: options.batch_size,
             max_batches: options.max_batches,
             start_item: options.start_item,
-            cache_items: options.cache_items,
+            window_items: options.window_items,
             device: options.device,
             augment: options.augment,
             similarity_teacher: options.similarity_teacher,
             open_records,
-            full_cache: Arc::new(Mutex::new(None)),
             pair_sampling_epoch: PairSamplingEpoch::new(options.randomize_pair_sampling),
         }
     }
-
-    fn is_full_cache(&self) -> bool {
-        is_full_gpu_cache(self.cache_items, self.batch_size, self.max_batches)
-    }
 }
 
-impl<B, Open> DataLoader<B, TokenizedAutoencoderBatch<B>> for CachedTokenizedMgfLoader<B, Open>
+impl<B, Open> DataLoader<B, TokenizedAutoencoderBatch<B>> for StreamingTokenizedMgfLoader<B, Open>
 where
     B: SimilarityTeacherBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
@@ -339,29 +328,10 @@ where
             .start_epoch(loader_epoch_items(self.batch_size, self.max_batches));
         let epoch_index = self.pair_sampling_epoch.next();
 
-        if self.is_full_cache()
-            && let Some(cache) = self
-                .full_cache
-                .lock()
-                .expect("full tokenized cache lock should not be poisoned")
-                .clone()
-        {
-            return Box::new(CachedTokenizedMgfIter {
-                loader: self,
-                records: None,
-                cache: Some(cache),
-                cache_offset: 0,
-                batches_processed: 0,
-                items_processed: 0,
-                epoch_index,
-                finished: false,
-            });
-        }
-
         let mut records = open_records_or_panic(&self.open_records, "tokenized", &self.mgf_source);
         skip_split_records(&mut records, self.start_item, &self.progress, None);
 
-        Box::new(CachedTokenizedMgfIter {
+        Box::new(StreamingTokenizedMgfIter {
             loader: self,
             records: Some(records),
             cache: None,
@@ -383,7 +353,6 @@ where
     ) -> Arc<dyn DataLoader<B, TokenizedAutoencoderBatch<B>>> {
         Arc::new(Self {
             device: device.clone(),
-            full_cache: Arc::new(Mutex::new(None)),
             ..self.clone()
         })
     }
@@ -398,7 +367,6 @@ where
         Arc::new(Self {
             max_batches: end_batch.saturating_sub(start_batch),
             start_item: self.start_item + start_batch * self.batch_size,
-            full_cache: Arc::new(Mutex::new(None)),
             progress: self.progress.clone_for_slice(),
             ..self.clone()
         })
@@ -417,11 +385,11 @@ struct TokenGpuCache<B: Backend> {
     items: usize,
 }
 
-struct CachedTokenizedMgfIter<'a, B, Open>
+struct StreamingTokenizedMgfIter<'a, B, Open>
 where
     B: Backend,
 {
-    loader: &'a CachedTokenizedMgfLoader<B, Open>,
+    loader: &'a StreamingTokenizedMgfLoader<B, Open>,
     records: Option<TokenizedMgfIter>,
     cache: Option<TokenGpuCache<B>>,
     cache_offset: usize,
@@ -431,7 +399,7 @@ where
     finished: bool,
 }
 
-impl<B, Open> Iterator for CachedTokenizedMgfIter<'_, B, Open>
+impl<B, Open> Iterator for StreamingTokenizedMgfIter<'_, B, Open>
 where
     B: SimilarityTeacherBackend,
 {
@@ -617,7 +585,7 @@ where
     }
 }
 
-impl<B, Open> CachedTokenizedMgfIter<'_, B, Open>
+impl<B, Open> StreamingTokenizedMgfIter<'_, B, Open>
 where
     B: SimilarityTeacherBackend,
 {
@@ -625,7 +593,7 @@ where
         let records = self.records.as_mut()?;
         let remaining_items = loader_epoch_items(self.loader.batch_size, self.loader.max_batches)
             .saturating_sub(self.items_processed);
-        let target_items = self.loader.cache_items.min(remaining_items);
+        let target_items = self.loader.window_items.min(remaining_items);
         if target_items == 0 {
             return None;
         }
@@ -732,13 +700,6 @@ where
             teacher_gpu,
             items,
         };
-        if self.loader.is_full_cache() {
-            *self
-                .loader
-                .full_cache
-                .lock()
-                .expect("full tokenized cache lock should not be poisoned") = Some(cache.clone());
-        }
         Some(cache)
     }
 
@@ -753,7 +714,7 @@ where
 }
 
 impl<B, Open> DataLoaderIterator<TokenizedAutoencoderBatch<B>>
-    for CachedTokenizedMgfIter<'_, B, Open>
+    for StreamingTokenizedMgfIter<'_, B, Open>
 where
     B: SimilarityTeacherBackend,
 {

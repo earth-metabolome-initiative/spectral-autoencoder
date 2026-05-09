@@ -116,26 +116,6 @@ impl RunArgs {
         })
     }
 
-    pub fn gpu_cache_percent(&self, default_percent: f64) -> f64 {
-        f64_var("GEMS_GPU_CACHE_PERCENT", default_percent).clamp(0.0, 100.0)
-    }
-
-    pub fn train_gpu_cache_percent(&self, default_percent: f64) -> f64 {
-        f64_var(
-            "GEMS_TRAIN_GPU_CACHE_PERCENT",
-            self.gpu_cache_percent(default_percent),
-        )
-        .clamp(0.0, 100.0)
-    }
-
-    pub fn valid_gpu_cache_percent(&self, default_percent: f64) -> f64 {
-        f64_var(
-            "GEMS_VALID_GPU_CACHE_PERCENT",
-            self.gpu_cache_percent(default_percent),
-        )
-        .clamp(0.0, 100.0)
-    }
-
     pub const fn valid_items(&self) -> usize {
         self.batch_size * self.valid_batches
     }
@@ -294,16 +274,16 @@ fn gems_a10_token() -> Option<String> {
         .filter(|token| !token.trim().is_empty())
 }
 
-pub fn print_run_header(
+pub fn print_streaming_run_header(
     model_name: &str,
     args: &RunArgs,
     parameter_count: usize,
-    cache_default_percent: f64,
+    streaming: StreamingTrainingLoaderConfig,
     auxiliary: AuxiliaryLossConfig,
     similarity_teacher: SimilarityTeacherConfig,
     flat_reconstruction_ordering: Option<FlatVectorReconstructionOrdering>,
 ) {
-    println!("GeMS {model_name} cached-window training");
+    println!("GeMS {model_name} streaming-window training");
     println!("mgf source: {}", args.mgf_source);
     println!("mgf files: {}", args.mgf_paths.len());
     println!("max peaks: {}", args.max_peaks);
@@ -346,9 +326,8 @@ pub fn print_run_header(
         println!("warm-start model: {}", path.display());
     }
     println!(
-        "gpu cache: enabled (train {}%, valid {}%)",
-        args.train_gpu_cache_percent(cache_default_percent),
-        args.valid_gpu_cache_percent(cache_default_percent)
+        "gpu feed: streaming windows ({} batches/window, {} disk prefetch window(s))",
+        streaming.gpu_window_batches, streaming.prefetch_windows
     );
     println!("model parameters: {parameter_count}");
     if let Some(ordering) = flat_reconstruction_ordering {
@@ -601,17 +580,34 @@ pub fn similarity_teacher_config_from_env(
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct CachedTrainingLoaderConfig {
-    pub(crate) cache_percent: f64,
+pub struct StreamingTrainingLoaderConfig {
+    pub(crate) gpu_window_batches: usize,
+    pub(crate) prefetch_windows: usize,
     pub(crate) similarity_teacher: SimilarityTeacherConfig,
 }
 
-impl CachedTrainingLoaderConfig {
-    pub const fn new(cache_percent: f64, similarity_teacher: SimilarityTeacherConfig) -> Self {
-        Self {
-            cache_percent,
+impl StreamingTrainingLoaderConfig {
+    pub fn from_env(
+        similarity_teacher: SimilarityTeacherConfig,
+    ) -> Result<Self, Box<dyn StdError>> {
+        Ok(Self {
+            gpu_window_batches: positive_usize_var("GEMS_GPU_WINDOW_BATCHES", 16)?,
+            prefetch_windows: positive_usize_var("GEMS_PREFETCH_WINDOWS", 2)?,
             similarity_teacher,
-        }
+        })
+    }
+
+    pub(crate) fn window_items(self, batch_size: usize, max_batches: usize) -> usize {
+        let epoch_items = loader_epoch_items(batch_size, max_batches);
+        let window_batches = if max_batches > 1 {
+            self.gpu_window_batches.min(max_batches - 1)
+        } else {
+            1
+        };
+        batch_size
+            .saturating_mul(window_batches)
+            .max(batch_size)
+            .min(epoch_items)
     }
 }
 
@@ -673,12 +669,12 @@ where
     Ok(model.load_record(record))
 }
 
-pub(crate) struct CachedLoaderOptions<B: Backend> {
+pub(crate) struct StreamingLoaderOptions<B: Backend> {
     pub(crate) mgf_source: String,
     pub(crate) batch_size: usize,
     pub(crate) max_batches: usize,
     pub(crate) start_item: usize,
-    pub(crate) cache_items: usize,
+    pub(crate) window_items: usize,
     pub(crate) device: B::Device,
     pub(crate) progress: LoaderProgress,
     pub(crate) augment: Option<SpectrumAugmentationConfig>,
@@ -686,23 +682,8 @@ pub(crate) struct CachedLoaderOptions<B: Backend> {
     pub(crate) randomize_pair_sampling: bool,
 }
 
-pub(crate) fn cache_items(batch_size: usize, max_batches: usize, cache_percent: f64) -> usize {
-    let epoch_items = loader_epoch_items(batch_size, max_batches);
-    if epoch_items == 0 {
-        return 0;
-    }
-
-    let requested = ((epoch_items as f64) * cache_percent / 100.0).ceil() as usize;
-    let requested = requested.max(batch_size).min(epoch_items);
-    requested.div_ceil(batch_size) * batch_size
-}
-
 pub(crate) fn loader_epoch_items(batch_size: usize, max_batches: usize) -> usize {
     batch_size.saturating_mul(max_batches)
-}
-
-pub(crate) fn is_full_gpu_cache(cache_items: usize, batch_size: usize, max_batches: usize) -> bool {
-    cache_items >= loader_epoch_items(batch_size, max_batches)
 }
 
 #[derive(Clone)]
@@ -1322,6 +1303,43 @@ pub(crate) fn usize_var(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
+}
+
+fn positive_usize_var(name: &str, default: usize) -> Result<usize, Box<dyn StdError>> {
+    let value = match env::var(name) {
+        Ok(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} cannot be empty"),
+                )
+                .into());
+            }
+            value.parse::<usize>().map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("{name} must be a positive integer: {error}"),
+                )
+            })?
+        }
+        Err(env::VarError::NotPresent) => default,
+        Err(error) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("could not read {name}: {error}"),
+            )
+            .into());
+        }
+    };
+    if value == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} must be greater than zero"),
+        )
+        .into());
+    }
+    Ok(value)
 }
 
 fn optional_usize_var(name: &str) -> Option<usize> {

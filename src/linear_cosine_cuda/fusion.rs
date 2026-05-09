@@ -1,9 +1,8 @@
 use super::api::{
     LinearCosineKernelBackend, LinearCosineKernelConfig, SimilarityRankingKernelConfig,
 };
-use burn::tensor::backend::Backend;
 use burn::tensor::ops::{FloatTensor, IntTensor};
-use burn::tensor::{Element, Shape};
+use burn::tensor::{Element as _, Shape};
 use burn_fusion::{
     Fusion, FusionBackend,
     stream::{Operation, OperationStreams},
@@ -101,12 +100,12 @@ where
         let partner_a = TensorIr::uninit(
             client.create_empty_handle(),
             index_shape.clone(),
-            <B as Backend>::IntElem::dtype(),
+            B::IntElem::dtype(),
         );
         let partner_b = TensorIr::uninit(
             client.create_empty_handle(),
             index_shape,
-            <B as Backend>::IntElem::dtype(),
+            B::IntElem::dtype(),
         );
         let target_delta =
             TensorIr::uninit(client.create_empty_handle(), delta_shape, teacher_mz.dtype);

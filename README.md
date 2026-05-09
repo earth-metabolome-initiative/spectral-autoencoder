@@ -55,16 +55,18 @@ the cleaned spectra.
 
 The examples use mascot-rs' GeMS-A10 Zenodo loaders. Data is cached under
 `datasets/gems-a10-top-128-peaks` by default. The flat-vector example also keeps
-a persistent preprocessed CPU cache so restarts can skip repeated vectorization.
+a persistent preprocessed vector cache so restarts can skip repeated
+vectorization and stream fixed-size GPU windows from disk.
 
 Run the flat-vector model:
 
 ```bash
-GEMS_RUN_DIR=runs/gems-a10-top128-flat-cache100-bs1024-10epoch \
-GEMS_GPU_CACHE_PERCENT=100 \
-GEMS_BATCH_SIZE=1024 \
-GEMS_VALID_BATCHES=192 \
-GEMS_TRAIN_BATCHES=19336 \
+GEMS_RUN_DIR=runs/gems-a10-top128-flat-window16-bs4096-10epoch \
+GEMS_GPU_WINDOW_BATCHES=16 \
+GEMS_PREFETCH_WINDOWS=2 \
+GEMS_BATCH_SIZE=4096 \
+GEMS_VALID_BATCHES=48 \
+GEMS_TRAIN_BATCHES=4834 \
 GEMS_EPOCHS=10 \
 cargo run --release --example train_gems_flat --no-default-features --features std,cuda-fusion,train,tui
 ```
@@ -72,8 +74,9 @@ cargo run --release --example train_gems_flat --no-default-features --features s
 Run the peak-set model:
 
 ```bash
-GEMS_RUN_DIR=runs/gems-a10-top128-peak-cache80-bs128-5epoch \
-GEMS_GPU_CACHE_PERCENT=80 \
+GEMS_RUN_DIR=runs/gems-a10-top128-peak-window16-bs128-5epoch \
+GEMS_GPU_WINDOW_BATCHES=16 \
+GEMS_PREFETCH_WINDOWS=2 \
 GEMS_BATCH_SIZE=128 \
 GEMS_VALID_BATCHES=512 \
 GEMS_TRAIN_BATCHES=10000 \
@@ -88,7 +91,7 @@ GeMS examples write Burn checkpoints by default under `GEMS_RUN_DIR/checkpoint`.
 Resume a checkpointed run:
 
 ```bash
-GEMS_RUN_DIR=runs/gems-a10-top128-flat-cache100-bs1024-10epoch \
+GEMS_RUN_DIR=runs/gems-a10-top128-flat-window16-bs4096-10epoch \
 GEMS_RESUME_EPOCH=10 \
 GEMS_EPOCHS=20 \
 cargo run --release --example train_gems_flat --no-default-features --features std,cuda-fusion,train,tui

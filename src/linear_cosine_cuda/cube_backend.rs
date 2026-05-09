@@ -6,7 +6,6 @@ use super::kernels::{
 };
 use burn::tensor::Shape;
 use burn::tensor::ops::{FloatTensor, IntTensor};
-use burn_cubecl::cubecl::prelude::*;
 use burn_cubecl::cubecl::{CubeDim, calculate_cube_count_elemwise};
 use burn_cubecl::ops::numeric::empty_device_dtype;
 use burn_cubecl::{BoolElement, CubeBackend, CubeRuntime, FloatElement, IntElement};
@@ -35,8 +34,8 @@ where
         left_mz.assert_is_on_same_device(&intensity_power);
         left_mz.assert_is_on_same_device(&mz_tolerance);
 
-        let [batch_size, _left_peaks] = left_mz.shape.dims();
-        let [right_rows, _right_peaks] = right_mz.shape.dims();
+        let [batch_size, _left_peaks] = left_mz.meta.shape().dims();
+        let [right_rows, _right_peaks] = right_mz.meta.shape().dims();
         assert_eq!(
             batch_size, right_rows,
             "paired linear cosine requires the same number of left and right rows"
@@ -53,21 +52,21 @@ where
         let cube_dim = CubeDim::new(&left_mz.client, total_elem);
         let cube_count = calculate_cube_count_elemwise(&left_mz.client, total_elem, cube_dim);
 
+        let client = left_mz.client.clone();
         linear_cosine_preprocessed_paired_sorted_forward::launch::<F, R>(
-            &left_mz.client,
+            &client,
             cube_count,
             cube_dim,
-            left_mz.as_tensor_arg(1),
-            left_intensity.as_tensor_arg(1),
-            right_mz.as_tensor_arg(1),
-            right_intensity.as_tensor_arg(1),
-            mz_power.as_tensor_arg(1),
-            intensity_power.as_tensor_arg(1),
-            mz_tolerance.as_tensor_arg(1),
-            output.as_tensor_arg(1),
-            ScalarArg::new(config.epsilon as f32),
-        )
-        .expect("paired linear cosine forward kernel launch failed");
+            left_mz.into_tensor_arg(),
+            left_intensity.into_tensor_arg(),
+            right_mz.into_tensor_arg(),
+            right_intensity.into_tensor_arg(),
+            mz_power.into_tensor_arg(),
+            intensity_power.into_tensor_arg(),
+            mz_tolerance.into_tensor_arg(),
+            output.clone().into_tensor_arg(),
+            config.epsilon as f32,
+        );
 
         output
     }
@@ -81,8 +80,8 @@ where
         teacher_mz.assert_is_on_same_device(&teacher_intensity);
         teacher_mz.assert_is_on_same_device(&teacher_precursor);
 
-        let [teacher_rows, teacher_peaks] = teacher_mz.shape.dims();
-        let [precursor_rows] = teacher_precursor.shape.dims();
+        let [teacher_rows, teacher_peaks] = teacher_mz.meta.shape().dims();
+        let [precursor_rows] = teacher_precursor.meta.shape().dims();
         assert_eq!(
             teacher_rows, precursor_rows,
             "similarity-ranking precursor cache must have one value per teacher row"
@@ -121,28 +120,28 @@ where
         let cube_dim = CubeDim::new(&teacher_mz.client, total_elem);
         let cube_count = calculate_cube_count_elemwise(&teacher_mz.client, total_elem, cube_dim);
 
+        let client = teacher_mz.client.clone();
         linear_cosine_similarity_ranking_forward::launch::<F, I, R>(
-            &teacher_mz.client,
+            &client,
             cube_count,
             cube_dim,
-            teacher_mz.as_tensor_arg(1),
-            teacher_intensity.as_tensor_arg(1),
-            teacher_precursor.as_tensor_arg(1),
-            partner_a.as_tensor_arg(1),
-            partner_b.as_tensor_arg(1),
-            target_delta.as_tensor_arg(1),
-            ScalarArg::new(config.batch_start as u32),
-            ScalarArg::new(config.batch_items as u32),
-            ScalarArg::new(config.candidates_per_anchor as u32),
-            ScalarArg::new(config.mz_power as f32),
-            ScalarArg::new(config.intensity_power as f32),
-            ScalarArg::new(config.mz_tolerance as f32),
-            ScalarArg::new(config.seed as u32),
-            ScalarArg::new(config.epsilon as f32),
+            teacher_mz.into_tensor_arg(),
+            teacher_intensity.into_tensor_arg(),
+            teacher_precursor.into_tensor_arg(),
+            partner_a.clone().into_tensor_arg(),
+            partner_b.clone().into_tensor_arg(),
+            target_delta.clone().into_tensor_arg(),
+            config.batch_start as u32,
+            config.batch_items as u32,
+            config.candidates_per_anchor as u32,
+            config.mz_power as f32,
+            config.intensity_power as f32,
+            config.mz_tolerance as f32,
+            config.seed as u32,
+            config.epsilon as f32,
             config.metric,
             config.max_peaks,
-        )
-        .expect("similarity-ranking forward kernel launch failed");
+        );
 
         (partner_a, partner_b, target_delta)
     }
