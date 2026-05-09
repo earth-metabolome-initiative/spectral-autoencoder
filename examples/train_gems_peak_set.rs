@@ -3,6 +3,10 @@
 mod gems_common;
 
 #[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[path = "support/gems_streaming.rs"]
+mod gems_streaming;
+
+#[cfg(all(feature = "cuda-fusion", feature = "train"))]
 #[path = "support/gems_peak_set.rs"]
 mod gems_peak_set;
 
@@ -27,10 +31,10 @@ mod app {
         print_streaming_run_header, save_model_record, similarity_teacher_config_from_env,
         warm_start_model,
     };
-    use crate::gems_peak_set::streaming_tokenized_loader;
+    use crate::gems_peak_set::{TokenCacheShape, streaming_tokenized_loader};
 
     pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let args = RunArgs::from_env("runs/gems-a10-smoke", 32)?;
+        let args = RunArgs::from_env_with_training_defaults("runs/gems-a10-smoke", 32, 200, 20, 1)?;
         std::fs::create_dir_all(&args.output_dir)?;
 
         let progress = Arc::new(GeMSProgress::new(
@@ -46,6 +50,12 @@ mod app {
             max_peaks: args.max_peaks,
             ..SpectrumTokenizerConfig::default()
         };
+        let token_cache_shape = TokenCacheShape {
+            max_peaks: tokenizer_config.max_peaks,
+            token_feature_width: tokenizer_config.feature_width(),
+            target_width: tokenizer_config.target_width(),
+            condition_width: ConditioningEncoder::default().vector_width(),
+        };
         let config = PeakSetAutoencoderConfig::twenty_million_run_with_peaks(args.max_peaks);
         let auxiliary = auxiliary_loss_config_from_env(config.auxiliary);
         let similarity_teacher = similarity_teacher_config_from_env(auxiliary)?;
@@ -59,6 +69,7 @@ mod app {
             args.train_start_item(),
             Some(augmentation),
             loader_config,
+            token_cache_shape,
             move || open_records(train_builder.clone(), train_tokenizer_config.clone()),
         );
         let valid_builder = args.gems_builder.clone();
@@ -70,6 +81,7 @@ mod app {
             args.valid_start_item(),
             None,
             loader_config,
+            token_cache_shape,
             move || open_records(valid_builder.clone(), valid_tokenizer_config.clone()),
         );
 

@@ -3,6 +3,10 @@
 mod gems_common;
 
 #[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[path = "support/gems_streaming.rs"]
+mod gems_streaming;
+
+#[cfg(all(feature = "cuda-fusion", feature = "train"))]
 #[path = "support/gems_flat.rs"]
 mod gems_flat;
 
@@ -30,7 +34,13 @@ mod app {
     use crate::gems_flat::{flat_vector_config_from_env, streaming_vectorized_loader};
 
     pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let args = RunArgs::from_env("runs/gems-a10-flat-smoke", 256)?;
+        let args = RunArgs::from_env_with_training_defaults(
+            "runs/gems-a10-top128-flat-bs32768-window8",
+            32768,
+            605,
+            6,
+            10,
+        )?;
         std::fs::create_dir_all(&args.output_dir)?;
 
         let progress = Arc::new(GeMSProgress::new(

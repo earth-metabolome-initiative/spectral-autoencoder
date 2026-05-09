@@ -61,17 +61,23 @@ The examples use mascot-rs' GeMS-A10 Zenodo loaders. Data is cached under
 `datasets/gems-a10-top-128-peaks` by default. The flat-vector example also keeps
 a persistent preprocessed vector cache so restarts can skip repeated
 vectorization and stream fixed-size GPU windows from disk.
+Set `GEMS_LOADER_PROFILE_EVERY` to emit averaged loader timings; with the Burn
+TUI feature enabled they are written to `$GEMS_RUN_DIR/loader-profile.log` by
+default so terminal rendering stays clean.
+The flat-vector example defaults to the tuned 32,768-spectrum batch,
+8-batch GPU window, 16-worker, 8-window host-prefetch setup shown below.
 
 Run the flat-vector model:
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" \
-GEMS_RUN_DIR=runs/gems-a10-top128-flat-window16-bs4096-10epoch \
-GEMS_GPU_WINDOW_BATCHES=16 \
-GEMS_PREFETCH_WINDOWS=2 \
-GEMS_BATCH_SIZE=4096 \
-GEMS_VALID_BATCHES=48 \
-GEMS_TRAIN_BATCHES=4834 \
+GEMS_RUN_DIR=runs/gems-a10-top128-flat-bs32768-window8-10epoch \
+GEMS_GPU_WINDOW_BATCHES=8 \
+GEMS_LOADER_WORKERS=16 \
+GEMS_HOST_PREFETCH_WINDOWS=8 \
+GEMS_BATCH_SIZE=32768 \
+GEMS_VALID_BATCHES=6 \
+GEMS_TRAIN_BATCHES=605 \
 GEMS_EPOCHS=10 \
 cargo run --release --example train_gems_flat --no-default-features --features std,cuda-fusion,train,tui
 ```
@@ -81,8 +87,9 @@ Run the peak-set model:
 ```bash
 RUSTFLAGS="-C target-cpu=native" \
 GEMS_RUN_DIR=runs/gems-a10-top128-peak-window16-bs128-5epoch \
-GEMS_GPU_WINDOW_BATCHES=16 \
-GEMS_PREFETCH_WINDOWS=2 \
+GEMS_GPU_WINDOW_BATCHES=8 \
+GEMS_LOADER_WORKERS=16 \
+GEMS_HOST_PREFETCH_WINDOWS=8 \
 GEMS_BATCH_SIZE=128 \
 GEMS_VALID_BATCHES=512 \
 GEMS_TRAIN_BATCHES=10000 \
@@ -98,7 +105,7 @@ Resume a checkpointed run:
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" \
-GEMS_RUN_DIR=runs/gems-a10-top128-flat-window16-bs4096-10epoch \
+GEMS_RUN_DIR=runs/gems-a10-top128-flat-bs32768-window8-10epoch \
 GEMS_RESUME_EPOCH=10 \
 GEMS_EPOCHS=20 \
 cargo run --release --example train_gems_flat --no-default-features --features std,cuda-fusion,train,tui

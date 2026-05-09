@@ -66,9 +66,12 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
-    pub fn from_env(
+    pub fn from_env_with_training_defaults(
         default_output_dir: &str,
         default_batch_size: usize,
+        default_train_batches: usize,
+        default_valid_batches: usize,
+        default_epochs: usize,
     ) -> Result<Self, Box<dyn StdError>> {
         let max_peaks = usize_var("GEMS_MAX_PEAKS", 128);
         let gems = resolve_mascot_gems_a10(max_peaks)?;
@@ -105,9 +108,9 @@ impl RunArgs {
             output_dir: path_var("GEMS_RUN_DIR", default_output_dir),
             device: usize_var("GEMS_CUDA_DEVICE", 0),
             batch_size: usize_var("GEMS_BATCH_SIZE", default_batch_size),
-            train_batches: usize_var("GEMS_TRAIN_BATCHES", 200),
-            valid_batches: usize_var("GEMS_VALID_BATCHES", 20),
-            epochs: usize_var("GEMS_EPOCHS", 1),
+            train_batches: usize_var("GEMS_TRAIN_BATCHES", default_train_batches),
+            valid_batches: usize_var("GEMS_VALID_BATCHES", default_valid_batches),
+            epochs: usize_var("GEMS_EPOCHS", default_epochs),
             learning_rate: f64_var("GEMS_LR", 1.0e-4),
             weight_decay: f64_var("GEMS_WEIGHT_DECAY", 1.0e-4),
             checkpoints,
@@ -326,8 +329,11 @@ pub fn print_streaming_run_header(
         println!("warm-start model: {}", path.display());
     }
     println!(
-        "gpu feed: streaming windows ({} batches/window, {} disk prefetch window(s))",
-        streaming.gpu_window_batches, streaming.prefetch_windows
+        "gpu feed: streaming windows ({} batches/window, {} host worker(s), {} host prefetch window(s), profile every {} window(s))",
+        streaming.gpu_window_batches,
+        streaming.loader_workers,
+        streaming.host_prefetch_windows,
+        streaming.loader_profile_every
     );
     println!("model parameters: {parameter_count}");
     if let Some(ordering) = flat_reconstruction_ordering {
@@ -580,7 +586,9 @@ pub fn similarity_teacher_config_from_env(
 #[derive(Debug, Clone, Copy)]
 pub struct StreamingTrainingLoaderConfig {
     pub(crate) gpu_window_batches: usize,
-    pub(crate) prefetch_windows: usize,
+    pub(crate) loader_workers: usize,
+    pub(crate) host_prefetch_windows: usize,
+    pub(crate) loader_profile_every: usize,
     pub(crate) similarity_teacher: SimilarityTeacherConfig,
 }
 
@@ -589,8 +597,10 @@ impl StreamingTrainingLoaderConfig {
         similarity_teacher: SimilarityTeacherConfig,
     ) -> Result<Self, Box<dyn StdError>> {
         Ok(Self {
-            gpu_window_batches: positive_usize_var("GEMS_GPU_WINDOW_BATCHES", 16)?,
-            prefetch_windows: positive_usize_var("GEMS_PREFETCH_WINDOWS", 2)?,
+            gpu_window_batches: positive_usize_var("GEMS_GPU_WINDOW_BATCHES", 8)?,
+            loader_workers: positive_usize_var("GEMS_LOADER_WORKERS", 16)?,
+            host_prefetch_windows: positive_usize_var("GEMS_HOST_PREFETCH_WINDOWS", 8)?,
+            loader_profile_every: usize_var("GEMS_LOADER_PROFILE_EVERY", 0),
             similarity_teacher,
         })
     }

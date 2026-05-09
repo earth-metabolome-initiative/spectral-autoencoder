@@ -7,12 +7,8 @@ use std::{
     io,
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver, SyncSender},
-    },
-    thread::{self, JoinHandle},
-    time::UNIX_EPOCH,
+    sync::{Arc, Mutex},
+    time::{Instant, UNIX_EPOCH},
 };
 
 use burn::{
@@ -32,6 +28,10 @@ use crate::gems_common::{
     mask_precursor_conditions, open_records_or_panic, probability_mask, signed_random,
     similarity_pair_seed, skip_split_records, teacher_similarity_ranking_batch, tokenization_style,
     usize_var,
+};
+use crate::gems_streaming::{
+    HostWindowPlan, LoaderProfileAccumulator, LoaderWindowProfile, LoaderWorkerError,
+    OrderedHostWindowStream, host_window_plan, spawn_ordered_host_workers,
 };
 
 pub fn flat_vector_config_from_env(
@@ -102,7 +102,7 @@ where
             randomize_pair_sampling: augment.is_some(),
         },
         preprocessed_cache_path,
-        loader_config.prefetch_windows,
+        loader_config,
         open_records,
     ));
     loader.ensure_preprocessed_cache_file();
@@ -117,9 +117,10 @@ fn flat_preprocessed_cache_path(
     start_item: usize,
     max_batches: usize,
 ) -> Option<PathBuf> {
-    if !bool_var("GEMS_FLAT_PREPROCESSED_CACHE", true) {
-        return None;
-    }
+    assert!(
+        bool_var("GEMS_FLAT_PREPROCESSED_CACHE", true),
+        "GEMS_FLAT_PREPROCESSED_CACHE=0 is no longer supported; the host-worker loader requires the flat cache"
+    );
 
     let default_cache_dir = format!(
         "datasets/gems-a10-top-{}-peaks/preprocessed-flat",
@@ -361,10 +362,15 @@ where
     progress: LoaderProgress,
     batch_size: usize,
     max_batches: usize,
+    epoch_items: usize,
     start_item: usize,
     window_items: usize,
-    prefetch_windows: usize,
+    loader_workers: usize,
+    host_prefetch_windows: usize,
+    loader_profile_every: usize,
     preprocessed_cache_path: Option<PathBuf>,
+    cache_total_items: usize,
+    cache_item_offset: usize,
     device: B::Device,
     augment: Option<SpectrumAugmentationConfig>,
     similarity_teacher: SimilarityTeacherConfig,
@@ -385,10 +391,15 @@ where
             progress: self.progress.clone(),
             batch_size: self.batch_size,
             max_batches: self.max_batches,
+            epoch_items: self.epoch_items,
             start_item: self.start_item,
             window_items: self.window_items,
-            prefetch_windows: self.prefetch_windows,
+            loader_workers: self.loader_workers,
+            host_prefetch_windows: self.host_prefetch_windows,
+            loader_profile_every: self.loader_profile_every,
             preprocessed_cache_path: self.preprocessed_cache_path.clone(),
+            cache_total_items: self.cache_total_items,
+            cache_item_offset: self.cache_item_offset,
             device: self.device.clone(),
             augment: self.augment,
             similarity_teacher: self.similarity_teacher,
@@ -406,18 +417,25 @@ where
     fn new(
         options: StreamingLoaderOptions<B>,
         preprocessed_cache_path: Option<PathBuf>,
-        prefetch_windows: usize,
+        loader_config: StreamingTrainingLoaderConfig,
         open_records: Open,
     ) -> Self {
+        let epoch_items = loader_epoch_items(options.batch_size, options.max_batches);
+        let cache_total_items = epoch_items;
         Self {
             mgf_source: options.mgf_source,
             progress: options.progress,
             batch_size: options.batch_size,
             max_batches: options.max_batches,
+            epoch_items,
             start_item: options.start_item,
             window_items: options.window_items,
-            prefetch_windows,
+            loader_workers: loader_config.loader_workers,
+            host_prefetch_windows: loader_config.host_prefetch_windows,
+            loader_profile_every: loader_config.loader_profile_every,
             preprocessed_cache_path,
+            cache_total_items,
+            cache_item_offset: 0,
             device: options.device,
             augment: options.augment,
             similarity_teacher: options.similarity_teacher,
@@ -437,7 +455,7 @@ where
         let Some(path) = &self.preprocessed_cache_path else {
             return;
         };
-        let total_items = loader_epoch_items(self.batch_size, self.max_batches);
+        let total_items = self.cache_total_items;
         let refresh = bool_var("GEMS_FLAT_PREPROCESSED_CACHE_REFRESH", false);
 
         if !refresh && path.try_exists().unwrap_or(false) {
@@ -470,45 +488,6 @@ where
             .expect("flat disk cache metadata lock should not be poisoned") = Some(metadata);
     }
 
-    fn load_flat_cpu_window(
-        &self,
-        start_item: usize,
-        target_items: usize,
-        transfer_bar: Option<&ProgressBar>,
-    ) -> Option<FlatCpuCache> {
-        let total_items = loader_epoch_items(self.batch_size, self.max_batches);
-        if let Some(path) = &self.preprocessed_cache_path
-            && !bool_var("GEMS_FLAT_PREPROCESSED_CACHE_REFRESH", false)
-            && path.try_exists().unwrap_or(false)
-        {
-            let metadata = self
-                .flat_cache_file_meta(path, total_items)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "invalid preprocessed flat cache {}: {error}",
-                        path.display()
-                    )
-                });
-            return Some(
-                read_flat_cpu_cache_window_file(
-                    &metadata,
-                    start_item,
-                    target_items,
-                    format!("{} disk", self.progress.label),
-                    transfer_bar,
-                    true,
-                )
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "failed to read preprocessed flat cache window {}: {error}",
-                        path.display()
-                    )
-                }),
-            );
-        }
-        None
-    }
-
     fn flat_cache_file_meta(
         &self,
         path: &Path,
@@ -531,33 +510,57 @@ where
         Ok(metadata)
     }
 
-    fn disk_prefetcher(&self, start_item: usize) -> Option<FlatCpuWindowPrefetcher> {
-        let path = self.preprocessed_cache_path.as_ref()?;
+    fn flat_host_window_stream(&self) -> OrderedHostWindowStream<FlatHostWindow> {
+        let path = self.preprocessed_cache_path.as_ref().unwrap_or_else(|| {
+            panic!(
+                "flat host-worker loading requires GEMS_FLAT_PREPROCESSED_CACHE=1 for {}",
+                self.mgf_source
+            )
+        });
         if bool_var("GEMS_FLAT_PREPROCESSED_CACHE_REFRESH", false)
             || !path.try_exists().unwrap_or(false)
         {
-            return None;
+            panic!(
+                "preprocessed flat cache {} is unavailable; it should have been prepared before iteration",
+                path.display()
+            );
         }
-        let total_items = loader_epoch_items(self.batch_size, self.max_batches);
-        if start_item >= total_items {
-            return None;
-        }
+        let total_items = self.epoch_items;
         let metadata = self
-            .flat_cache_file_meta(path, total_items)
+            .flat_cache_file_meta(path, self.cache_total_items)
             .unwrap_or_else(|error| {
                 panic!(
                     "invalid preprocessed flat cache {}: {error}",
                     path.display()
                 )
             });
-        Some(FlatCpuWindowPrefetcher::new(
-            metadata,
-            start_item,
-            total_items,
-            self.window_items,
-            self.prefetch_windows,
-            format!("{} disk", self.progress.label),
-        ))
+        let plans = host_window_plan(total_items, self.window_items);
+        let cache_item_offset = self.cache_item_offset;
+        let similarity_teacher = self.similarity_teacher;
+        let progress = self.progress.clone();
+        let batch_size = self.batch_size;
+        let max_batches = self.max_batches;
+        let epoch_items = self.epoch_items;
+        let prefix = format!("{} disk", self.progress.label);
+
+        spawn_ordered_host_workers(
+            plans,
+            self.loader_workers,
+            self.host_prefetch_windows,
+            move |_worker_id, plan| {
+                build_flat_host_window(
+                    &metadata,
+                    cache_item_offset,
+                    plan,
+                    similarity_teacher,
+                    &progress,
+                    batch_size,
+                    max_batches,
+                    epoch_items,
+                    &prefix,
+                )
+            },
+        )
     }
 
     fn write_flat_cpu_cache_file_streaming(
@@ -750,35 +753,22 @@ where
         })
     }
 
-    fn move_flat_cache_window_to_gpu(
+    fn move_flat_host_window_to_gpu(
         &self,
-        cpu_cache: &FlatCpuCache,
-        start_item: usize,
-        target_items: usize,
+        host_window: &FlatHostWindow,
         transfer_bar: Option<&ProgressBar>,
     ) -> FlatGpuCache<B> {
-        move_flat_cache_window_to_gpu(
-            cpu_cache,
-            start_item,
-            target_items,
-            self.batch_size,
-            &self.device,
-            self.similarity_teacher,
-            transfer_bar,
-        )
+        move_flat_cache_window_to_gpu(host_window, self.batch_size, &self.device, transfer_bar)
     }
 }
 
 fn move_flat_cache_window_to_gpu<B: Backend>(
-    cpu_cache: &FlatCpuCache,
-    start_item: usize,
-    target_items: usize,
+    host_window: &FlatHostWindow,
     batch_size: usize,
     device: &B::Device,
-    similarity_teacher: SimilarityTeacherConfig,
     transfer_bar: Option<&ProgressBar>,
 ) -> FlatGpuCache<B> {
-    let items = target_items.min(cpu_cache.items.saturating_sub(start_item));
+    let items = host_window.items;
     if items == 0 {
         return FlatGpuCache {
             chunks: Vec::new(),
@@ -788,22 +778,21 @@ fn move_flat_cache_window_to_gpu<B: Backend>(
     let chunk_items = gpu_transfer_chunk_items(batch_size, items);
     let chunk_count = items.div_ceil(chunk_items);
     let mut chunks = Vec::with_capacity(chunk_count);
-    let end_item = start_item + items;
 
-    for (chunk_index, start) in (start_item..end_item).step_by(chunk_items).enumerate() {
-        let end = (start + chunk_items).min(end_item);
+    for (chunk_index, start) in (0..items).step_by(chunk_items).enumerate() {
+        let end = (start + chunk_items).min(items);
         let chunk_len = end - start;
         let chunk_label = format!("{}/{}", chunk_index + 1, chunk_count);
 
         if let Some(bar) = transfer_bar {
             bar.set_message(format!("moving spectra chunk {chunk_label} to GPU"));
         }
-        let spectra_start = start * cpu_cache.spectrum_width;
-        let spectra_end = end * cpu_cache.spectrum_width;
+        let spectra_start = start * host_window.spectrum_width;
+        let spectra_end = end * host_window.spectrum_width;
         let spectra = Tensor::<B, 2>::from_data(
             TensorData::new(
-                cpu_cache.spectra[spectra_start..spectra_end].to_vec(),
-                [chunk_len, cpu_cache.spectrum_width],
+                host_window.spectra[spectra_start..spectra_end].to_vec(),
+                [chunk_len, host_window.spectrum_width],
             ),
             device,
         );
@@ -811,42 +800,30 @@ fn move_flat_cache_window_to_gpu<B: Backend>(
             bar.inc(chunk_len as u64);
             bar.set_message(format!("moving condition chunk {chunk_label} to GPU"));
         }
-        let conditions_start = start * cpu_cache.condition_width;
-        let conditions_end = end * cpu_cache.condition_width;
+        let conditions_start = start * host_window.condition_width;
+        let conditions_end = end * host_window.condition_width;
         let conditions = Tensor::<B, 2>::from_data(
             TensorData::new(
-                cpu_cache.conditions[conditions_start..conditions_end].to_vec(),
-                [chunk_len, cpu_cache.condition_width],
+                host_window.conditions[conditions_start..conditions_end].to_vec(),
+                [chunk_len, host_window.condition_width],
             ),
             device,
         );
         if let Some(bar) = transfer_bar {
             bar.inc(chunk_len as u64);
         }
-        let teacher_gpu = similarity_teacher
-            .enabled()
-            .then(|| {
-                if let Some(bar) = transfer_bar {
-                    bar.set_message(format!("moving teacher chunk {chunk_label} to GPU"));
-                }
-                let teacher = teacher_spectra_cache_from_target_pairs(
-                    similarity_teacher,
-                    &cpu_cache.spectra[spectra_start..spectra_end],
-                    &cpu_cache.conditions[conditions_start..conditions_end],
-                    chunk_len,
-                    cpu_cache.spectrum_width,
-                    cpu_cache.condition_width,
-                    None,
-                );
-                let cache = TeacherGpuCache::from_cpu_window(&teacher, 0, chunk_len, device);
-                if cache.is_some()
-                    && let Some(bar) = transfer_bar
-                {
-                    bar.inc(chunk_len as u64);
-                }
-                cache
-            })
-            .flatten();
+        let teacher_gpu = host_window.teacher.as_ref().and_then(|teacher| {
+            if let Some(bar) = transfer_bar {
+                bar.set_message(format!("moving teacher chunk {chunk_label} to GPU"));
+            }
+            let cache = TeacherGpuCache::from_cpu_window(teacher, start, end, device);
+            if cache.is_some()
+                && let Some(bar) = transfer_bar
+            {
+                bar.inc(chunk_len as u64);
+            }
+            cache
+        });
 
         chunks.push(FlatGpuCacheChunk {
             spectra,
@@ -894,42 +871,27 @@ where
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn iter<'a>(&'a self) -> Box<dyn DataLoaderIterator<AutoencoderBatch<B>> + 'a> {
-        self.progress
-            .start_epoch(loader_epoch_items(self.batch_size, self.max_batches));
+        self.progress.start_epoch(self.epoch_items);
         let epoch_index = self.pair_sampling_epoch.next();
-
-        if let Some(cpu_prefetcher) = self.disk_prefetcher(0) {
-            return Box::new(StreamingVectorizedMgfIter {
-                loader: self,
-                records: None,
-                cache: None,
-                cpu_prefetcher: Some(cpu_prefetcher),
-                cache_offset: 0,
-                batches_processed: 0,
-                items_processed: 0,
-                epoch_index,
-                finished: false,
-            });
-        }
-
-        let mut records = open_records_or_panic(&self.open_records, "vectorized", &self.mgf_source);
-        skip_split_records(&mut records, self.start_item, &self.progress, None);
 
         Box::new(StreamingVectorizedMgfIter {
             loader: self,
-            records: Some(records),
+            host_windows: self.flat_host_window_stream(),
             cache: None,
-            cpu_prefetcher: None,
             cache_offset: 0,
             batches_processed: 0,
             items_processed: 0,
             epoch_index,
+            profile: LoaderProfileAccumulator::new(
+                format!("{} flat", self.progress.label),
+                self.loader_profile_every,
+            ),
             finished: false,
         })
     }
 
     fn num_items(&self) -> usize {
-        loader_epoch_items(self.batch_size, self.max_batches)
+        self.epoch_items
     }
 
     fn to_device(&self, device: &B::Device) -> Arc<dyn DataLoader<B, AutoencoderBatch<B>>> {
@@ -940,14 +902,18 @@ where
     }
 
     fn slice(&self, start: usize, end: usize) -> Arc<dyn DataLoader<B, AutoencoderBatch<B>>> {
-        let start_batch = start / self.batch_size;
-        let end_batch = end.div_ceil(self.batch_size);
+        let start_item = start.min(self.epoch_items);
+        let end_item = end.min(self.epoch_items).max(start_item);
+        let epoch_items = end_item - start_item;
+        let max_batches = epoch_items.div_ceil(self.batch_size);
+        let mut progress = self.progress.clone_for_slice();
+        progress.max_batches = max_batches;
         Arc::new(Self {
-            max_batches: end_batch.saturating_sub(start_batch),
-            start_item: self.start_item + start_batch * self.batch_size,
-            preprocessed_cache_path: None,
-            disk_cache: Arc::new(Mutex::new(None)),
-            progress: self.progress.clone_for_slice(),
+            max_batches,
+            epoch_items,
+            start_item: self.start_item + start_item,
+            cache_item_offset: self.cache_item_offset + start_item,
+            progress,
             ..self.clone()
         })
     }
@@ -959,6 +925,85 @@ struct FlatCpuCache {
     items: usize,
     spectrum_width: usize,
     condition_width: usize,
+}
+
+struct FlatHostWindow {
+    spectra: Vec<f32>,
+    conditions: Vec<f32>,
+    teacher: Option<Arc<TeacherSpectraCache>>,
+    profile: LoaderWindowProfile,
+    items: usize,
+    spectrum_width: usize,
+    condition_width: usize,
+}
+
+fn build_flat_host_window(
+    metadata: &FlatCacheFileMeta,
+    cache_item_offset: usize,
+    plan: HostWindowPlan,
+    similarity_teacher: SimilarityTeacherConfig,
+    progress: &LoaderProgress,
+    batch_size: usize,
+    max_batches: usize,
+    epoch_items: usize,
+    prefix: &str,
+) -> Result<FlatHostWindow, LoaderWorkerError> {
+    let producer_start = Instant::now();
+    let disk_start = Instant::now();
+    let cache = read_flat_cpu_cache_window_file(
+        metadata,
+        cache_item_offset + plan.start_item,
+        plan.items,
+        prefix.to_string(),
+        None,
+        false,
+    )?;
+    let disk_read = disk_start.elapsed();
+    if cache.items != plan.items {
+        return Err(LoaderWorkerError::new(format!(
+            "flat cache ended after {} items for planned {}-item window at {}",
+            cache.items, plan.items, plan.start_item
+        )));
+    }
+
+    let host_pack_start = Instant::now();
+    progress.cache_filling(
+        plan.start_item + cache.items,
+        epoch_items,
+        (plan.start_item + cache.items).div_ceil(batch_size),
+        max_batches,
+    );
+    let host_pack = host_pack_start.elapsed();
+
+    let teacher_start = Instant::now();
+    let teacher = similarity_teacher.enabled().then(|| {
+        Arc::new(teacher_spectra_cache_from_target_pairs(
+            similarity_teacher,
+            &cache.spectra,
+            &cache.conditions,
+            cache.items,
+            cache.spectrum_width,
+            cache.condition_width,
+            None,
+        ))
+    });
+    let teacher_build = teacher_start.elapsed();
+
+    Ok(FlatHostWindow {
+        spectra: cache.spectra,
+        conditions: cache.conditions,
+        teacher,
+        profile: LoaderWindowProfile {
+            disk_read,
+            host_pack,
+            teacher_build,
+            producer_total: producer_start.elapsed(),
+            ..LoaderWindowProfile::default()
+        },
+        items: cache.items,
+        spectrum_width: cache.spectrum_width,
+        condition_width: cache.condition_width,
+    })
 }
 
 #[derive(Clone)]
@@ -1189,84 +1234,18 @@ impl<B: Backend> FlatGpuCache<B> {
     }
 }
 
-struct FlatCpuWindowPrefetcher {
-    receiver: Receiver<io::Result<FlatCpuCache>>,
-    _join: JoinHandle<()>,
-}
-
-impl FlatCpuWindowPrefetcher {
-    fn new(
-        metadata: FlatCacheFileMeta,
-        start_item: usize,
-        total_items: usize,
-        window_items: usize,
-        prefetch_windows: usize,
-        prefix: String,
-    ) -> Self {
-        let (sender, receiver) = mpsc::sync_channel(prefetch_windows.max(1));
-        let _join = thread::spawn(move || {
-            prefetch_flat_cpu_windows(
-                sender,
-                metadata,
-                start_item,
-                total_items,
-                window_items,
-                prefix,
-            );
-        });
-        Self { receiver, _join }
-    }
-
-    fn next_window(&self) -> Option<FlatCpuCache> {
-        match self.receiver.recv() {
-            Ok(Ok(cache)) => Some(cache),
-            Ok(Err(error)) => {
-                panic!("failed to prefetch flat vector cache window: {error}");
-            }
-            Err(_) => None,
-        }
-    }
-}
-
-fn prefetch_flat_cpu_windows(
-    sender: SyncSender<io::Result<FlatCpuCache>>,
-    metadata: FlatCacheFileMeta,
-    start_item: usize,
-    total_items: usize,
-    window_items: usize,
-    prefix: String,
-) {
-    let mut offset = start_item;
-    while offset < total_items {
-        let target_items = window_items.min(total_items - offset);
-        let result = read_flat_cpu_cache_window_file(
-            &metadata,
-            offset,
-            target_items,
-            prefix.clone(),
-            None,
-            false,
-        );
-        let done = result.as_ref().is_err() || target_items == 0;
-        if sender.send(result).is_err() || done {
-            break;
-        }
-        offset += target_items;
-    }
-}
-
 struct StreamingVectorizedMgfIter<'a, B, Open>
 where
     B: Backend,
 {
     loader: &'a StreamingVectorizedMgfLoader<B, Open>,
-    records: Option<VectorizedMgfIter>,
+    host_windows: OrderedHostWindowStream<FlatHostWindow>,
     cache: Option<FlatGpuCache<B>>,
-    cpu_prefetcher: Option<FlatCpuWindowPrefetcher>,
     cache_offset: usize,
     batches_processed: usize,
     items_processed: usize,
     epoch_index: u64,
+    profile: LoaderProfileAccumulator,
     finished: bool,
 }
 
@@ -1395,44 +1374,30 @@ where
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn fill_cache(&mut self) -> Option<FlatGpuCache<B>> {
-        let remaining_items = loader_epoch_items(self.loader.batch_size, self.loader.max_batches)
-            .saturating_sub(self.items_processed);
+        let remaining_items = self.loader.epoch_items.saturating_sub(self.items_processed);
         let target_items = self.loader.window_items.min(remaining_items);
         if target_items == 0 {
             return None;
         }
 
-        if let Some(prefetcher) = &self.cpu_prefetcher
-            && let Some(cpu_cache) = prefetcher.next_window()
-        {
-            return Some(self.loader.move_flat_cache_window_to_gpu(
-                &cpu_cache,
-                0,
-                cpu_cache.items,
-                None,
-            ));
+        let wait_start = Instant::now();
+        let host_window = self.host_windows.next_window("flat vector");
+        let wait = wait_start.elapsed();
+        let host_window = host_window?;
+        if host_window.items > target_items {
+            panic!(
+                "flat host worker produced {} items for a {}-item target window",
+                host_window.items, target_items
+            );
         }
 
-        if let Some(cpu_cache) =
-            self.loader
-                .load_flat_cpu_window(self.items_processed, target_items, None)
-        {
-            return Some(self.loader.move_flat_cache_window_to_gpu(
-                &cpu_cache,
-                0,
-                cpu_cache.items,
-                None,
-            ));
-        }
-
-        let records = self.records.as_mut()?;
-        let cpu_cache =
-            self.loader
-                .read_flat_cpu_cache(records, target_items, self.batches_processed, None)?;
-        Some(
-            self.loader
-                .move_flat_cache_window_to_gpu(&cpu_cache, 0, cpu_cache.items, None),
-        )
+        let mut profile = host_window.profile;
+        profile.wait = wait;
+        let upload_start = Instant::now();
+        let gpu_cache = self.loader.move_flat_host_window_to_gpu(&host_window, None);
+        profile.tensor_upload = upload_start.elapsed();
+        self.profile.record(profile);
+        Some(gpu_cache)
     }
 
     fn finish(&mut self) {
@@ -1453,7 +1418,7 @@ where
     fn progress(&self) -> Progress {
         Progress {
             items_processed: self.items_processed,
-            items_total: loader_epoch_items(self.loader.batch_size, self.loader.max_batches),
+            items_total: self.loader.epoch_items,
         }
     }
 }
@@ -1520,4 +1485,49 @@ fn usize_list_var(name: &str, default: &[usize]) -> Result<Vec<usize>, Box<dyn S
         values.push(width);
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn flat_cache_range_read_preserves_spectra_and_conditions() {
+        let path = temp_cache_path("flat-range", "saefc");
+        {
+            let mut writer = BufWriter::new(fs::File::create(&path).expect("create flat cache"));
+            writer.write_all(FLAT_CACHE_MAGIC).expect("write magic");
+            write_u32(&mut writer, FLAT_CACHE_VERSION).expect("write version");
+            write_u64(&mut writer, 3).expect("write items");
+            write_u64(&mut writer, 2).expect("write spectrum width");
+            write_u64(&mut writer, 2).expect("write condition width");
+            write_f32_slice_untracked(&mut writer, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                .expect("write spectra");
+            write_f32_slice_untracked(&mut writer, &[10.0, 11.0, 12.0, 13.0, 14.0, 15.0])
+                .expect("write conditions");
+            writer.flush().expect("flush flat cache");
+        }
+
+        let metadata = read_flat_cache_file_meta(&path, 3).expect("read metadata");
+        let window =
+            read_flat_cpu_cache_window_file(&metadata, 1, 2, "test".to_string(), None, false)
+                .expect("read range");
+        assert_eq!(window.items, 2);
+        assert_eq!(window.spectra, vec![3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(window.conditions, vec![12.0, 13.0, 14.0, 15.0]);
+        fs::remove_file(path).ok();
+    }
+
+    fn temp_cache_path(label: &str, extension: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after epoch")
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "spectral-autoencoder-{label}-{}-{nanos}.{extension}",
+            std::process::id()
+        ))
+    }
 }
