@@ -65,6 +65,7 @@ vectorization and stream fixed-size GPU windows from disk.
 Run the flat-vector model:
 
 ```bash
+RUSTFLAGS="-C target-cpu=native" \
 GEMS_RUN_DIR=runs/gems-a10-top128-flat-window16-bs4096-10epoch \
 GEMS_GPU_WINDOW_BATCHES=16 \
 GEMS_PREFETCH_WINDOWS=2 \
@@ -78,6 +79,7 @@ cargo run --release --example train_gems_flat --no-default-features --features s
 Run the peak-set model:
 
 ```bash
+RUSTFLAGS="-C target-cpu=native" \
 GEMS_RUN_DIR=runs/gems-a10-top128-peak-window16-bs128-5epoch \
 GEMS_GPU_WINDOW_BATCHES=16 \
 GEMS_PREFETCH_WINDOWS=2 \
@@ -95,6 +97,7 @@ GeMS examples write Burn checkpoints by default under `GEMS_RUN_DIR/checkpoint`.
 Resume a checkpointed run:
 
 ```bash
+RUSTFLAGS="-C target-cpu=native" \
 GEMS_RUN_DIR=runs/gems-a10-top128-flat-window16-bs4096-10epoch \
 GEMS_RESUME_EPOCH=10 \
 GEMS_EPOCHS=20 \
