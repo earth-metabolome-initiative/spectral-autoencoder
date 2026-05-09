@@ -23,16 +23,16 @@
     </g>
     <style>
       .bg { fill: #f8fafc; }
-      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 18; }
-      .card { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; rx: 14; }
-      .inputBox { fill: #dbeafe; stroke: #93c5fd; stroke-width: 2; rx: 16; }
-      .augmentBox { fill: #ffedd5; stroke: #fdba74; stroke-width: 2; rx: 16; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .card { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .inputBox { fill: #dbeafe; stroke: #93c5fd; stroke-width: 2; }
+      .augmentBox { fill: #ffedd5; stroke: #fdba74; stroke-width: 2; }
       .encoderShape { fill: #e0e7ff; stroke: #a5b4fc; stroke-width: 3; }
       .embeddingHex { fill: #fef3c7; stroke: #fbbf24; stroke-width: 3; stroke-linejoin: round; }
       .decoderShape { fill: #dcfce7; stroke: #86efac; stroke-width: 3; }
-      .targetBox { fill: #f0fdf4; stroke: #bbf7d0; stroke-width: 2; rx: 16; }
-      .totalBox { fill: #e2e8f0; stroke: #cbd5e1; stroke-width: 2; rx: 16; }
-      .chip { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; rx: 8; }
+      .targetBox { fill: #f0fdf4; stroke: #bbf7d0; stroke-width: 2; }
+      .totalBox { fill: #e2e8f0; stroke: #cbd5e1; stroke-width: 2; }
+      .chip { fill: #f8fafc; stroke: #cbd5e1; stroke-width: 1.5; }
       .heading { font: 700 34px Inter, Arial, sans-serif; fill: #0f172a; }
       .subheading { font: 700 22px Inter, Arial, sans-serif; fill: #1e293b; }
       .label { font: 700 17px Inter, Arial, sans-serif; fill: #1e293b; }
@@ -54,10 +54,10 @@
   <text x="70" y="70" class="heading">MS/MS Spectral Autoencoder</text>
   <text x="70" y="104" class="small">Corruption is applied only to the encoder input. Decoder targets remain the cleaned spectrum and precursor.</text>
 
-  <rect x="55" y="130" width="1490" height="365" class="panel" filter="url(#shadow)"/>
+  <rect x="55" y="130" width="1490" height="365" rx="18" class="panel" filter="url(#shadow)"/>
   <text x="85" y="168" class="subheading">Model Path</text>
 
-  <rect x="85" y="205" width="205" height="225" class="inputBox"/>
+  <rect x="85" y="205" width="205" height="225" rx="16" class="inputBox"/>
   <text x="188" y="242" class="label" text-anchor="middle">Clean spectrum</text>
   <text x="188" y="272" class="small" text-anchor="middle">top-N peaks</text>
   <text x="188" y="296" class="small" text-anchor="middle">+ precursor m/z</text>
@@ -68,7 +68,7 @@
   <line x1="246" y1="382" x2="246" y2="350" class="peakTarget"/>
   <line x1="116" y1="382" x2="260" y2="382" stroke="#334155" stroke-width="2"/>
 
-  <rect x="345" y="205" width="225" height="225" class="augmentBox"/>
+  <rect x="345" y="205" width="225" height="225" rx="16" class="augmentBox"/>
   <text x="458" y="242" class="label" text-anchor="middle">Input corruption</text>
   <text x="458" y="272" class="small" text-anchor="middle">mask peaks</text>
   <text x="458" y="296" class="small" text-anchor="middle">mask precursor</text>
@@ -105,7 +105,7 @@
   <text x="1242" y="340" class="small" text-anchor="middle">set decoder</text>
   <text x="1242" y="378" class="small" text-anchor="middle">reconstructs clean output</text>
 
-  <rect x="1416" y="205" width="105" height="225" class="targetBox"/>
+  <rect x="1416" y="205" width="105" height="225" rx="16" class="targetBox"/>
   <text x="1469" y="242" class="label" text-anchor="middle">Target</text>
   <line x1="1445" y1="365" x2="1445" y2="318" class="peakTarget"/>
   <line x1="1465" y1="365" x2="1465" y2="296" class="peakTarget"/>
@@ -120,13 +120,13 @@
   <path d="M 1091 318 H 1123" class="arrow"/>
   <path d="M 1361 318 H 1416" class="arrow"/>
 
-  <rect x="55" y="520" width="1490" height="450" class="panel" filter="url(#shadow)"/>
+  <rect x="55" y="520" width="1490" height="450" rx="18" class="panel" filter="url(#shadow)"/>
   <text x="85" y="580" class="subheading">Training Objectives</text>
   <text x="85" y="610" class="small">Losses and latent-noise training act on the same encoder, latent space, and decoder.</text>
 
   <g transform="translate(-15 -20)">
   <g transform="translate(30 0)">
-  <rect x="85" y="645" width="230" height="220" class="card"/>
+  <rect x="85" y="645" width="230" height="220" rx="14" class="card"/>
   <text x="200" y="682" class="label" text-anchor="middle">Reconstruction</text>
   <text x="200" y="712" class="small" text-anchor="middle">clean spectrum</text>
   <text x="200" y="736" class="small" text-anchor="middle">and precursor m/z</text>
@@ -205,7 +205,7 @@
   </g>
 
   <g transform="translate(71 0)">
-  <rect x="330" y="645" width="210" height="220" class="card"/>
+  <rect x="330" y="645" width="210" height="220" rx="14" class="card"/>
   <text x="435" y="682" class="label" text-anchor="middle">Latent stability</text>
   <text x="435" y="712" class="small" text-anchor="middle">decode embedding plus noise</text>
   <text x="435" y="736" class="small" text-anchor="middle">against clean target</text>
@@ -222,7 +222,7 @@
   </g>
 
   <g transform="translate(112 0)">
-  <rect x="555" y="645" width="225" height="220" class="card"/>
+  <rect x="555" y="645" width="225" height="220" rx="14" class="card"/>
   <text x="668" y="682" class="label" text-anchor="middle">Masked prediction</text>
   <text x="668" y="712" class="small" text-anchor="middle">recover hidden peaks</text>
   <text x="668" y="736" class="small" text-anchor="middle">and hidden precursor</text>
@@ -323,7 +323,7 @@
   </g>
 
   <g transform="translate(-72 0)">
-  <rect x="1020" y="645" width="210" height="220" class="card"/>
+  <rect x="1020" y="645" width="210" height="220" rx="14" class="card"/>
   <text x="1125" y="682" class="label" text-anchor="middle">Intruder detection</text>
   <text x="1125" y="712" class="small" text-anchor="middle">identify synthetic</text>
   <text x="1125" y="736" class="small" text-anchor="middle">peaks in the input</text>
@@ -375,7 +375,7 @@
   </svg>
 
   <g transform="translate(41 0)">
-  <rect x="1245" y="645" width="300" height="220" class="card"/>
+  <rect x="1245" y="645" width="300" height="220" rx="14" class="card"/>
   <text x="1395" y="682" class="label" text-anchor="middle">Similarity-order hinge</text>
   <text x="1395" y="712" class="small" text-anchor="middle">s is linear cosine or</text>
   <text x="1395" y="736" class="small" text-anchor="middle">modified linear cosine</text>
@@ -560,7 +560,7 @@
   <path d="M 800 890 H 1364" class="bus"/>
   <path d="M 800 890 V 910" class="softArrow"/>
 
-  <rect x="635" y="910" width="330" height="55" class="totalBox"/>
+  <rect x="635" y="910" width="330" height="55" rx="16" class="totalBox"/>
   <text x="670" y="944" class="label">Total loss</text>
   <svg class="formulaSvg" x="775" y="925" width="150" height="35" viewBox="-69.698634 -69.011212 58.203879 22.274592" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
 <defs>
