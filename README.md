@@ -1,5 +1,10 @@
 # spectral-autoencoder
 
+[![CI](https://github.com/earth-metabolome-initiative/spectral-autoencoder/actions/workflows/ci.yml/badge.svg)](https://github.com/earth-metabolome-initiative/spectral-autoencoder/actions/workflows/ci.yml)
+[![Codecov](https://codecov.io/gh/earth-metabolome-initiative/spectral-autoencoder/branch/main/graph/badge.svg)](https://codecov.io/gh/earth-metabolome-initiative/spectral-autoencoder)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust 2024](https://img.shields.io/badge/rust-2024-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
+
 MS/MS spectrum autoencoders built with [Burn](https://burn.dev/).
 
 The crate includes MGF ingestion, spectrum preprocessing, metadata conditioning,
