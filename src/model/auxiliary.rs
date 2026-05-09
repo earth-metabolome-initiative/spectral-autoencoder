@@ -43,7 +43,7 @@ impl Default for AuxiliaryLossConfig {
     fn default() -> Self {
         Self {
             reconstruction_weight: 1.0,
-            masked_peak_weight: 0.25,
+            masked_peak_weight: 0.1,
             intruder_peak_weight: 0.05,
             precursor_reconstruction_weight: 0.05,
             masked_precursor_weight: 0.05,

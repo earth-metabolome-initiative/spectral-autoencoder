@@ -653,7 +653,7 @@ mod tests {
         );
         assert_eq!(config.regularization.l1, 0.0);
         assert_eq!(config.regularization.l2, 0.0);
-        assert_eq!(config.auxiliary.masked_peak_weight, 0.25);
+        assert_eq!(config.auxiliary.masked_peak_weight, 0.1);
         assert_eq!(config.auxiliary.intruder_peak_weight, 0.05);
         assert_eq!(config.auxiliary.masked_precursor_weight, 0.05);
         assert_eq!(config.auxiliary.similarity_ranking_weight, 0.05);
