@@ -5,6 +5,8 @@ MS/MS spectrum autoencoders built with [Burn](https://burn.dev/).
 The crate includes MGF ingestion, spectrum preprocessing, metadata conditioning,
 Burn models, training metrics, and GeMS-A10 training examples.
 
+![MS/MS spectral autoencoder overview](https://raw.githubusercontent.com/earth-metabolome-initiative/spectral-autoencoder/main/assets/autoencoder-overview.svg)
+
 ## Data
 
 The models operate on cleaned top-N MS/MS peak lists, not binned spectra. The
