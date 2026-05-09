@@ -27,7 +27,7 @@ fn default_precursor_mz_scale() -> f64 {
 #[cfg(feature = "train")]
 use crate::{
     model::auxiliary::{
-        apply_latent_noise, weighted_cosine_distance_loss, weighted_intruder_detection_loss,
+        apply_latent_noise, weighted_intruder_detection_loss,
         weighted_masked_precursor_reconstruction_output, weighted_precursor_reconstruction_output,
         weighted_similarity_ranking_output,
     },
@@ -127,7 +127,7 @@ pub struct SpectralAutoencoderConfig {
     /// L1/L2 model-parameter regularization.
     #[serde(default)]
     pub regularization: RegularizationConfig,
-    /// Auxiliary denoising, consistency, intruder, and similarity-ranking objectives.
+    /// Auxiliary denoising, intruder, precursor, and similarity-ranking objectives.
     #[serde(default)]
     pub auxiliary: AuxiliaryLossConfig,
 }
@@ -254,7 +254,6 @@ impl SpectralAutoencoderConfig {
             regularization_l2: self.regularization.l2,
             reconstruction_weight: self.auxiliary.reconstruction_weight,
             masked_peak_weight: self.auxiliary.masked_peak_weight,
-            consistency_weight: self.auxiliary.consistency_weight,
             intruder_peak_weight: self.auxiliary.intruder_peak_weight,
             precursor_reconstruction_weight: self.auxiliary.precursor_reconstruction_weight,
             masked_precursor_weight: self.auxiliary.masked_precursor_weight,
@@ -367,7 +366,6 @@ pub struct SpectralAutoencoder<B: Backend> {
     regularization_l2: f64,
     reconstruction_weight: f64,
     masked_peak_weight: f64,
-    consistency_weight: f64,
     intruder_peak_weight: f64,
     precursor_reconstruction_weight: f64,
     masked_precursor_weight: f64,
@@ -506,15 +504,6 @@ impl<B: Backend> SpectralAutoencoder<B> {
             (reconstruction, Tensor::zeros([1], &device))
         };
         let (reconstruction, masked) = masked;
-        let consistency = weighted_cosine_distance_loss(
-            output.latent.clone(),
-            || {
-                self.encoder
-                    .forward(batch.consistency_spectra, batch.consistency_conditions)
-            },
-            self.consistency_weight,
-            &device,
-        );
         let intruder = weighted_intruder_detection_loss(
             &self.auxiliary_heads,
             output.latent.clone(),
@@ -553,7 +542,6 @@ impl<B: Backend> SpectralAutoencoder<B> {
         let losses = AutoencoderLossBreakdown {
             reconstruction,
             masked,
-            consistency,
             intruder,
             precursor: precursor.loss,
             masked_precursor: masked_precursor.loss,
@@ -666,7 +654,6 @@ mod tests {
         assert_eq!(config.regularization.l1, 0.0);
         assert_eq!(config.regularization.l2, 0.0);
         assert_eq!(config.auxiliary.masked_peak_weight, 0.25);
-        assert_eq!(config.auxiliary.consistency_weight, 0.05);
         assert_eq!(config.auxiliary.intruder_peak_weight, 0.05);
         assert_eq!(config.auxiliary.masked_precursor_weight, 0.05);
         assert_eq!(config.auxiliary.similarity_ranking_weight, 0.05);

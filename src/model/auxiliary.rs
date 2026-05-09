@@ -16,8 +16,6 @@ pub struct AuxiliaryLossConfig {
     pub reconstruction_weight: f64,
     /// Extra weight on reconstructing masked or dropped spectral inputs.
     pub masked_peak_weight: f64,
-    /// Weight for keeping two augmented views close in latent space.
-    pub consistency_weight: f64,
     /// Weight for detecting synthetic intruder peaks inserted into input spectra.
     pub intruder_peak_weight: f64,
     /// Weight for reconstructing precursor m/z and its presence flag.
@@ -46,7 +44,6 @@ impl Default for AuxiliaryLossConfig {
         Self {
             reconstruction_weight: 1.0,
             masked_peak_weight: 0.25,
-            consistency_weight: 0.05,
             intruder_peak_weight: 0.05,
             precursor_reconstruction_weight: 0.05,
             masked_precursor_weight: 0.05,
@@ -151,17 +148,6 @@ impl<B: Backend> SimilarityRankingBatch<B> {
     }
 }
 
-/// Cosine distance between two augmented views of the same embeddings.
-pub fn cosine_distance_loss<B: Backend>(left: Tensor<B, 2>, right: Tensor<B, 2>) -> Tensor<B, 1> {
-    let numerator = (left.clone() * right.clone()).sum_dim(1);
-    let left_norm = (left.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
-    let right_norm = (right.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
-    let similarity = (numerator / (left_norm * right_norm))
-        .clamp_min(-1.0)
-        .clamp_max(1.0);
-    (similarity * -1.0 + 1.0).mean()
-}
-
 /// Applies mild Gaussian denoising noise to the decoder-side latent input.
 ///
 /// The noise scale is relative to the current batch latent standard deviation,
@@ -191,23 +177,6 @@ pub fn apply_latent_noise<B: Backend>(latent: Tensor<B, 2>, std_fraction: f64) -
     );
 
     latent + noise * scale
-}
-
-/// Weighted cosine distance, or zero when the weight is disabled.
-pub fn weighted_cosine_distance_loss<B: Backend, F>(
-    left: Tensor<B, 2>,
-    right: F,
-    weight: f64,
-    device: &B::Device,
-) -> Tensor<B, 1>
-where
-    F: FnOnce() -> Tensor<B, 2>,
-{
-    if weight > 0.0 {
-        cosine_distance_loss(left, right()) * weight
-    } else {
-        Tensor::zeros([1], device)
-    }
 }
 
 /// Precursor reconstruction objective result and diagnostics.

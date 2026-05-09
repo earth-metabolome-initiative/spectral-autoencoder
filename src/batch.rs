@@ -33,10 +33,6 @@ pub struct AutoencoderBatch<B: Backend> {
     pub target_conditions: Tensor<B, 2>,
     /// Float mask with `1.0` for rows whose precursor condition was masked in the encoder input.
     pub masked_precursor_mask: Tensor<B, 2>,
-    /// Second input view used for latent consistency.
-    pub consistency_spectra: Tensor<B, 2>,
-    /// Conditions for the second input view.
-    pub consistency_conditions: Tensor<B, 2>,
     /// Float mask with `1.0` for masked or dropped spectral vector positions.
     pub masked_spectra_mask: Tensor<B, 2>,
     /// Float mask with `1.0` for synthetic intruder peak slots.
@@ -79,14 +75,6 @@ pub struct TokenizedAutoencoderBatch<B: Backend> {
     pub target_conditions: Tensor<B, 2>,
     /// Float mask with `1.0` for rows whose precursor condition was masked in the encoder input.
     pub masked_precursor_mask: Tensor<B, 2>,
-    /// Second peak-token input view used for latent consistency.
-    pub consistency_token_features: Tensor<B, 3>,
-    /// Peak mask for the second input view.
-    pub consistency_peak_mask: Tensor<B, 2>,
-    /// Padding mask for the second input view.
-    pub consistency_padding_mask: Tensor<B, 2, Bool>,
-    /// Conditions for the second input view.
-    pub consistency_conditions: Tensor<B, 2>,
     /// Float mask with `1.0` for masked or dropped target peaks.
     pub masked_peak_mask: Tensor<B, 2>,
     /// Float mask with `1.0` for synthetic intruder peak tokens.
@@ -110,17 +98,13 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for Autoenco
         let mut conditions = Vec::with_capacity(layout.condition_capacity());
         let mut target_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_precursor_mask = Vec::with_capacity(layout.batch_size);
-        let mut consistency_spectra = Vec::with_capacity(layout.spectrum_capacity());
-        let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_spectra_mask = Vec::with_capacity(layout.spectrum_capacity());
         let mut intruder_peak_mask = Vec::with_capacity(layout.peak_capacity());
         for item in items {
             spectra.extend_from_slice(&item.spectrum);
             target_spectra.extend_from_slice(&item.spectrum);
-            consistency_spectra.extend(item.spectrum);
             conditions.extend_from_slice(&item.conditions);
             target_conditions.extend_from_slice(&item.conditions);
-            consistency_conditions.extend(item.conditions);
             masked_precursor_mask.push(0.0);
             masked_spectra_mask.resize(masked_spectra_mask.len() + layout.spectrum_width, 0.0);
             intruder_peak_mask.resize(intruder_peak_mask.len() + layout.peak_count(), 0.0);
@@ -134,8 +118,6 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>> for Autoenco
                 conditions,
                 target_conditions,
                 masked_precursor_mask,
-                consistency_spectra,
-                consistency_conditions,
                 masked_spectra_mask,
                 intruder_peak_mask,
                 similarity_ranking: None,
@@ -169,26 +151,18 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
         let mut conditions = Vec::with_capacity(layout.condition_capacity());
         let mut target_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_precursor_mask = Vec::with_capacity(layout.batch_size);
-        let mut consistency_token_features = Vec::with_capacity(layout.token_feature_capacity());
-        let mut consistency_peak_mask = Vec::with_capacity(layout.peak_capacity());
-        let mut consistency_padding_mask = Vec::with_capacity(layout.peak_capacity());
-        let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_peak_mask = Vec::with_capacity(layout.peak_capacity());
         let mut intruder_peak_mask = Vec::with_capacity(layout.peak_capacity());
         for item in items {
             token_features.extend_from_slice(&item.token_features);
-            consistency_token_features.extend(item.token_features);
             target_pairs.extend(item.target_pairs);
             peak_mask.extend_from_slice(&item.peak_mask);
-            consistency_peak_mask.extend_from_slice(&item.peak_mask);
             target_peak_mask.extend_from_slice(&item.peak_mask);
             masked_peak_mask.resize(masked_peak_mask.len() + item.peak_mask.len(), 0.0);
             intruder_peak_mask.resize(intruder_peak_mask.len() + item.peak_mask.len(), 0.0);
             padding_mask.extend_from_slice(&item.padding_mask);
-            consistency_padding_mask.extend(item.padding_mask);
             conditions.extend_from_slice(&item.conditions);
             target_conditions.extend_from_slice(&item.conditions);
-            consistency_conditions.extend(item.conditions);
             masked_precursor_mask.push(0.0);
         }
 
@@ -203,10 +177,6 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
                 conditions,
                 target_conditions,
                 masked_precursor_mask,
-                consistency_token_features,
-                consistency_peak_mask,
-                consistency_padding_mask,
-                consistency_conditions,
                 masked_peak_mask,
                 intruder_peak_mask,
                 similarity_ranking: None,
@@ -266,8 +236,6 @@ pub(crate) struct AutoencoderBatchParts<B: Backend> {
     pub(crate) conditions: Vec<f32>,
     pub(crate) target_conditions: Vec<f32>,
     pub(crate) masked_precursor_mask: Vec<f32>,
-    pub(crate) consistency_spectra: Vec<f32>,
-    pub(crate) consistency_conditions: Vec<f32>,
     pub(crate) masked_spectra_mask: Vec<f32>,
     pub(crate) intruder_peak_mask: Vec<f32>,
     pub(crate) similarity_ranking: Option<SimilarityRankingBatch<B>>,
@@ -312,20 +280,6 @@ pub(crate) fn autoencoder_batch_from_parts<B: Backend>(
         ),
         masked_precursor_mask: Tensor::<B, 2>::from_data(
             TensorData::new(parts.masked_precursor_mask, [parts.layout.batch_size, 1]),
-            device,
-        ),
-        consistency_spectra: Tensor::<B, 2>::from_data(
-            TensorData::new(
-                parts.consistency_spectra,
-                [parts.layout.batch_size, parts.layout.spectrum_width],
-            ),
-            device,
-        ),
-        consistency_conditions: Tensor::<B, 2>::from_data(
-            TensorData::new(
-                parts.consistency_conditions,
-                [parts.layout.batch_size, parts.layout.condition_width],
-            ),
             device,
         ),
         masked_spectra_mask: Tensor::<B, 2>::from_data(
@@ -404,10 +358,6 @@ pub(crate) struct TokenizedAutoencoderBatchParts<B: Backend> {
     pub(crate) conditions: Vec<f32>,
     pub(crate) target_conditions: Vec<f32>,
     pub(crate) masked_precursor_mask: Vec<f32>,
-    pub(crate) consistency_token_features: Vec<f32>,
-    pub(crate) consistency_peak_mask: Vec<f32>,
-    pub(crate) consistency_padding_mask: Vec<bool>,
-    pub(crate) consistency_conditions: Vec<f32>,
     pub(crate) masked_peak_mask: Vec<f32>,
     pub(crate) intruder_peak_mask: Vec<f32>,
     pub(crate) similarity_ranking: Option<SimilarityRankingBatch<B>>,
@@ -479,38 +429,6 @@ pub(crate) fn tokenized_autoencoder_batch_from_parts<B: Backend>(
             TensorData::new(parts.masked_precursor_mask, [parts.layout.batch_size, 1]),
             device,
         ),
-        consistency_token_features: Tensor::<B, 3>::from_data(
-            TensorData::new(
-                parts.consistency_token_features,
-                [
-                    parts.layout.batch_size,
-                    parts.layout.max_peaks,
-                    parts.layout.token_feature_width,
-                ],
-            ),
-            device,
-        ),
-        consistency_peak_mask: Tensor::<B, 2>::from_data(
-            TensorData::new(
-                parts.consistency_peak_mask,
-                [parts.layout.batch_size, parts.layout.max_peaks],
-            ),
-            device,
-        ),
-        consistency_padding_mask: Tensor::<B, 2, Bool>::from_bool(
-            TensorData::new(
-                parts.consistency_padding_mask,
-                [parts.layout.batch_size, parts.layout.max_peaks],
-            ),
-            device,
-        ),
-        consistency_conditions: Tensor::<B, 2>::from_data(
-            TensorData::new(
-                parts.consistency_conditions,
-                [parts.layout.batch_size, parts.layout.condition_width],
-            ),
-            device,
-        ),
         masked_peak_mask: Tensor::<B, 2>::from_data(
             TensorData::new(
                 parts.masked_peak_mask,
@@ -557,7 +475,6 @@ mod tests {
         assert_eq!(batch.conditions.dims(), [2, 1]);
         assert_eq!(batch.target_conditions.dims(), [2, 1]);
         assert_eq!(batch.masked_precursor_mask.dims(), [2, 1]);
-        assert_eq!(batch.consistency_spectra.dims(), [2, 2]);
         assert_eq!(batch.masked_spectra_mask.dims(), [2, 2]);
         assert_eq!(batch.intruder_peak_mask.dims(), [2, 1]);
     }
@@ -595,8 +512,6 @@ mod tests {
         assert_eq!(batch.conditions.dims(), [2, 1]);
         assert_eq!(batch.target_conditions.dims(), [2, 1]);
         assert_eq!(batch.masked_precursor_mask.dims(), [2, 1]);
-        assert_eq!(batch.consistency_token_features.dims(), [2, 2, 3]);
-        assert_eq!(batch.consistency_peak_mask.dims(), [2, 2]);
         assert_eq!(batch.masked_peak_mask.dims(), [2, 2]);
         assert_eq!(batch.intruder_peak_mask.dims(), [2, 2]);
     }

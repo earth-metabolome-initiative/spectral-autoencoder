@@ -1323,53 +1323,37 @@ where
             .clone()
             .narrow(0, chunk_offset, batch_items);
         let target_conditions = clean_conditions.clone();
-        let (
-            spectra,
-            conditions,
-            masked_precursor_mask,
-            masked_spectra_mask,
-            intruder_peak_mask,
-            consistency_spectra,
-            consistency_conditions,
-        ) = match self.loader.augment {
-            Some(config) => {
-                let (
-                    spectra,
-                    conditions,
-                    masked_precursor_mask,
-                    masked_spectra_mask,
-                    intruder_peak_mask,
-                ) = augment_flat_batch(clean_spectra.clone(), clean_conditions.clone(), config);
-                let (consistency_spectra, consistency_conditions, _, _, _) = augment_flat_batch(
-                    clean_spectra.clone(),
-                    clean_conditions.clone(),
-                    config.without_intruder_peaks(),
-                );
-                (
-                    spectra,
-                    conditions,
-                    masked_precursor_mask,
-                    masked_spectra_mask,
-                    intruder_peak_mask,
-                    consistency_spectra,
-                    consistency_conditions,
-                )
-            }
-            None => {
-                let device = clean_spectra.device();
-                let [batch_size, spectrum_width] = clean_spectra.dims();
-                let peak_count = spectrum_width / 2;
-                (
-                    clean_spectra.clone(),
-                    clean_conditions.clone(),
-                    Tensor::<B, 2>::zeros([batch_size, 1], &device),
-                    Tensor::<B, 2>::zeros([batch_size, spectrum_width], &device),
-                    Tensor::<B, 2>::zeros([batch_size, peak_count], &device),
-                    clean_spectra,
-                    clean_conditions,
-                )
-            }
-        };
+        let (spectra, conditions, masked_precursor_mask, masked_spectra_mask, intruder_peak_mask) =
+            match self.loader.augment {
+                Some(config) => {
+                    let (
+                        spectra,
+                        conditions,
+                        masked_precursor_mask,
+                        masked_spectra_mask,
+                        intruder_peak_mask,
+                    ) = augment_flat_batch(clean_spectra.clone(), clean_conditions.clone(), config);
+                    (
+                        spectra,
+                        conditions,
+                        masked_precursor_mask,
+                        masked_spectra_mask,
+                        intruder_peak_mask,
+                    )
+                }
+                None => {
+                    let device = clean_spectra.device();
+                    let [batch_size, spectrum_width] = clean_spectra.dims();
+                    let peak_count = spectrum_width / 2;
+                    (
+                        clean_spectra.clone(),
+                        clean_conditions.clone(),
+                        Tensor::<B, 2>::zeros([batch_size, 1], &device),
+                        Tensor::<B, 2>::zeros([batch_size, spectrum_width], &device),
+                        Tensor::<B, 2>::zeros([batch_size, peak_count], &device),
+                    )
+                }
+            };
         let similarity_ranking = teacher_similarity_ranking_batch(
             chunk.teacher_gpu.as_ref(),
             chunk_offset,
@@ -1398,8 +1382,6 @@ where
             conditions,
             target_conditions,
             masked_precursor_mask,
-            consistency_spectra,
-            consistency_conditions,
             masked_spectra_mask,
             intruder_peak_mask,
             similarity_ranking,

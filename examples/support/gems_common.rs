@@ -335,10 +335,9 @@ pub fn print_streaming_run_header(
     }
     println!("similarity teacher: {}", similarity_teacher.summary());
     println!(
-        "auxiliary losses: reconstruction {} masked {} consistency {} intruder {} precursor {} masked-precursor {} similarity-ranking {} latent-noise-std {} similarity-ranking-pairs/batch {}",
+        "auxiliary losses: reconstruction {} masked {} intruder {} precursor {} masked-precursor {} similarity-ranking {} latent-noise-std {} similarity-ranking-pairs/batch {}",
         auxiliary.reconstruction_weight,
         auxiliary.masked_peak_weight,
-        auxiliary.consistency_weight,
         auxiliary.intruder_peak_weight,
         auxiliary.precursor_reconstruction_weight,
         auxiliary.masked_precursor_weight,
@@ -359,7 +358,6 @@ pub fn auxiliary_loss_config_from_env(default: AuxiliaryLossConfig) -> Auxiliary
             default.reconstruction_weight,
         ),
         masked_peak_weight: f64_var("GEMS_AUX_MASKED_WEIGHT", default.masked_peak_weight),
-        consistency_weight: f64_var("GEMS_AUX_CONSISTENCY_WEIGHT", default.consistency_weight),
         intruder_peak_weight: f64_var("GEMS_AUX_INTRUDER_WEIGHT", default.intruder_peak_weight),
         precursor_reconstruction_weight: f64_var(
             "GEMS_AUX_PRECURSOR_WEIGHT",

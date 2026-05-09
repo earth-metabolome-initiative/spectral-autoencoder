@@ -78,13 +78,6 @@ impl SpectrumAugmentationConfig {
         }
     }
 
-    /// Returns a copy with synthetic intruder insertion disabled.
-    #[must_use]
-    pub const fn without_intruder_peaks(mut self) -> Self {
-        self.intruder_peak_probability = 0.0;
-        self
-    }
-
     /// Returns `true` when all augmentation knobs are disabled.
     #[must_use]
     pub fn is_disabled(&self) -> bool {
@@ -296,34 +289,21 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
         let mut conditions = Vec::with_capacity(layout.condition_capacity());
         let mut target_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_precursor_mask = Vec::with_capacity(layout.batch_capacity());
-        let mut consistency_spectra = Vec::with_capacity(layout.spectrum_capacity());
-        let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_spectra_mask = Vec::with_capacity(layout.spectrum_capacity());
         let mut intruder_peak_mask = Vec::with_capacity(layout.peak_capacity());
-        let consistency_augmenter =
-            SpectrumAugmenter::new(self.augmenter.config().without_intruder_peaks());
         for (index, item) in items.into_iter().enumerate() {
             let seed = mix_seed(batch_seed, index as u64);
-            let consistency_seed = seed ^ 0xd1b5_4a32_d192_ed03;
             let (augmented_spectrum, masked, intruders) =
                 self.augmenter.augment_vector(&item.spectrum, seed);
-            let (consistency_spectrum, _, _) =
-                consistency_augmenter.augment_vector(&item.spectrum, consistency_seed);
             spectra.extend(augmented_spectrum);
             target_spectra.extend(item.spectrum);
-            consistency_spectra.extend(consistency_spectrum);
             masked_spectra_mask.extend(masked);
             intruder_peak_mask.extend(intruders);
             target_conditions.extend_from_slice(&item.conditions);
             let (input_conditions, masked_precursor) = self
                 .augmenter
                 .augment_precursor_conditions(&item.conditions, seed ^ 0x9e37_79b9_7f4a_7c15);
-            let (input_consistency_conditions, _) = self.augmenter.augment_precursor_conditions(
-                &item.conditions,
-                consistency_seed ^ 0x9e37_79b9_7f4a_7c15,
-            );
             conditions.extend(input_conditions);
-            consistency_conditions.extend(input_consistency_conditions);
             masked_precursor_mask.push(masked_precursor);
         }
 
@@ -335,8 +315,6 @@ impl<B: Backend> Batcher<B, AutoencoderSample, AutoencoderBatch<B>>
                 conditions,
                 target_conditions,
                 masked_precursor_mask,
-                consistency_spectra,
-                consistency_conditions,
                 masked_spectra_mask,
                 intruder_peak_mask,
                 similarity_ranking: None,
@@ -386,46 +364,25 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
         let mut conditions = Vec::with_capacity(layout.condition_capacity());
         let mut target_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_precursor_mask = Vec::with_capacity(layout.batch_capacity());
-        let mut consistency_token_features = Vec::with_capacity(layout.token_feature_capacity());
-        let mut consistency_peak_mask = Vec::with_capacity(layout.peak_capacity());
-        let mut consistency_padding_mask = Vec::with_capacity(layout.peak_capacity());
-        let mut consistency_conditions = Vec::with_capacity(layout.condition_capacity());
         let mut masked_peak_mask = Vec::with_capacity(layout.peak_capacity());
         let mut intruder_peak_mask = Vec::with_capacity(layout.peak_capacity());
-        let consistency_augmenter =
-            SpectrumAugmenter::new(self.augmenter.config().without_intruder_peaks());
         for (index, item) in items.into_iter().enumerate() {
             let seed = mix_seed(batch_seed, index as u64);
-            let consistency_seed = seed ^ 0xd1b5_4a32_d192_ed03;
             let (input_features, input_peak_mask, input_padding_mask, masked_peaks, intruders) =
                 self.augmenter
                     .augment_token_features(&item.token_features, &item.peak_mask, seed);
-            let (consistency_features, consistency_mask, consistency_padding, _, _) =
-                consistency_augmenter.augment_token_features(
-                    &item.token_features,
-                    &item.peak_mask,
-                    consistency_seed,
-                );
             token_features.extend(input_features);
-            consistency_token_features.extend(consistency_features);
             target_pairs.extend(item.target_pairs);
             peak_mask.extend(input_peak_mask);
-            consistency_peak_mask.extend(consistency_mask);
             target_peak_mask.extend(item.peak_mask);
             padding_mask.extend(input_padding_mask);
-            consistency_padding_mask.extend(consistency_padding);
             masked_peak_mask.extend(masked_peaks);
             intruder_peak_mask.extend(intruders);
             target_conditions.extend_from_slice(&item.conditions);
             let (input_conditions, masked_precursor) = self
                 .augmenter
                 .augment_precursor_conditions(&item.conditions, seed ^ 0x9e37_79b9_7f4a_7c15);
-            let (input_consistency_conditions, _) = self.augmenter.augment_precursor_conditions(
-                &item.conditions,
-                consistency_seed ^ 0x9e37_79b9_7f4a_7c15,
-            );
             conditions.extend(input_conditions);
-            consistency_conditions.extend(input_consistency_conditions);
             masked_precursor_mask.push(masked_precursor);
         }
 
@@ -440,10 +397,6 @@ impl<B: Backend> Batcher<B, TokenizedAutoencoderSample, TokenizedAutoencoderBatc
                 conditions,
                 target_conditions,
                 masked_precursor_mask,
-                consistency_token_features,
-                consistency_peak_mask,
-                consistency_padding_mask,
-                consistency_conditions,
                 masked_peak_mask,
                 intruder_peak_mask,
                 similarity_ranking: None,

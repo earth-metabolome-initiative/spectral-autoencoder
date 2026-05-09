@@ -43,7 +43,6 @@ The GeMS training examples use these losses:
 - precursor m/z reconstruction
 - masked precursor m/z reconstruction
 - masked-peak reconstruction
-- latent consistency between two augmented input views
 - synthetic intruder-peak detection
 - similarity-ranking against an online spectral-similarity teacher
 - decoder-side latent noise for reconstruction robustness

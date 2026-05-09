@@ -471,16 +471,11 @@ where
             masked_precursor_mask,
             masked_peak_mask,
             intruder_peak_mask,
-            consistency_token_features,
-            consistency_peak_mask,
-            consistency_padding_mask,
-            consistency_conditions,
         ) = match self.loader.augment {
             Some(config) => {
                 let clean_token_features = token_features.clone();
                 let clean_peak_mask = peak_mask.clone();
                 let clean_padding_mask = padding_mask.clone();
-                let clean_conditions = conditions.clone();
                 let (
                     token_features,
                     peak_mask,
@@ -493,23 +488,8 @@ where
                     clean_token_features.clone(),
                     clean_peak_mask.clone(),
                     clean_padding_mask.clone(),
-                    clean_conditions.clone(),
+                    conditions.clone(),
                     config,
-                );
-                let (
-                    consistency_token_features,
-                    consistency_peak_mask,
-                    consistency_padding_mask,
-                    consistency_conditions,
-                    _,
-                    _,
-                    _,
-                ) = augment_token_batch(
-                    clean_token_features,
-                    clean_peak_mask,
-                    clean_padding_mask,
-                    clean_conditions,
-                    config.without_intruder_peaks(),
                 );
                 (
                     token_features,
@@ -519,10 +499,6 @@ where
                     masked_precursor_mask,
                     masked_peak_mask,
                     intruder_peak_mask,
-                    consistency_token_features,
-                    consistency_peak_mask,
-                    consistency_padding_mask,
-                    consistency_conditions,
                 )
             }
             None => {
@@ -536,10 +512,6 @@ where
                     Tensor::<B, 2>::zeros([batch_size, 1], &device),
                     Tensor::<B, 2>::zeros([batch_size, max_peaks], &device),
                     Tensor::<B, 2>::zeros([batch_size, max_peaks], &device),
-                    token_features,
-                    peak_mask,
-                    padding_mask,
-                    conditions,
                 )
             }
         };
@@ -574,10 +546,6 @@ where
             conditions,
             target_conditions,
             masked_precursor_mask,
-            consistency_token_features,
-            consistency_peak_mask,
-            consistency_padding_mask,
-            consistency_conditions,
             masked_peak_mask,
             intruder_peak_mask,
             similarity_ranking,

@@ -22,8 +22,6 @@ pub struct AutoencoderLossBreakdown<B: Backend> {
     pub reconstruction: Tensor<B, 1>,
     /// Masked-peak contribution to the total loss.
     pub masked: Tensor<B, 1>,
-    /// Latent-consistency contribution to the total loss.
-    pub consistency: Tensor<B, 1>,
     /// Synthetic intruder-peak detection contribution to the total loss.
     pub intruder: Tensor<B, 1>,
     /// Precursor m/z reconstruction contribution to the total loss.
@@ -42,7 +40,6 @@ impl<B: Backend> AutoencoderLossBreakdown<B> {
         Self {
             reconstruction: Tensor::zeros([1], device),
             masked: Tensor::zeros([1], device),
-            consistency: Tensor::zeros([1], device),
             intruder: Tensor::zeros([1], device),
             precursor: Tensor::zeros([1], device),
             masked_precursor: Tensor::zeros([1], device),
@@ -55,7 +52,6 @@ impl<B: Backend> AutoencoderLossBreakdown<B> {
     pub fn total(&self) -> Tensor<B, 1> {
         self.reconstruction.clone()
             + self.masked.clone()
-            + self.consistency.clone()
             + self.intruder.clone()
             + self.precursor.clone()
             + self.masked_precursor.clone()
@@ -139,7 +135,6 @@ impl<B: Backend> Adaptor<AutoencoderLossComponentsInput<B>> for AutoencoderTrain
             loss: self.loss.clone(),
             reconstruction: self.losses.reconstruction.clone(),
             masked: self.losses.masked.clone(),
-            consistency: self.losses.consistency.clone(),
             intruder: self.losses.intruder.clone(),
             precursor: self.losses.precursor.clone(),
             masked_precursor: self.losses.masked_precursor.clone(),
@@ -159,7 +154,6 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             loss,
             reconstruction,
             masked,
-            consistency,
             intruder,
             precursor,
             masked_precursor,
@@ -172,7 +166,6 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             .register(self.loss)
             .register(self.losses.reconstruction)
             .register(self.losses.masked)
-            .register(self.losses.consistency)
             .register(self.losses.intruder)
             .register(self.losses.precursor)
             .register(self.losses.masked_precursor)
@@ -193,7 +186,6 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             losses: AutoencoderLossBreakdown {
                 reconstruction: Tensor::from_data(reconstruction, device),
                 masked: Tensor::from_data(masked, device),
-                consistency: Tensor::from_data(consistency, device),
                 intruder: Tensor::from_data(intruder, device),
                 precursor: Tensor::from_data(precursor, device),
                 masked_precursor: Tensor::from_data(masked_precursor, device),
@@ -214,7 +206,6 @@ pub struct AutoencoderLossComponentsInput<B: Backend> {
     loss: Tensor<B, 1>,
     reconstruction: Tensor<B, 1>,
     masked: Tensor<B, 1>,
-    consistency: Tensor<B, 1>,
     intruder: Tensor<B, 1>,
     precursor: Tensor<B, 1>,
     masked_precursor: Tensor<B, 1>,
@@ -247,11 +238,6 @@ impl<B: Backend> AutoencoderLossComponentMetric<B> {
     /// Masked-peak loss contribution.
     pub fn masked() -> Self {
         Self::new(AutoencoderLossComponent::Masked)
-    }
-
-    /// Latent-consistency loss contribution.
-    pub fn consistency() -> Self {
-        Self::new(AutoencoderLossComponent::Consistency)
     }
 
     /// Synthetic intruder-peak detection loss contribution.
@@ -321,7 +307,6 @@ impl<B: Backend> Metric for AutoencoderLossComponentMetric<B> {
             AutoencoderLossComponent::Loss => item.loss.clone(),
             AutoencoderLossComponent::Reconstruction => item.reconstruction.clone(),
             AutoencoderLossComponent::Masked => item.masked.clone(),
-            AutoencoderLossComponent::Consistency => item.consistency.clone(),
             AutoencoderLossComponent::Intruder => item.intruder.clone(),
             AutoencoderLossComponent::Precursor => item.precursor.clone(),
             AutoencoderLossComponent::MaskedPrecursor => item.masked_precursor.clone(),
@@ -366,7 +351,6 @@ enum AutoencoderLossComponent {
     Loss,
     Reconstruction,
     Masked,
-    Consistency,
     Intruder,
     Precursor,
     MaskedPrecursor,
@@ -381,7 +365,6 @@ impl AutoencoderLossComponent {
             Self::Loss => "Loss",
             Self::Reconstruction => "Reconstruction Loss",
             Self::Masked => "Masked Loss",
-            Self::Consistency => "Consistency Loss",
             Self::Intruder => "Intruder Loss",
             Self::Precursor => "Precursor Loss",
             Self::MaskedPrecursor => "Masked Precursor Loss",
@@ -396,7 +379,6 @@ impl AutoencoderLossComponent {
             Self::Loss => "total weighted loss",
             Self::Reconstruction => "reconstruction",
             Self::Masked => "masked-peak",
-            Self::Consistency => "latent-consistency",
             Self::Intruder => "intruder-peak detection",
             Self::Precursor => "precursor reconstruction",
             Self::MaskedPrecursor => "masked precursor reconstruction",
@@ -466,8 +448,6 @@ where
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::reconstruction())
             .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::reconstruction())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::masked())
-            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::consistency())
-            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::consistency())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::intruder())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::precursor())
             .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::precursor())
@@ -510,7 +490,6 @@ mod tests {
         AutoencoderLossBreakdown {
             reconstruction: scalar(1.0, device),
             masked: scalar(2.0, device),
-            consistency: scalar(3.0, device),
             intruder: scalar(4.0, device),
             precursor: scalar(5.0, device),
             masked_precursor: scalar(6.0, device),
@@ -582,7 +561,7 @@ mod tests {
         let device = device();
         let total = losses(&device).total();
 
-        assert_tensor_close(total, 36.0);
+        assert_tensor_close(total, 33.0);
     }
 
     #[test]
@@ -603,7 +582,7 @@ mod tests {
         let output =
             AutoencoderTrainingOutput::new(matrix(&device), matrix(&device), losses(&device));
 
-        assert_tensor_close(output.loss, 36.0);
+        assert_tensor_close(output.loss, 33.0);
         assert_eq!(output.output.dims(), [2, 2]);
         assert_eq!(output.targets.dims(), [2, 2]);
         assert_tensor_close(output.diagnostics.similarity_ranking_pairs, 0.0);
@@ -616,10 +595,9 @@ mod tests {
         let device = device();
         let adapted: AutoencoderLossComponentsInput<TestBackend> = output(&device).adapt();
 
-        assert_tensor_close(adapted.loss, 36.0);
+        assert_tensor_close(adapted.loss, 33.0);
         assert_tensor_close(adapted.reconstruction, 1.0);
         assert_tensor_close(adapted.masked, 2.0);
-        assert_tensor_close(adapted.consistency, 3.0);
         assert_tensor_close(adapted.intruder, 4.0);
         assert_tensor_close(adapted.precursor, 5.0);
         assert_tensor_close(adapted.masked_precursor, 6.0);
@@ -634,14 +612,13 @@ mod tests {
         let device = device();
         let synced = output(&device).sync();
 
-        assert_tensor_close(synced.loss, 36.0);
+        assert_tensor_close(synced.loss, 33.0);
         assert_eq!(synced.output.dims(), [1, 1]);
         assert_eq!(synced.targets.dims(), [1, 1]);
         assert_single_matrix_zero(synced.output);
         assert_single_matrix_zero(synced.targets);
         assert_tensor_close(synced.losses.reconstruction, 1.0);
         assert_tensor_close(synced.losses.masked, 2.0);
-        assert_tensor_close(synced.losses.consistency, 3.0);
         assert_tensor_close(synced.losses.intruder, 4.0);
         assert_tensor_close(synced.losses.precursor, 5.0);
         assert_tensor_close(synced.losses.masked_precursor, 6.0);
@@ -668,11 +645,6 @@ mod tests {
             (
                 AutoencoderLossComponentMetric::<TestBackend>::masked(),
                 "Masked Loss",
-                false,
-            ),
-            (
-                AutoencoderLossComponentMetric::<TestBackend>::consistency(),
-                "Consistency Loss",
                 false,
             ),
             (
@@ -730,7 +702,7 @@ mod tests {
         let item: AutoencoderLossComponentsInput<TestBackend> = output(&device).adapt();
         let metadata = metadata();
         let cases = [
-            (AutoencoderLossComponentMetric::<TestBackend>::loss(), 36.0),
+            (AutoencoderLossComponentMetric::<TestBackend>::loss(), 33.0),
             (
                 AutoencoderLossComponentMetric::<TestBackend>::masked_precursor(),
                 6.0,
