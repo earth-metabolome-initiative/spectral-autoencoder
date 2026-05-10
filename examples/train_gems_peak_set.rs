@@ -1,16 +1,16 @@
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 #[path = "support/gems_common.rs"]
 mod gems_common;
 
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 #[path = "support/gems_streaming.rs"]
 mod gems_streaming;
 
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 #[path = "support/gems_peak_set.rs"]
 mod gems_peak_set;
 
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 mod app {
     use std::sync::Arc;
 
@@ -37,10 +37,10 @@ mod app {
 
     pub fn main() -> Result<(), Box<dyn std::error::Error>> {
         let args = RunArgs::from_env_with_training_defaults(
-            "runs/gems-a10-top128-peak-window8-bs128-5epoch",
-            128,
-            10000,
-            512,
+            "runs/gems-a10-top128-peak-window8-bs64-fusion-5epoch",
+            64,
+            20000,
+            1024,
             5,
         )?;
         std::fs::create_dir_all(&args.output_dir)?;
@@ -161,14 +161,12 @@ mod app {
     }
 }
 
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     app::main()
 }
 
-#[cfg(not(all(feature = "cuda-fusion", feature = "train")))]
+#[cfg(not(all(feature = "cuda", feature = "train")))]
 fn main() {
-    eprintln!(
-        "train_gems_peak_set requires --no-default-features --features std,cuda-fusion,train,tui"
-    );
+    eprintln!("train_gems_peak_set requires --no-default-features --features std,cuda,train,tui");
 }

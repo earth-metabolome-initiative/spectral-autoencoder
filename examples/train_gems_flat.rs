@@ -1,16 +1,16 @@
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 #[path = "support/gems_common.rs"]
 mod gems_common;
 
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 #[path = "support/gems_streaming.rs"]
 mod gems_streaming;
 
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 #[path = "support/gems_flat.rs"]
 mod gems_flat;
 
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 mod app {
     use std::sync::Arc;
 
@@ -147,14 +147,12 @@ mod app {
     }
 }
 
-#[cfg(all(feature = "cuda-fusion", feature = "train"))]
+#[cfg(all(feature = "cuda", feature = "train"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     app::main()
 }
 
-#[cfg(not(all(feature = "cuda-fusion", feature = "train")))]
+#[cfg(not(all(feature = "cuda", feature = "train")))]
 fn main() {
-    eprintln!(
-        "train_gems_flat requires --no-default-features --features std,cuda-fusion,train,tui"
-    );
+    eprintln!("train_gems_flat requires --no-default-features --features std,cuda,train,tui");
 }

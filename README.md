@@ -90,13 +90,14 @@ Run the peak-set model:
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" \
-GEMS_RUN_DIR=runs/gems-a10-top128-peak-window8-bs128-5epoch \
+GEMS_RUN_DIR=runs/gems-a10-top128-peak-window8-bs64-fusion-5epoch \
 GEMS_GPU_WINDOW_BATCHES=8 \
 GEMS_LOADER_WORKERS=16 \
 GEMS_HOST_PREFETCH_WINDOWS=8 \
-GEMS_BATCH_SIZE=128 \
-GEMS_VALID_BATCHES=512 \
-GEMS_TRAIN_BATCHES=10000 \
+GEMS_LOADER_PROFILE_EVERY=100 \
+GEMS_BATCH_SIZE=64 \
+GEMS_VALID_BATCHES=1024 \
+GEMS_TRAIN_BATCHES=20000 \
 GEMS_EPOCHS=5 \
 cargo run --release --example train_gems_peak_set --no-default-features --features std,cuda-fusion,train,tui
 ```
@@ -121,5 +122,7 @@ loads weights but starts a fresh optimizer.
 
 ## Features
 
-Default features are `std`, `ndarray`, `train`, and `tui`. CUDA training uses
-`cuda-fusion`, which enables Burn CUDA with fusion and autotune.
+Default features are `std`, `ndarray`, `train`, and `tui`. The CUDA training
+examples run with `cuda`, `cuda-no-fusion`, or `cuda-fusion`; the documented
+commands use `cuda-fusion`, and plain `cuda` is the fallback when Burn fusion
+or autotune allocates too much temporary GPU memory.
