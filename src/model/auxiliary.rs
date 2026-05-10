@@ -24,8 +24,15 @@ pub struct AuxiliaryLossConfig {
     pub masked_precursor_weight: f64,
     /// Weight for preserving clean-spectrum similarity order in latent space.
     pub similarity_ranking_weight: f64,
-    /// Margin applied to latent cosine ordering for the similarity-ranking loss.
-    pub similarity_ranking_margin: f64,
+    /// Temperature applied to latent cosine gaps in the pairwise logistic ranking loss.
+    #[serde(
+        default = "default_similarity_ranking_latent_temperature",
+        alias = "similarity_ranking_margin"
+    )]
+    pub similarity_ranking_latent_temperature: f64,
+    /// Temperature applied to teacher similarity gaps in the pairwise logistic ranking loss.
+    #[serde(default = "default_similarity_ranking_teacher_temperature")]
+    pub similarity_ranking_teacher_temperature: f64,
     /// Minimum clean-spectrum cosine gap required for a sampled ranking pair.
     pub similarity_ranking_min_gap: f64,
     /// Gaussian decoder-input latent noise as a fraction of the batch latent standard deviation.
@@ -47,14 +54,24 @@ impl Default for AuxiliaryLossConfig {
             intruder_peak_weight: 0.05,
             precursor_reconstruction_weight: 0.05,
             masked_precursor_weight: 0.05,
-            similarity_ranking_weight: 0.05,
-            similarity_ranking_margin: 0.05,
+            similarity_ranking_weight: 0.20,
+            similarity_ranking_latent_temperature: default_similarity_ranking_latent_temperature(),
+            similarity_ranking_teacher_temperature: default_similarity_ranking_teacher_temperature(
+            ),
             similarity_ranking_min_gap: 0.05,
             latent_noise_std: 0.02,
             similarity_ranking_pairs_per_batch: 0,
             intruder_hidden_width: 128,
         }
     }
+}
+
+fn default_similarity_ranking_latent_temperature() -> f64 {
+    0.10
+}
+
+fn default_similarity_ranking_teacher_temperature() -> f64 {
+    0.10
 }
 
 /// Configuration for small embedding-level auxiliary heads.
@@ -323,26 +340,36 @@ pub struct SimilarityRankingOutput<B: Backend> {
     pub accuracy: Tensor<B, 1>,
 }
 
-/// In-batch ranking loss that preserves teacher similarity order.
+/// In-batch pairwise logistic ranking loss that preserves teacher similarity order.
 ///
-/// The teacher scores are treated as fixed labels. Gradients flow only through
+/// The teacher scores define fixed soft targets. Gradients flow only through
 /// the latent cosine similarities.
 pub fn similarity_ranking_loss<B: Backend>(
     latent: Tensor<B, 2>,
     batch: SimilarityRankingBatch<B>,
     max_pairs: usize,
-    margin: f64,
+    latent_temperature: f64,
+    teacher_temperature: f64,
     min_gap: f64,
 ) -> Tensor<B, 1> {
-    similarity_ranking_output(latent, batch, max_pairs, margin, min_gap).loss
+    similarity_ranking_output(
+        latent,
+        batch,
+        max_pairs,
+        latent_temperature,
+        teacher_temperature,
+        min_gap,
+    )
+    .loss
 }
 
-/// In-batch ranking objective and diagnostics for teacher similarity order.
+/// In-batch pairwise logistic ranking objective and diagnostics for teacher similarity order.
 pub fn similarity_ranking_output<B: Backend>(
     latent: Tensor<B, 2>,
     batch: SimilarityRankingBatch<B>,
     max_pairs: usize,
-    margin: f64,
+    latent_temperature: f64,
+    teacher_temperature: f64,
     min_gap: f64,
 ) -> SimilarityRankingOutput<B> {
     let [batch_size, _latent_width] = latent.dims();
@@ -370,18 +397,22 @@ pub fn similarity_ranking_output<B: Backend>(
         - row_cosine_similarity(anchor_latent, latent_b);
     let target_delta = batch.target_delta.narrow(0, 0, pair_count).detach();
     let target_gap = target_delta.clone().abs();
-    let target_direction = target_delta / (target_gap.clone() + 1.0e-6);
+    let target_direction = target_delta.clone() / (target_gap.clone() + 1.0e-6);
     let valid = target_gap.clone().greater_elem(min_gap).float();
     let valid_pairs = valid.clone().sum();
     let gap_weights = target_gap * valid.clone();
     let gap_weight_sum = gap_weights.clone().sum().clamp_min(1.0e-6);
-    let ordered_delta = target_direction * latent_delta;
-    let hinge = (margin - ordered_delta.clone()).clamp_min(0.0);
+    let ordered_delta = target_direction * latent_delta.clone();
+    let latent_logit = latent_delta / latent_temperature.max(1.0e-6);
+    let teacher_target = sigmoid(target_delta / teacher_temperature.max(1.0e-6));
+    let binary_cross_entropy = latent_logit.clone().clamp_min(0.0)
+        - latent_logit.clone() * teacher_target
+        + ((latent_logit.abs() * -1.0).exp() + 1.0).log();
     let accuracy = (ordered_delta.greater_elem(0.0).float() * valid.clone()).sum()
         / valid_pairs.clone().clamp_min(1.0);
 
     SimilarityRankingOutput {
-        loss: (hinge * gap_weights).sum() / gap_weight_sum,
+        loss: (binary_cross_entropy * gap_weights).sum() / gap_weight_sum,
         valid_pairs,
         accuracy,
     }
@@ -392,11 +423,21 @@ pub fn weighted_similarity_ranking_loss<B: Backend>(
     latent: Tensor<B, 2>,
     batch: SimilarityRankingBatch<B>,
     max_pairs: usize,
-    margin: f64,
+    latent_temperature: f64,
+    teacher_temperature: f64,
     min_gap: f64,
     weight: f64,
 ) -> Tensor<B, 1> {
-    weighted_similarity_ranking_output(latent, batch, max_pairs, margin, min_gap, weight).loss
+    weighted_similarity_ranking_output(
+        latent,
+        batch,
+        max_pairs,
+        latent_temperature,
+        teacher_temperature,
+        min_gap,
+        weight,
+    )
+    .loss
 }
 
 /// Weighted similarity-ranking output, or zero diagnostics when the weight is disabled.
@@ -404,12 +445,20 @@ pub fn weighted_similarity_ranking_output<B: Backend>(
     latent: Tensor<B, 2>,
     batch: SimilarityRankingBatch<B>,
     max_pairs: usize,
-    margin: f64,
+    latent_temperature: f64,
+    teacher_temperature: f64,
     min_gap: f64,
     weight: f64,
 ) -> SimilarityRankingOutput<B> {
     if weight > 0.0 {
-        let mut output = similarity_ranking_output(latent, batch, max_pairs, margin, min_gap);
+        let mut output = similarity_ranking_output(
+            latent,
+            batch,
+            max_pairs,
+            latent_temperature,
+            teacher_temperature,
+            min_gap,
+        );
         output.loss = output.loss * weight;
         output
     } else {
@@ -631,7 +680,7 @@ mod tests {
             target_delta: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
         };
 
-        let loss = similarity_ranking_loss(latent, batch, 0, 0.05, 0.01).into_scalar();
+        let loss = similarity_ranking_loss(latent, batch, 0, 0.10, 0.10, 0.01).into_scalar();
 
         assert!(loss.is_finite());
         assert!(loss >= 0.0);
@@ -655,7 +704,7 @@ mod tests {
             target_delta: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
         };
 
-        let output = similarity_ranking_output(latent, batch, 0, 0.05, 0.01);
+        let output = similarity_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01);
         let accuracy = output.accuracy.into_scalar();
 
         assert!(output.valid_pairs.into_scalar() > 0.0);
@@ -664,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn similarity_ranking_loss_weights_hinge_by_metric_gap() {
+    fn similarity_ranking_loss_weights_pairwise_logistic_by_metric_gap() {
         type B = burn::backend::NdArray<f32, i64>;
         let device = burn::backend::ndarray::NdArrayDevice::default();
         let latent = Tensor::<B, 2>::from_floats([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], &device);
@@ -680,11 +729,14 @@ mod tests {
             target_delta: Tensor::<B, 2>::from_floats([[0.9], [0.1], [0.0]], &device),
         };
 
-        let loss = similarity_ranking_loss(latent, batch, 0, 0.5, 0.01).into_scalar();
+        let loss = similarity_ranking_loss(latent, batch, 0, 0.5, 0.5, 0.01).into_scalar();
+        let expected = (0.9 * bce_with_logits(1.0 / 0.5, sigmoid_scalar(0.9 / 0.5))
+            + 0.1 * bce_with_logits(-1.0 / 0.5, sigmoid_scalar(0.1 / 0.5)))
+            / (0.9 + 0.1);
 
         assert!(
-            (loss - 0.15).abs() < 1.0e-3,
-            "expected gap-weighted hinge loss near 0.15, got {loss}"
+            (loss - expected).abs() < 1.0e-3,
+            "expected gap-weighted pairwise logistic loss near {expected}, got {loss}"
         );
     }
 
@@ -695,8 +747,16 @@ mod tests {
         let latent = Tensor::<B, 2>::zeros([2, 2], &device);
         let batch = SimilarityRankingBatch::zeros(2, &device);
 
-        let loss = similarity_ranking_loss(latent, batch, 0, 0.05, 0.01).into_scalar();
+        let loss = similarity_ranking_loss(latent, batch, 0, 0.10, 0.10, 0.01).into_scalar();
 
         assert_eq!(loss, 0.0);
+    }
+
+    fn sigmoid_scalar(value: f32) -> f32 {
+        1.0 / (1.0 + (-value).exp())
+    }
+
+    fn bce_with_logits(logit: f32, target: f32) -> f32 {
+        logit.max(0.0) - logit * target + (1.0 + (-logit.abs()).exp()).ln()
     }
 }

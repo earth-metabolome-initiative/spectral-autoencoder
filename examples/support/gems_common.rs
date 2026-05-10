@@ -341,13 +341,15 @@ pub fn print_streaming_run_header(
     }
     println!("similarity teacher: {}", similarity_teacher.summary());
     println!(
-        "auxiliary losses: reconstruction {} masked {} intruder {} precursor {} masked-precursor {} similarity-ranking {} latent-noise-std {} similarity-ranking-pairs/batch {}",
+        "auxiliary losses: reconstruction {} masked {} intruder {} precursor {} masked-precursor {} similarity-ranking {} similarity-ranking-latent-temperature {} similarity-ranking-teacher-temperature {} latent-noise-std {} similarity-ranking-pairs/batch {}",
         auxiliary.reconstruction_weight,
         auxiliary.masked_peak_weight,
         auxiliary.intruder_peak_weight,
         auxiliary.precursor_reconstruction_weight,
         auxiliary.masked_precursor_weight,
         auxiliary.similarity_ranking_weight,
+        auxiliary.similarity_ranking_latent_temperature,
+        auxiliary.similarity_ranking_teacher_temperature,
         auxiliary.latent_noise_std,
         if auxiliary.similarity_ranking_pairs_per_batch == 0 {
             "all".to_string()
@@ -377,9 +379,14 @@ pub fn auxiliary_loss_config_from_env(default: AuxiliaryLossConfig) -> Auxiliary
             "GEMS_AUX_SIMILARITY_RANKING_WEIGHT",
             default.similarity_ranking_weight,
         ),
-        similarity_ranking_margin: f64_var(
+        similarity_ranking_latent_temperature: f64_var_with_legacy(
+            "GEMS_SIMILARITY_RANKING_LATENT_TEMPERATURE",
             "GEMS_SIMILARITY_RANKING_MARGIN",
-            default.similarity_ranking_margin,
+            default.similarity_ranking_latent_temperature,
+        ),
+        similarity_ranking_teacher_temperature: f64_var(
+            "GEMS_SIMILARITY_RANKING_TEACHER_TEMPERATURE",
+            default.similarity_ranking_teacher_temperature,
         ),
         similarity_ranking_min_gap: f64_var(
             "GEMS_SIMILARITY_RANKING_MIN_GAP",
@@ -1360,6 +1367,14 @@ fn optional_usize_var(name: &str) -> Option<usize> {
 fn f64_var(name: &str, default: f64) -> f64 {
     env::var(name)
         .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn f64_var_with_legacy(name: &str, legacy_name: &str, default: f64) -> f64 {
+    env::var(name)
+        .ok()
+        .or_else(|| env::var(legacy_name).ok())
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
 }

@@ -259,7 +259,12 @@ impl SpectralAutoencoderConfig {
             masked_precursor_weight: self.auxiliary.masked_precursor_weight,
             precursor_mz_scale: self.precursor_mz_scale,
             similarity_ranking_weight: self.auxiliary.similarity_ranking_weight,
-            similarity_ranking_margin: self.auxiliary.similarity_ranking_margin,
+            similarity_ranking_latent_temperature: self
+                .auxiliary
+                .similarity_ranking_latent_temperature,
+            similarity_ranking_teacher_temperature: self
+                .auxiliary
+                .similarity_ranking_teacher_temperature,
             similarity_ranking_min_gap: self.auxiliary.similarity_ranking_min_gap,
             latent_noise_std: self.auxiliary.latent_noise_std,
             similarity_ranking_pairs_per_batch: self.auxiliary.similarity_ranking_pairs_per_batch,
@@ -371,7 +376,8 @@ pub struct SpectralAutoencoder<B: Backend> {
     masked_precursor_weight: f64,
     precursor_mz_scale: f64,
     similarity_ranking_weight: f64,
-    similarity_ranking_margin: f64,
+    similarity_ranking_latent_temperature: f64,
+    similarity_ranking_teacher_temperature: f64,
     similarity_ranking_min_gap: f64,
     latent_noise_std: f64,
     similarity_ranking_pairs_per_batch: usize,
@@ -529,7 +535,8 @@ impl<B: Backend> SpectralAutoencoder<B> {
             output.latent.clone(),
             batch.similarity_ranking,
             self.similarity_ranking_pairs_per_batch,
-            self.similarity_ranking_margin,
+            self.similarity_ranking_latent_temperature,
+            self.similarity_ranking_teacher_temperature,
             self.similarity_ranking_min_gap,
             self.similarity_ranking_weight,
         );
@@ -656,7 +663,12 @@ mod tests {
         assert_eq!(config.auxiliary.masked_peak_weight, 0.1);
         assert_eq!(config.auxiliary.intruder_peak_weight, 0.05);
         assert_eq!(config.auxiliary.masked_precursor_weight, 0.05);
-        assert_eq!(config.auxiliary.similarity_ranking_weight, 0.05);
+        assert_eq!(config.auxiliary.similarity_ranking_weight, 0.20);
+        assert_eq!(config.auxiliary.similarity_ranking_latent_temperature, 0.10);
+        assert_eq!(
+            config.auxiliary.similarity_ranking_teacher_temperature,
+            0.10
+        );
         assert_eq!(config.auxiliary.latent_noise_std, 0.02);
         assert_eq!(model.num_params(), 23_338_107);
     }

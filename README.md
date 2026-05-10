@@ -64,6 +64,10 @@ and stream fixed-size GPU windows from disk.
 Set `GEMS_LOADER_PROFILE_EVERY` to emit averaged loader timings; with the Burn
 TUI feature enabled they are written to `$GEMS_RUN_DIR/loader-profile.log` by
 default so terminal rendering stays clean.
+The similarity-ranking objective is a gap-weighted pairwise logistic loss with
+a soft spectral-cosine teacher target; tune its scale with
+`GEMS_SIMILARITY_RANKING_LATENT_TEMPERATURE` and
+`GEMS_SIMILARITY_RANKING_TEACHER_TEMPERATURE`.
 The flat-vector example defaults to the tuned 32,768-spectrum batch,
 8-batch GPU window, 16-worker, 8-window host-prefetch setup shown below.
 
