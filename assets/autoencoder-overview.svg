@@ -1141,8 +1141,8 @@
   </svg>
   <path d="M 420 805 H 450" class="bus"/>
   <text x="435" y="796" class="tiny" text-anchor="middle">+ eps</text>
-  <rect x="456" y="783" width="50" height="44" rx="10" class="decoderShape"/>
-  <text x="481" y="811" class="label" text-anchor="middle">D</text>
+  <path class="decoderShape" d="M 462 789 Q 456 791 456 797 L 456 815 Q 456 821 462 823 L 504 831 Q 510 832 510 826 L 510 786 Q 510 780 504 781 Z"/>
+  <text x="482" y="812" class="label" text-anchor="middle">D</text>
   <text x="435" y="875" class="tiny" text-anchor="middle">no separate loss term</text>
 
   </g>
