@@ -517,9 +517,8 @@ where
                 self.mgf_source
             )
         });
-        if bool_var("GEMS_FLAT_PREPROCESSED_CACHE_REFRESH", false)
-            || !path.try_exists().unwrap_or(false)
-        {
+        // Refresh is consumed during cache preparation; iteration only needs the rebuilt file.
+        if !path.try_exists().unwrap_or(false) {
             panic!(
                 "preprocessed flat cache {} is unavailable; it should have been prepared before iteration",
                 path.display()
@@ -535,31 +534,22 @@ where
                 )
             });
         let plans = host_window_plan(total_items, self.window_items);
-        let cache_item_offset = self.cache_item_offset;
-        let similarity_teacher = self.similarity_teacher;
-        let progress = self.progress.clone();
-        let batch_size = self.batch_size;
-        let max_batches = self.max_batches;
-        let epoch_items = self.epoch_items;
-        let prefix = format!("{} disk", self.progress.label);
+        let build_context = FlatHostWindowBuildContext {
+            metadata,
+            cache_item_offset: self.cache_item_offset,
+            similarity_teacher: self.similarity_teacher,
+            progress: self.progress.clone(),
+            batch_size: self.batch_size,
+            max_batches: self.max_batches,
+            epoch_items: self.epoch_items,
+            prefix: format!("{} disk", self.progress.label),
+        };
 
         spawn_ordered_host_workers(
             plans,
             self.loader_workers,
             self.host_prefetch_windows,
-            move |_worker_id, plan| {
-                build_flat_host_window(
-                    &metadata,
-                    cache_item_offset,
-                    plan,
-                    similarity_teacher,
-                    &progress,
-                    batch_size,
-                    max_batches,
-                    epoch_items,
-                    &prefix,
-                )
-            },
+            move |_worker_id, plan| build_flat_host_window(&build_context, plan),
         )
     }
 
@@ -937,24 +927,28 @@ struct FlatHostWindow {
     condition_width: usize,
 }
 
-fn build_flat_host_window(
-    metadata: &FlatCacheFileMeta,
+struct FlatHostWindowBuildContext {
+    metadata: FlatCacheFileMeta,
     cache_item_offset: usize,
-    plan: HostWindowPlan,
     similarity_teacher: SimilarityTeacherConfig,
-    progress: &LoaderProgress,
     batch_size: usize,
     max_batches: usize,
     epoch_items: usize,
-    prefix: &str,
+    progress: LoaderProgress,
+    prefix: String,
+}
+
+fn build_flat_host_window(
+    context: &FlatHostWindowBuildContext,
+    plan: HostWindowPlan,
 ) -> Result<FlatHostWindow, LoaderWorkerError> {
     let producer_start = Instant::now();
     let disk_start = Instant::now();
     let cache = read_flat_cpu_cache_window_file(
-        metadata,
-        cache_item_offset + plan.start_item,
+        &context.metadata,
+        context.cache_item_offset + plan.start_item,
         plan.items,
-        prefix.to_string(),
+        context.prefix.clone(),
         None,
         false,
     )?;
@@ -967,18 +961,18 @@ fn build_flat_host_window(
     }
 
     let host_pack_start = Instant::now();
-    progress.cache_filling(
+    context.progress.cache_filling(
         plan.start_item + cache.items,
-        epoch_items,
-        (plan.start_item + cache.items).div_ceil(batch_size),
-        max_batches,
+        context.epoch_items,
+        (plan.start_item + cache.items).div_ceil(context.batch_size),
+        context.max_batches,
     );
     let host_pack = host_pack_start.elapsed();
 
     let teacher_start = Instant::now();
-    let teacher = similarity_teacher.enabled().then(|| {
+    let teacher = context.similarity_teacher.enabled().then(|| {
         Arc::new(teacher_spectra_cache_from_target_pairs(
-            similarity_teacher,
+            context.similarity_teacher,
             &cache.spectra,
             &cache.conditions,
             cache.items,

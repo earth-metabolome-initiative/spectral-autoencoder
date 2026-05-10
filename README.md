@@ -58,9 +58,9 @@ the cleaned spectra.
 ## GeMS-A10 Training
 
 The examples use mascot-rs' GeMS-A10 Zenodo loaders. Data is cached under
-`datasets/gems-a10-top-128-peaks` by default. The flat-vector example also keeps
-a persistent preprocessed vector cache so restarts can skip repeated
-vectorization and stream fixed-size GPU windows from disk.
+`datasets/gems-a10-top-128-peaks` by default. The examples also keep persistent
+preprocessed caches so restarts can skip repeated vectorization or tokenization
+and stream fixed-size GPU windows from disk.
 Set `GEMS_LOADER_PROFILE_EVERY` to emit averaged loader timings; with the Burn
 TUI feature enabled they are written to `$GEMS_RUN_DIR/loader-profile.log` by
 default so terminal rendering stays clean.
@@ -86,7 +86,7 @@ Run the peak-set model:
 
 ```bash
 RUSTFLAGS="-C target-cpu=native" \
-GEMS_RUN_DIR=runs/gems-a10-top128-peak-window16-bs128-5epoch \
+GEMS_RUN_DIR=runs/gems-a10-top128-peak-window8-bs128-5epoch \
 GEMS_GPU_WINDOW_BATCHES=8 \
 GEMS_LOADER_WORKERS=16 \
 GEMS_HOST_PREFETCH_WINDOWS=8 \

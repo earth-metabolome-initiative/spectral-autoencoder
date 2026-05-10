@@ -40,20 +40,32 @@ pub struct TokenCacheShape {
     pub condition_width: usize,
 }
 
+pub struct TokenizedLoaderOptions<B: Backend> {
+    pub device: B::Device,
+    pub progress: LoaderProgress,
+    pub start_item: usize,
+    pub augment: Option<SpectrumAugmentationConfig>,
+    pub loader_config: StreamingTrainingLoaderConfig,
+    pub token_cache_shape: TokenCacheShape,
+}
+
 pub fn streaming_tokenized_loader<B, Open>(
     args: &RunArgs,
-    device: B::Device,
-    progress: LoaderProgress,
-    start_item: usize,
-    augment: Option<SpectrumAugmentationConfig>,
-    loader_config: StreamingTrainingLoaderConfig,
-    token_cache_shape: TokenCacheShape,
+    options: TokenizedLoaderOptions<B>,
     open_records: Open,
 ) -> Arc<dyn DataLoader<B, TokenizedAutoencoderBatch<B>>>
 where
     B: SimilarityTeacherBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
 {
+    let TokenizedLoaderOptions {
+        device,
+        progress,
+        start_item,
+        augment,
+        loader_config,
+        token_cache_shape,
+    } = options;
     let preprocessed_cache_path =
         token_preprocessed_cache_path(args, start_item, progress.max_batches, token_cache_shape);
     let loader = Arc::new(StreamingTokenizedMgfLoader::new(
@@ -513,9 +525,8 @@ where
                 self.mgf_source
             )
         });
-        if bool_var("GEMS_TOKEN_PREPROCESSED_CACHE_REFRESH", false)
-            || !path.try_exists().unwrap_or(false)
-        {
+        // Refresh is consumed during cache preparation; iteration only needs the rebuilt file.
+        if !path.try_exists().unwrap_or(false) {
             panic!(
                 "preprocessed token cache {} is unavailable; it should have been prepared before iteration",
                 path.display()
@@ -531,31 +542,22 @@ where
                 )
             });
         let plans = host_window_plan(total_items, self.window_items);
-        let cache_item_offset = self.cache_item_offset;
-        let similarity_teacher = self.similarity_teacher;
-        let progress = self.progress.clone();
-        let batch_size = self.batch_size;
-        let max_batches = self.max_batches;
-        let epoch_items = self.epoch_items;
-        let prefix = format!("{} disk", self.progress.label);
+        let build_context = TokenHostWindowBuildContext {
+            metadata,
+            cache_item_offset: self.cache_item_offset,
+            similarity_teacher: self.similarity_teacher,
+            progress: self.progress.clone(),
+            batch_size: self.batch_size,
+            max_batches: self.max_batches,
+            epoch_items: self.epoch_items,
+            prefix: format!("{} disk", self.progress.label),
+        };
 
         spawn_ordered_host_workers(
             plans,
             self.loader_workers,
             self.host_prefetch_windows,
-            move |_worker_id, plan| {
-                build_token_host_window(
-                    &metadata,
-                    cache_item_offset,
-                    plan,
-                    similarity_teacher,
-                    &progress,
-                    batch_size,
-                    max_batches,
-                    epoch_items,
-                    &prefix,
-                )
-            },
+            move |_worker_id, plan| build_token_host_window(&build_context, plan),
         )
     }
 
@@ -852,24 +854,28 @@ struct TokenCacheFileMeta {
     conditions_offset: u64,
 }
 
-fn build_token_host_window(
-    metadata: &TokenCacheFileMeta,
+struct TokenHostWindowBuildContext {
+    metadata: TokenCacheFileMeta,
     cache_item_offset: usize,
-    plan: HostWindowPlan,
     similarity_teacher: SimilarityTeacherConfig,
-    progress: &LoaderProgress,
     batch_size: usize,
     max_batches: usize,
     epoch_items: usize,
-    prefix: &str,
+    progress: LoaderProgress,
+    prefix: String,
+}
+
+fn build_token_host_window(
+    context: &TokenHostWindowBuildContext,
+    plan: HostWindowPlan,
 ) -> Result<TokenHostWindow, LoaderWorkerError> {
     let producer_start = Instant::now();
     let disk_start = Instant::now();
     let cache = read_token_cpu_cache_window_file(
-        metadata,
-        cache_item_offset + plan.start_item,
+        &context.metadata,
+        context.cache_item_offset + plan.start_item,
         plan.items,
-        prefix.to_string(),
+        context.prefix.clone(),
     )?;
     let disk_read = disk_start.elapsed();
     if cache.items != plan.items {
@@ -880,18 +886,18 @@ fn build_token_host_window(
     }
 
     let host_pack_start = Instant::now();
-    progress.cache_filling(
+    context.progress.cache_filling(
         plan.start_item + cache.items,
-        epoch_items,
-        (plan.start_item + cache.items).div_ceil(batch_size),
-        max_batches,
+        context.epoch_items,
+        (plan.start_item + cache.items).div_ceil(context.batch_size),
+        context.max_batches,
     );
     let host_pack = host_pack_start.elapsed();
 
     let teacher_start = Instant::now();
-    let teacher = similarity_teacher.enabled().then(|| {
+    let teacher = context.similarity_teacher.enabled().then(|| {
         Arc::new(teacher_spectra_cache_from_target_pairs(
-            similarity_teacher,
+            context.similarity_teacher,
             &cache.target_pairs,
             &cache.conditions,
             cache.items,

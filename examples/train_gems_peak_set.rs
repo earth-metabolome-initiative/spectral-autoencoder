@@ -31,10 +31,18 @@ mod app {
         print_streaming_run_header, save_model_record, similarity_teacher_config_from_env,
         warm_start_model,
     };
-    use crate::gems_peak_set::{TokenCacheShape, streaming_tokenized_loader};
+    use crate::gems_peak_set::{
+        TokenCacheShape, TokenizedLoaderOptions, streaming_tokenized_loader,
+    };
 
     pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let args = RunArgs::from_env_with_training_defaults("runs/gems-a10-smoke", 32, 200, 20, 1)?;
+        let args = RunArgs::from_env_with_training_defaults(
+            "runs/gems-a10-top128-peak-window8-bs128-5epoch",
+            128,
+            10000,
+            512,
+            5,
+        )?;
         std::fs::create_dir_all(&args.output_dir)?;
 
         let progress = Arc::new(GeMSProgress::new(
@@ -64,24 +72,28 @@ mod app {
         let train_tokenizer_config = tokenizer_config.clone();
         let train_loader = streaming_tokenized_loader::<TrainingBackend, _>(
             &args,
-            device.clone(),
-            progress.train.clone(),
-            args.train_start_item(),
-            Some(augmentation),
-            loader_config,
-            token_cache_shape,
+            TokenizedLoaderOptions {
+                device: device.clone(),
+                progress: progress.train.clone(),
+                start_item: args.train_start_item(),
+                augment: Some(augmentation),
+                loader_config,
+                token_cache_shape,
+            },
             move || open_records(train_builder.clone(), train_tokenizer_config.clone()),
         );
         let valid_builder = args.gems_builder.clone();
         let valid_tokenizer_config = tokenizer_config.clone();
         let valid_loader = streaming_tokenized_loader::<InnerBackend, _>(
             &args,
-            device.clone(),
-            progress.valid.clone(),
-            args.valid_start_item(),
-            None,
-            loader_config,
-            token_cache_shape,
+            TokenizedLoaderOptions {
+                device: device.clone(),
+                progress: progress.valid.clone(),
+                start_item: args.valid_start_item(),
+                augment: None,
+                loader_config,
+                token_cache_shape,
+            },
             move || open_records(valid_builder.clone(), valid_tokenizer_config.clone()),
         );
 
