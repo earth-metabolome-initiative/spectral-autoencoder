@@ -20,7 +20,10 @@ use crate::{
     model::auxiliary::{
         AuxiliaryLossConfig, EmbeddingAuxiliaryHeads, EmbeddingAuxiliaryHeadsConfig,
     },
-    model::reconstruction::{SetReconstructionLossConfig, set_reconstruction_loss_from_triples},
+    model::reconstruction::{
+        SetReconstructionLossConfig, reconstruction_similarity_from_triples,
+        set_reconstruction_loss_from_triples,
+    },
     tokenize::SpectrumTokenizerConfig,
 };
 
@@ -657,7 +660,7 @@ impl<B: Backend> PeakSetAutoencoder<B> {
         );
         let masked_precursor = weighted_masked_precursor_reconstruction_output(
             output.condition_reconstruction.clone(),
-            precursor_target,
+            precursor_target.clone(),
             batch.masked_precursor_mask,
             self.precursor_mz_scale,
             self.masked_precursor_weight,
@@ -671,11 +674,22 @@ impl<B: Backend> PeakSetAutoencoder<B> {
             self.similarity_ranking_min_gap,
             self.similarity_ranking_weight,
         );
+        let reconstruction_similarity = reconstruction_similarity_from_triples(
+            output.reconstruction.clone(),
+            target.clone(),
+            target_mask.clone(),
+            precursor_target,
+            output.condition_reconstruction.clone(),
+            self.loss_config(),
+        );
         let regularization = self.regularization_config().penalty(self, &device);
         let diagnostics = AutoencoderDiagnostics {
             similarity_ranking_pairs: similarity_ranking.valid_pairs,
             similarity_ranking_accuracy: similarity_ranking.accuracy,
             precursor_mae_da: precursor.mae_da,
+            self_linear_cosine: reconstruction_similarity.linear_cosine,
+            self_modified_linear_cosine: reconstruction_similarity.modified_linear_cosine,
+            self_similarity_items: reconstruction_similarity.items,
         };
         let losses = AutoencoderLossBreakdown {
             reconstruction,

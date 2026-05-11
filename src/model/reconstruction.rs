@@ -6,6 +6,8 @@ use burn::{
 };
 use serde::{Deserialize, Serialize};
 
+const RECONSTRUCTION_SIMILARITY_MAX_ITEMS: usize = 256;
+
 /// Flat-vector reconstruction alignment strategy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlatVectorReconstructionOrdering {
@@ -68,6 +70,240 @@ impl Default for SetReconstructionLossConfig {
 
 /// Backward-compatible name for the peak-set reconstruction loss configuration.
 pub type PeakSetLossConfig = SetReconstructionLossConfig;
+
+/// Reconstruction spectral-similarity diagnostics.
+pub struct ReconstructionSimilarityOutput<B: Backend> {
+    /// Linear-cosine similarity between target and reconstructed spectra.
+    pub linear_cosine: Tensor<B, 1>,
+    /// Modified-linear-cosine similarity between target and reconstructed spectra.
+    pub modified_linear_cosine: Tensor<B, 1>,
+    /// Number of spectra used by the sampled diagnostics.
+    pub items: Tensor<B, 1>,
+}
+
+/// Self-similarity diagnostics for flat vector reconstructions.
+pub fn reconstruction_similarity_from_vectors<B: Backend>(
+    reconstruction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    target_conditions: Tensor<B, 2>,
+    reconstructed_conditions: Tensor<B, 2>,
+    config: SetReconstructionLossConfig,
+) -> ReconstructionSimilarityOutput<B> {
+    let [batch_size, vector_width] = reconstruction.dims();
+    let max_peaks = vector_width / 2;
+    debug_assert_eq!(vector_width % 2, 0);
+
+    let items = batch_size.min(RECONSTRUCTION_SIMILARITY_MAX_ITEMS);
+    if items == 0 {
+        return zero_reconstruction_similarity_output(&reconstruction.device());
+    }
+
+    let reconstruction = reconstruction
+        .narrow(0, 0, items)
+        .reshape([items, max_peaks, 2]);
+    let target = target.narrow(0, 0, items).reshape([items, max_peaks, 2]);
+    let target_mask = target
+        .clone()
+        .narrow(2, 1, 1)
+        .reshape([items, max_peaks])
+        .greater_elem(0.0)
+        .float();
+    let target_conditions = target_conditions.narrow(0, 0, items);
+    let reconstructed_conditions = reconstructed_conditions.narrow(0, 0, items);
+
+    reconstruction_similarity_from_parts(
+        reconstruction,
+        target,
+        target_mask,
+        target_conditions,
+        reconstructed_conditions,
+        config,
+        items,
+    )
+}
+
+/// Self-similarity diagnostics for peak-set reconstructions.
+pub fn reconstruction_similarity_from_triples<B: Backend>(
+    reconstruction: Tensor<B, 3>,
+    target_pairs: Tensor<B, 2>,
+    target_mask: Tensor<B, 2>,
+    target_conditions: Tensor<B, 2>,
+    reconstructed_conditions: Tensor<B, 2>,
+    config: SetReconstructionLossConfig,
+) -> ReconstructionSimilarityOutput<B> {
+    let [batch_size, max_peaks, _output_width] = reconstruction.dims();
+    let items = batch_size.min(RECONSTRUCTION_SIMILARITY_MAX_ITEMS);
+    if items == 0 {
+        return zero_reconstruction_similarity_output(&reconstruction.device());
+    }
+
+    let reconstruction = reconstruction.narrow(0, 0, items);
+    let target_pairs = target_pairs
+        .narrow(0, 0, items)
+        .reshape([items, max_peaks, 2]);
+    let target_mask = target_mask.narrow(0, 0, items);
+    let target_conditions = target_conditions.narrow(0, 0, items);
+    let reconstructed_conditions = reconstructed_conditions.narrow(0, 0, items);
+
+    reconstruction_similarity_from_parts(
+        reconstruction,
+        target_pairs,
+        target_mask,
+        target_conditions,
+        reconstructed_conditions,
+        config,
+        items,
+    )
+}
+
+fn reconstruction_similarity_from_parts<B: Backend>(
+    reconstruction: Tensor<B, 3>,
+    target_pairs: Tensor<B, 3>,
+    target_mask: Tensor<B, 2>,
+    target_conditions: Tensor<B, 2>,
+    reconstructed_conditions: Tensor<B, 2>,
+    config: SetReconstructionLossConfig,
+    items: usize,
+) -> ReconstructionSimilarityOutput<B> {
+    let [batch_size, max_peaks, output_width] = reconstruction.dims();
+    let pred_mz = reconstruction
+        .clone()
+        .narrow(2, 0, 1)
+        .reshape([batch_size, max_peaks]);
+    let pred_intensity = reconstruction
+        .clone()
+        .narrow(2, 1, 1)
+        .reshape([batch_size, max_peaks]);
+    let pred_presence = if output_width >= 3 {
+        reconstruction
+            .narrow(2, 2, 1)
+            .reshape([batch_size, max_peaks])
+    } else {
+        pred_intensity.ones_like()
+    };
+    let target_mz = target_pairs
+        .clone()
+        .narrow(2, 0, 1)
+        .reshape([batch_size, max_peaks]);
+    let target_intensity = target_pairs
+        .narrow(2, 1, 1)
+        .reshape([batch_size, max_peaks]);
+
+    let pred_products = peak_products(
+        pred_mz.clone(),
+        pred_intensity,
+        pred_presence.clamp_min(0.0).clamp_max(1.0),
+        config,
+    );
+    let target_products = peak_products(
+        target_mz.clone(),
+        target_intensity,
+        target_mask.clone(),
+        config,
+    );
+    let target_precursor = normalized_precursor(target_conditions);
+    let pred_precursor = normalized_precursor(reconstructed_conditions);
+
+    let linear_cosine = reconstruction_similarity_for_match_mode(
+        pred_mz.clone(),
+        pred_products.clone(),
+        pred_precursor.clone(),
+        target_mz.clone(),
+        target_products.clone(),
+        target_mask.clone(),
+        target_precursor.clone(),
+        config.normalized_mz_tolerance,
+        false,
+    )
+    .mean();
+    let modified_linear_cosine = reconstruction_similarity_for_match_mode(
+        pred_mz,
+        pred_products,
+        pred_precursor,
+        target_mz,
+        target_products,
+        target_mask,
+        target_precursor,
+        config.normalized_mz_tolerance,
+        true,
+    )
+    .mean();
+    let device = linear_cosine.device();
+
+    ReconstructionSimilarityOutput {
+        linear_cosine,
+        modified_linear_cosine,
+        items: Tensor::<B, 1>::from_floats([items as f32], &device),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruction_similarity_for_match_mode<B: Backend>(
+    pred_mz: Tensor<B, 2>,
+    pred_products: Tensor<B, 2>,
+    pred_precursor: Tensor<B, 2>,
+    target_mz: Tensor<B, 2>,
+    target_products: Tensor<B, 2>,
+    target_mask: Tensor<B, 2>,
+    target_precursor: Tensor<B, 2>,
+    normalized_mz_tolerance: f64,
+    modified: bool,
+) -> Tensor<B, 1> {
+    let [batch_size, max_peaks] = pred_mz.dims();
+    let tolerance = normalized_mz_tolerance.max(1.0e-6);
+    let ordinary_delta =
+        (pred_mz.clone().unsqueeze_dim::<3>(2) - target_mz.clone().unsqueeze_dim::<3>(1)).abs();
+    let ordinary_match = ordinary_delta
+        .greater_elem(tolerance)
+        .float()
+        .mul_scalar(-1.0)
+        + 1.0;
+    let match_weights = if modified {
+        let pred_shifted = pred_mz - pred_precursor.expand([batch_size, max_peaks]);
+        let target_shifted = target_mz - target_precursor.expand([batch_size, max_peaks]);
+        let shifted_delta =
+            (pred_shifted.unsqueeze_dim::<3>(2) - target_shifted.unsqueeze_dim::<3>(1)).abs();
+        let shifted_match = shifted_delta
+            .greater_elem(tolerance)
+            .float()
+            .mul_scalar(-1.0)
+            + 1.0;
+        (ordinary_match + shifted_match).clamp_max(1.0)
+    } else {
+        ordinary_match
+    } * target_mask.unsqueeze_dim::<3>(1);
+
+    let pair_scores = pred_products.clone().unsqueeze_dim::<3>(2)
+        * target_products.clone().unsqueeze_dim::<3>(1)
+        * match_weights;
+    let pred_best = pair_scores
+        .clone()
+        .max_dim(2)
+        .reshape([batch_size, max_peaks]);
+    let target_best = pair_scores.max_dim(1).reshape([batch_size, max_peaks]);
+    let score_sum = (pred_best.sum_dim(1) + target_best.sum_dim(1)) * 0.5;
+    let pred_norm = (pred_products.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
+    let target_norm = (target_products.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
+
+    (score_sum / (pred_norm * target_norm))
+        .clamp_min(0.0)
+        .clamp_max(1.0)
+        .reshape([batch_size])
+}
+
+fn normalized_precursor<B: Backend>(conditions: Tensor<B, 2>) -> Tensor<B, 2> {
+    conditions.narrow(1, 0, 1).clamp_min(0.0).clamp_max(1.0)
+}
+
+fn zero_reconstruction_similarity_output<B: Backend>(
+    device: &B::Device,
+) -> ReconstructionSimilarityOutput<B> {
+    ReconstructionSimilarityOutput {
+        linear_cosine: Tensor::zeros([1], device),
+        modified_linear_cosine: Tensor::zeros([1], device),
+        items: Tensor::zeros([1], device),
+    }
+}
 
 /// Soft set-wise cosine reconstruction loss on normalized peak targets.
 pub fn set_reconstruction_loss<B: Backend>(
@@ -519,6 +755,50 @@ mod tests {
                 .into_scalar();
 
         assert!((vector_loss - triple_loss).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn reconstruction_similarity_reports_identity() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let spectra = Tensor::<B, 2>::from_floats([[0.1, 1.0, 0.4, 0.25]], &device);
+        let conditions = Tensor::<B, 2>::from_floats([[0.5, 1.0]], &device);
+
+        let output = reconstruction_similarity_from_vectors(
+            spectra.clone(),
+            spectra,
+            conditions.clone(),
+            conditions,
+            SetReconstructionLossConfig::default(),
+        );
+
+        assert!(output.linear_cosine.into_scalar() > 0.99);
+        assert!(output.modified_linear_cosine.into_scalar() > 0.99);
+        assert_eq!(output.items.into_scalar(), 1.0);
+    }
+
+    #[test]
+    fn reconstruction_similarity_modified_cosine_accepts_precursor_shift() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let target = Tensor::<B, 2>::from_floats([[0.30, 1.0]], &device);
+        let shifted = Tensor::<B, 2>::from_floats([[0.40, 1.0]], &device);
+        let target_conditions = Tensor::<B, 2>::from_floats([[0.50, 1.0]], &device);
+        let shifted_conditions = Tensor::<B, 2>::from_floats([[0.60, 1.0]], &device);
+
+        let output = reconstruction_similarity_from_vectors(
+            shifted,
+            target,
+            target_conditions,
+            shifted_conditions,
+            SetReconstructionLossConfig {
+                normalized_mz_tolerance: 0.02,
+                ..SetReconstructionLossConfig::default()
+            },
+        );
+
+        assert!(output.linear_cosine.into_scalar() < 0.01);
+        assert!(output.modified_linear_cosine.into_scalar() > 0.99);
     }
 
     #[test]

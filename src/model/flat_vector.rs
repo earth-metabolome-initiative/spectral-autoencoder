@@ -33,7 +33,8 @@ use crate::{
     },
     model::reconstruction::{
         flat_vector_reconstruction_losses_from_vectors_with_masks,
-        vector_element_mask_to_peak_mask, vector_target_mask,
+        reconstruction_similarity_from_vectors, vector_element_mask_to_peak_mask,
+        vector_target_mask,
     },
     training::{AutoencoderDiagnostics, AutoencoderLossBreakdown},
 };
@@ -526,7 +527,7 @@ impl<B: Backend> SpectralAutoencoder<B> {
         );
         let masked_precursor = weighted_masked_precursor_reconstruction_output(
             output.condition_reconstruction.clone(),
-            precursor_target,
+            precursor_target.clone(),
             batch.masked_precursor_mask,
             self.precursor_mz_scale,
             self.masked_precursor_weight,
@@ -540,11 +541,21 @@ impl<B: Backend> SpectralAutoencoder<B> {
             self.similarity_ranking_min_gap,
             self.similarity_ranking_weight,
         );
+        let reconstruction_similarity = reconstruction_similarity_from_vectors(
+            output.reconstruction.clone(),
+            target.clone(),
+            precursor_target,
+            output.condition_reconstruction.clone(),
+            reconstruction_config,
+        );
         let regularization = self.regularization_config().penalty(self, &device);
         let diagnostics = AutoencoderDiagnostics {
             similarity_ranking_pairs: similarity_ranking.valid_pairs,
             similarity_ranking_accuracy: similarity_ranking.accuracy,
             precursor_mae_da: precursor.mae_da,
+            self_linear_cosine: reconstruction_similarity.linear_cosine,
+            self_modified_linear_cosine: reconstruction_similarity.modified_linear_cosine,
+            self_similarity_items: reconstruction_similarity.items,
         };
         let losses = AutoencoderLossBreakdown {
             reconstruction,
