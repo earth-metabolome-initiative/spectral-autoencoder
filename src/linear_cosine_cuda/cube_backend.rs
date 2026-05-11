@@ -95,24 +95,26 @@ where
             "similarity-ranking batch is outside the teacher cache window"
         );
 
-        let index_shape = Shape::new([config.batch_items]);
-        let delta_shape = Shape::new([config.batch_items]);
-        let partner_a = empty_device_dtype(
+        let candidate_count = config.effective_candidates_per_anchor();
+        let candidate_shape = Shape::new([config.batch_items, candidate_count]);
+        let position_shape = Shape::new([config.batch_items]);
+        let gap_shape = Shape::new([config.batch_items]);
+        let candidate_index = empty_device_dtype(
             teacher_mz.client.clone(),
             teacher_mz.device.clone(),
-            index_shape.clone(),
+            candidate_shape,
             I::dtype(),
         );
-        let partner_b = empty_device_dtype(
+        let best_candidate_position = empty_device_dtype(
             teacher_mz.client.clone(),
             teacher_mz.device.clone(),
-            index_shape,
+            position_shape,
             I::dtype(),
         );
-        let target_delta = empty_device_dtype(
+        let top2_gap = empty_device_dtype(
             teacher_mz.client.clone(),
             teacher_mz.device.clone(),
-            delta_shape,
+            gap_shape,
             teacher_mz.dtype,
         );
 
@@ -128,9 +130,9 @@ where
             teacher_mz.into_tensor_arg(),
             teacher_intensity.into_tensor_arg(),
             teacher_precursor.into_tensor_arg(),
-            partner_a.clone().into_tensor_arg(),
-            partner_b.clone().into_tensor_arg(),
-            target_delta.clone().into_tensor_arg(),
+            candidate_index.clone().into_tensor_arg(),
+            best_candidate_position.clone().into_tensor_arg(),
+            top2_gap.clone().into_tensor_arg(),
             config.batch_start as u32,
             config.batch_items as u32,
             config.candidates_per_anchor as u32,
@@ -143,6 +145,6 @@ where
             config.max_peaks,
         );
 
-        (partner_a, partner_b, target_delta)
+        (candidate_index, best_candidate_position, top2_gap)
     }
 }

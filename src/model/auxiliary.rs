@@ -5,7 +5,10 @@ use burn::{
     nn::{Linear, LinearConfig, Relu},
     prelude::*,
     tensor::TensorData,
-    tensor::{Distribution, Int, Tensor, activation::sigmoid},
+    tensor::{
+        Distribution, Int, Tensor,
+        activation::{log_softmax, sigmoid},
+    },
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,13 +27,13 @@ pub struct AuxiliaryLossConfig {
     pub masked_precursor_weight: f64,
     /// Weight for preserving clean-spectrum similarity order in latent space.
     pub similarity_ranking_weight: f64,
-    /// Temperature applied to latent cosine gaps in the pairwise logistic ranking loss.
+    /// Temperature applied to latent cosine logits in the softmax ranking loss.
     #[serde(
         default = "default_similarity_ranking_latent_temperature",
         alias = "similarity_ranking_margin"
     )]
     pub similarity_ranking_latent_temperature: f64,
-    /// Temperature applied to teacher similarity gaps in the pairwise logistic ranking loss.
+    /// Deprecated compatibility field; the hard-label softmax ranking loss ignores it.
     #[serde(default = "default_similarity_ranking_teacher_temperature")]
     pub similarity_ranking_teacher_temperature: f64,
     /// Minimum clean-spectrum cosine gap required for a sampled ranking pair.
@@ -135,16 +138,16 @@ impl<B: Backend> EmbeddingAuxiliaryHeads<B> {
     }
 }
 
-/// Batch fields used to supervise similarity-ranking from non-differentiable
-/// teacher scores.
+/// Batch fields used to supervise similarity ranking from non-differentiable
+/// teacher scores over a sampled candidate set.
 #[derive(Debug, Clone)]
 pub struct SimilarityRankingBatch<B: Backend> {
-    /// First partner row index for each anchor.
-    pub partner_a_index: Tensor<B, 1, Int>,
-    /// Second partner row index for each anchor.
-    pub partner_b_index: Tensor<B, 1, Int>,
-    /// Teacher score delta `score(anchor, a) - score(anchor, b)`.
-    pub target_delta: Tensor<B, 2>,
+    /// Candidate partner row indices for each anchor, shaped `[batch, candidates]`.
+    pub candidate_index: Tensor<B, 2, Int>,
+    /// Position of the highest-scoring candidate in each anchor's candidate row.
+    pub best_candidate_position: Tensor<B, 1, Int>,
+    /// Teacher score gap between the best and runner-up candidates.
+    pub top2_gap: Tensor<B, 2>,
 }
 
 impl<B: Backend> SimilarityRankingBatch<B> {
@@ -152,15 +155,15 @@ impl<B: Backend> SimilarityRankingBatch<B> {
     pub fn zeros(batch_size: usize, device: &B::Device) -> Self {
         let indices = vec![0_i64; batch_size];
         Self {
-            partner_a_index: Tensor::<B, 1, Int>::from_data(
-                TensorData::new(indices.clone(), [batch_size]),
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![0_i64; batch_size * 2], [batch_size, 2]),
                 device,
             ),
-            partner_b_index: Tensor::<B, 1, Int>::from_data(
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
                 TensorData::new(indices, [batch_size]),
                 device,
             ),
-            target_delta: Tensor::<B, 2>::zeros([batch_size, 1], device),
+            top2_gap: Tensor::<B, 2>::zeros([batch_size, 1], device),
         }
     }
 }
@@ -340,10 +343,10 @@ pub struct SimilarityRankingOutput<B: Backend> {
     pub accuracy: Tensor<B, 1>,
 }
 
-/// In-batch pairwise logistic ranking loss that preserves teacher similarity order.
+/// In-batch softmax ranking loss that preserves sampled teacher similarity order.
 ///
-/// The teacher scores define fixed soft targets. Gradients flow only through
-/// the latent cosine similarities.
+/// The teacher scores define a hard best-candidate target and a top-2 gap
+/// weight. Gradients flow only through the latent cosine similarities.
 pub fn similarity_ranking_loss<B: Backend>(
     latent: Tensor<B, 2>,
     batch: SimilarityRankingBatch<B>,
@@ -363,17 +366,21 @@ pub fn similarity_ranking_loss<B: Backend>(
     .loss
 }
 
-/// In-batch pairwise logistic ranking objective and diagnostics for teacher similarity order.
+/// In-batch softmax ranking objective and diagnostics for teacher similarity order.
 pub fn similarity_ranking_output<B: Backend>(
     latent: Tensor<B, 2>,
     batch: SimilarityRankingBatch<B>,
     max_pairs: usize,
     latent_temperature: f64,
-    teacher_temperature: f64,
+    _teacher_temperature: f64,
     min_gap: f64,
 ) -> SimilarityRankingOutput<B> {
-    let [batch_size, _latent_width] = latent.dims();
+    let [batch_size, latent_width] = latent.dims();
     if batch_size < 3 {
+        return zero_similarity_ranking_output(&latent.device());
+    }
+    let [_candidate_rows, candidate_count] = batch.candidate_index.dims();
+    if candidate_count < 2 {
         return zero_similarity_ranking_output(&latent.device());
     }
 
@@ -387,32 +394,42 @@ pub fn similarity_ranking_output<B: Backend>(
     }
 
     let anchor_latent = latent.clone().narrow(0, 0, pair_count);
-    let latent_a = latent
+    let candidate_index = batch.candidate_index.narrow(0, 0, pair_count);
+    let flat_candidate_index = candidate_index.reshape([pair_count * candidate_count]);
+    let candidate_latent = latent.clone().select(0, flat_candidate_index).reshape([
+        pair_count,
+        candidate_count,
+        latent_width,
+    ]);
+    let anchor_latent =
+        anchor_latent
+            .unsqueeze_dim::<3>(1)
+            .expand([pair_count, candidate_count, latent_width]);
+    let logits =
+        row_cosine_similarity_3d(anchor_latent, candidate_latent) / latent_temperature.max(1.0e-6);
+    let log_probs = log_softmax(logits.clone(), 1);
+    let target = batch
+        .best_candidate_position
         .clone()
-        .select(0, batch.partner_a_index.narrow(0, 0, pair_count));
-    let latent_b = latent
-        .clone()
-        .select(0, batch.partner_b_index.narrow(0, 0, pair_count));
-    let latent_delta = row_cosine_similarity(anchor_latent.clone(), latent_a)
-        - row_cosine_similarity(anchor_latent, latent_b);
-    let target_delta = batch.target_delta.narrow(0, 0, pair_count).detach();
-    let target_gap = target_delta.clone().abs();
-    let target_direction = target_delta.clone() / (target_gap.clone() + 1.0e-6);
+        .narrow(0, 0, pair_count)
+        .one_hot::<2>(candidate_count)
+        .float();
+    let cross_entropy = (log_probs * target * -1.0).sum_dim(1);
+    let target_gap = batch.top2_gap.narrow(0, 0, pair_count).detach();
     let valid = target_gap.clone().greater_elem(min_gap).float();
     let valid_pairs = valid.clone().sum();
     let gap_weights = target_gap * valid.clone();
     let gap_weight_sum = gap_weights.clone().sum().clamp_min(1.0e-6);
-    let ordered_delta = target_direction * latent_delta.clone();
-    let latent_logit = latent_delta / latent_temperature.max(1.0e-6);
-    let teacher_target = sigmoid(target_delta / teacher_temperature.max(1.0e-6));
-    let binary_cross_entropy = latent_logit.clone().clamp_min(0.0)
-        - latent_logit.clone() * teacher_target
-        + ((latent_logit.abs() * -1.0).exp() + 1.0).log();
-    let accuracy = (ordered_delta.greater_elem(0.0).float() * valid.clone()).sum()
+    let predicted_best = logits.argmax(1);
+    let teacher_best = batch
+        .best_candidate_position
+        .narrow(0, 0, pair_count)
+        .reshape([pair_count, 1]);
+    let accuracy = (predicted_best.equal(teacher_best).float() * valid.clone()).sum()
         / valid_pairs.clone().clamp_min(1.0);
 
     SimilarityRankingOutput {
-        loss: (binary_cross_entropy * gap_weights).sum() / gap_weight_sum,
+        loss: (cross_entropy * gap_weights).sum() / gap_weight_sum,
         valid_pairs,
         accuracy,
     }
@@ -474,13 +491,15 @@ fn zero_similarity_ranking_output<B: Backend>(device: &B::Device) -> SimilarityR
     }
 }
 
-fn row_cosine_similarity<B: Backend>(left: Tensor<B, 2>, right: Tensor<B, 2>) -> Tensor<B, 2> {
-    let numerator = (left.clone() * right.clone()).sum_dim(1);
-    let left_norm = (left.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
-    let right_norm = (right.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
+fn row_cosine_similarity_3d<B: Backend>(left: Tensor<B, 3>, right: Tensor<B, 3>) -> Tensor<B, 2> {
+    let [batch_size, candidate_count, _latent_width] = left.dims();
+    let numerator = (left.clone() * right.clone()).sum_dim(2);
+    let left_norm = (left.powf_scalar(2.0).sum_dim(2) + 1.0e-6).sqrt();
+    let right_norm = (right.powf_scalar(2.0).sum_dim(2) + 1.0e-6).sqrt();
     (numerator / (left_norm * right_norm))
         .clamp_min(-1.0)
         .clamp_max(1.0)
+        .reshape([batch_size, candidate_count])
 }
 
 /// Binary intruder detection loss over active input peak slots.
@@ -669,15 +688,15 @@ mod tests {
         let latent =
             Tensor::<B, 2>::from_floats([[0.0, 1.0], [1.0, 0.0], [0.0, 0.9], [0.9, 0.0]], &device);
         let batch = SimilarityRankingBatch {
-            partner_a_index: Tensor::<B, 1, Int>::from_data(
-                TensorData::new(vec![2_i64, 3, 0, 1], [4]),
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![2_i64, 1, 3, 0, 0, 3, 1, 2], [4, 2]),
                 &device,
             ),
-            partner_b_index: Tensor::<B, 1, Int>::from_data(
-                TensorData::new(vec![1_i64, 0, 3, 2], [4]),
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![0_i64, 0, 0, 0], [4]),
                 &device,
             ),
-            target_delta: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
+            top2_gap: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
         };
 
         let loss = similarity_ranking_loss(latent, batch, 0, 0.10, 0.10, 0.01).into_scalar();
@@ -693,15 +712,15 @@ mod tests {
         let latent =
             Tensor::<B, 2>::from_floats([[0.0, 1.0], [1.0, 0.0], [0.0, 0.9], [0.9, 0.0]], &device);
         let batch = SimilarityRankingBatch {
-            partner_a_index: Tensor::<B, 1, Int>::from_data(
-                TensorData::new(vec![2_i64, 3, 0, 1], [4]),
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![2_i64, 1, 3, 0, 0, 3, 1, 2], [4, 2]),
                 &device,
             ),
-            partner_b_index: Tensor::<B, 1, Int>::from_data(
-                TensorData::new(vec![1_i64, 0, 3, 2], [4]),
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![0_i64, 0, 0, 0], [4]),
                 &device,
             ),
-            target_delta: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
+            top2_gap: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
         };
 
         let output = similarity_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01);
@@ -713,31 +732,53 @@ mod tests {
     }
 
     #[test]
-    fn similarity_ranking_loss_weights_pairwise_logistic_by_metric_gap() {
+    fn similarity_ranking_loss_weights_softmax_cross_entropy_by_top2_gap() {
         type B = burn::backend::NdArray<f32, i64>;
         let device = burn::backend::ndarray::NdArrayDevice::default();
         let latent = Tensor::<B, 2>::from_floats([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], &device);
         let batch = SimilarityRankingBatch {
-            partner_a_index: Tensor::<B, 1, Int>::from_data(
-                TensorData::new(vec![1_i64, 2, 0], [3]),
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![1_i64, 2, 2, 0, 0, 1], [3, 2]),
                 &device,
             ),
-            partner_b_index: Tensor::<B, 1, Int>::from_data(
-                TensorData::new(vec![2_i64, 0, 1], [3]),
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![0_i64, 0, 0], [3]),
                 &device,
             ),
-            target_delta: Tensor::<B, 2>::from_floats([[0.9], [0.1], [0.0]], &device),
+            top2_gap: Tensor::<B, 2>::from_floats([[0.9], [0.1], [0.0]], &device),
         };
 
         let loss = similarity_ranking_loss(latent, batch, 0, 0.5, 0.5, 0.01).into_scalar();
-        let expected = (0.9 * bce_with_logits(1.0 / 0.5, sigmoid_scalar(0.9 / 0.5))
-            + 0.1 * bce_with_logits(-1.0 / 0.5, sigmoid_scalar(0.1 / 0.5)))
+        let expected = (0.9 * softmax_ce_for_class0(2.0, 0.0)
+            + 0.1 * softmax_ce_for_class0(0.0, 2.0))
             / (0.9 + 0.1);
 
         assert!(
             (loss - expected).abs() < 1.0e-3,
-            "expected gap-weighted pairwise logistic loss near {expected}, got {loss}"
+            "expected gap-weighted softmax CE near {expected}, got {loss}"
         );
+    }
+
+    #[test]
+    fn similarity_ranking_pairs_per_batch_limits_anchors() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let latent = Tensor::<B, 2>::from_floats([[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]], &device);
+        let batch = SimilarityRankingBatch {
+            candidate_index: Tensor::<B, 2, Int>::from_data(
+                TensorData::new(vec![1_i64, 2, 2, 0, 0, 1], [3, 2]),
+                &device,
+            ),
+            best_candidate_position: Tensor::<B, 1, Int>::from_data(
+                TensorData::new(vec![0_i64, 0, 0], [3]),
+                &device,
+            ),
+            top2_gap: Tensor::<B, 2>::from_floats([[0.9], [0.1], [0.1]], &device),
+        };
+
+        let output = similarity_ranking_output(latent, batch, 1, 0.5, 0.5, 0.01);
+
+        assert_eq!(output.valid_pairs.into_scalar(), 1.0);
     }
 
     #[test]
@@ -752,11 +793,9 @@ mod tests {
         assert_eq!(loss, 0.0);
     }
 
-    fn sigmoid_scalar(value: f32) -> f32 {
-        1.0 / (1.0 + (-value).exp())
-    }
-
-    fn bce_with_logits(logit: f32, target: f32) -> f32 {
-        logit.max(0.0) - logit * target + (1.0 + (-logit.abs()).exp()).ln()
+    fn softmax_ce_for_class0(class0_logit: f32, class1_logit: f32) -> f32 {
+        let max_logit = class0_logit.max(class1_logit);
+        max_logit + ((class0_logit - max_logit).exp() + (class1_logit - max_logit).exp()).ln()
+            - class0_logit
     }
 }

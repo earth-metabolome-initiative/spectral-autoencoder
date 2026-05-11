@@ -64,6 +64,15 @@ pub struct SimilarityRankingKernelConfig {
     pub epsilon: f64,
 }
 
+impl SimilarityRankingKernelConfig {
+    /// Effective number of candidate partners scored for each anchor.
+    pub fn effective_candidates_per_anchor(self) -> usize {
+        self.candidates_per_anchor
+            .max(2)
+            .min(self.batch_items.saturating_sub(1))
+    }
+}
+
 /// Compute paired preprocessed linear-cosine similarities on the backend.
 pub fn linear_cosine_preprocessed_paired_kernel<B: LinearCosineKernelBackend>(
     left_mz: BurnTensor<B, 2>,
@@ -96,21 +105,22 @@ pub fn linear_cosine_similarity_ranking_kernel<B: LinearCosineKernelBackend>(
     teacher_precursor: BurnTensor<B, 1>,
     config: SimilarityRankingKernelConfig,
 ) -> (
-    BurnTensor<B, 1, TensorInt>,
+    BurnTensor<B, 2, TensorInt>,
     BurnTensor<B, 1, TensorInt>,
     BurnTensor<B, 2>,
 ) {
-    let (partner_a, partner_b, target_delta) = B::linear_cosine_similarity_ranking_kernel(
-        teacher_mz.into_primitive().tensor(),
-        teacher_intensity.into_primitive().tensor(),
-        teacher_precursor.into_primitive().tensor(),
-        config,
-    );
+    let (candidate_index, best_candidate_position, top2_gap) =
+        B::linear_cosine_similarity_ranking_kernel(
+            teacher_mz.into_primitive().tensor(),
+            teacher_intensity.into_primitive().tensor(),
+            teacher_precursor.into_primitive().tensor(),
+            config,
+        );
 
     (
-        BurnTensor::new(partner_a),
-        BurnTensor::new(partner_b),
-        BurnTensor::<B, 1>::from_primitive(TensorPrimitive::Float(target_delta))
+        BurnTensor::new(candidate_index),
+        BurnTensor::new(best_candidate_position),
+        BurnTensor::<B, 1>::from_primitive(TensorPrimitive::Float(top2_gap))
             .reshape([config.batch_items, 1]),
     )
 }

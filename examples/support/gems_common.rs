@@ -341,7 +341,7 @@ pub fn print_streaming_run_header(
     }
     println!("similarity teacher: {}", similarity_teacher.summary());
     println!(
-        "auxiliary losses: reconstruction {} masked {} intruder {} precursor {} masked-precursor {} similarity-ranking {} similarity-ranking-latent-temperature {} similarity-ranking-teacher-temperature {} latent-noise-std {} similarity-ranking-pairs/batch {}",
+        "auxiliary losses: reconstruction {} masked {} intruder {} precursor {} masked-precursor {} similarity-ranking {} similarity-ranking-latent-temperature {} latent-noise-std {} similarity-ranking-pairs/batch {}",
         auxiliary.reconstruction_weight,
         auxiliary.masked_peak_weight,
         auxiliary.intruder_peak_weight,
@@ -349,7 +349,6 @@ pub fn print_streaming_run_header(
         auxiliary.masked_precursor_weight,
         auxiliary.similarity_ranking_weight,
         auxiliary.similarity_ranking_latent_temperature,
-        auxiliary.similarity_ranking_teacher_temperature,
         auxiliary.latent_noise_std,
         if auxiliary.similarity_ranking_pairs_per_batch == 0 {
             "all".to_string()
@@ -996,7 +995,7 @@ pub(crate) fn teacher_similarity_ranking_batch<B: SimilarityTeacherBackend>(
 
     #[cfg(feature = "cuda")]
     {
-        let (partner_a_index, partner_b_index, target_delta) =
+        let (candidate_index, best_candidate_position, top2_gap) =
             linear_cosine_similarity_ranking_kernel(
                 teacher_gpu.mz.clone(),
                 teacher_gpu.intensity.clone(),
@@ -1015,9 +1014,9 @@ pub(crate) fn teacher_similarity_ranking_batch<B: SimilarityTeacherBackend>(
                 },
             );
         SimilarityRankingBatch {
-            partner_a_index,
-            partner_b_index,
-            target_delta,
+            candidate_index,
+            best_candidate_position,
+            top2_gap,
         }
     }
 

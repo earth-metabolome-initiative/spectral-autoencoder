@@ -119,7 +119,7 @@ where
             .stateful()
         {
             OpsKind::Tracked(prep) => {
-                let (partner_a, partner_b, target_delta) =
+                let (candidate_index, best_candidate_position, top2_gap) =
                     B::linear_cosine_similarity_ranking_kernel(
                         teacher_mz.primitive.clone(),
                         teacher_intensity.primitive.clone(),
@@ -127,10 +127,14 @@ where
                         config,
                     );
 
-                (partner_a, partner_b, prep.finish((), target_delta))
+                (
+                    candidate_index,
+                    best_candidate_position,
+                    prep.finish((), top2_gap),
+                )
             }
             OpsKind::UnTracked(prep) => {
-                let (partner_a, partner_b, target_delta) =
+                let (candidate_index, best_candidate_position, top2_gap) =
                     B::linear_cosine_similarity_ranking_kernel(
                         teacher_mz.primitive,
                         teacher_intensity.primitive,
@@ -138,7 +142,11 @@ where
                         config,
                     );
 
-                (partner_a, partner_b, prep.finish(target_delta))
+                (
+                    candidate_index,
+                    best_candidate_position,
+                    prep.finish(top2_gap),
+                )
             }
         }
     }

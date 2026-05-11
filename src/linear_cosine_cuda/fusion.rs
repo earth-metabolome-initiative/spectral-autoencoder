@@ -95,20 +95,21 @@ where
         let streams =
             OperationStreams::with_inputs([&teacher_mz, &teacher_intensity, &teacher_precursor]);
         let client = teacher_mz.client.clone();
-        let index_shape = Shape::new([config.batch_items]);
-        let delta_shape = Shape::new([config.batch_items]);
-        let partner_a = TensorIr::uninit(
+        let candidate_count = config.effective_candidates_per_anchor();
+        let candidate_shape = Shape::new([config.batch_items, candidate_count]);
+        let position_shape = Shape::new([config.batch_items]);
+        let gap_shape = Shape::new([config.batch_items]);
+        let candidate_index = TensorIr::uninit(
             client.create_empty_handle(),
-            index_shape.clone(),
+            candidate_shape,
             B::IntElem::dtype(),
         );
-        let partner_b = TensorIr::uninit(
+        let best_candidate_position = TensorIr::uninit(
             client.create_empty_handle(),
-            index_shape,
+            position_shape,
             B::IntElem::dtype(),
         );
-        let target_delta =
-            TensorIr::uninit(client.create_empty_handle(), delta_shape, teacher_mz.dtype);
+        let top2_gap = TensorIr::uninit(client.create_empty_handle(), gap_shape, teacher_mz.dtype);
         let desc = CustomOpIr::new(
             "linear_cosine_similarity_ranking_forward",
             &[
@@ -116,7 +117,7 @@ where
                 teacher_intensity.into_ir(),
                 teacher_precursor.into_ir(),
             ],
-            &[partner_a, partner_b, target_delta],
+            &[candidate_index, best_candidate_position, top2_gap],
         );
 
         let mut outputs = client.register(
@@ -128,15 +129,17 @@ where
                 backend: PhantomData,
             },
         );
-        let target_delta = outputs.pop().expect("ranking custom op has delta output");
-        let partner_b = outputs
+        let top2_gap = outputs
             .pop()
-            .expect("ranking custom op has second partner output");
-        let partner_a = outputs
+            .expect("ranking custom op has top-2 gap output");
+        let best_candidate_position = outputs
             .pop()
-            .expect("ranking custom op has first partner output");
+            .expect("ranking custom op has best candidate position output");
+        let candidate_index = outputs
+            .pop()
+            .expect("ranking custom op has candidate-index output");
 
-        (partner_a, partner_b, target_delta)
+        (candidate_index, best_candidate_position, top2_gap)
     }
 }
 
@@ -185,15 +188,16 @@ where
 {
     fn execute(&self, handles: &mut burn_ir::HandleContainer<B::Handle>) {
         let (inputs, outputs) = self.desc.as_fixed::<3, 3>();
-        let (partner_a, partner_b, target_delta) = B::linear_cosine_similarity_ranking_kernel(
-            handles.get_float_tensor::<B>(&inputs[0]),
-            handles.get_float_tensor::<B>(&inputs[1]),
-            handles.get_float_tensor::<B>(&inputs[2]),
-            self.config,
-        );
+        let (candidate_index, best_candidate_position, top2_gap) =
+            B::linear_cosine_similarity_ranking_kernel(
+                handles.get_float_tensor::<B>(&inputs[0]),
+                handles.get_float_tensor::<B>(&inputs[1]),
+                handles.get_float_tensor::<B>(&inputs[2]),
+                self.config,
+            );
 
-        handles.register_int_tensor::<B>(&outputs[0].id, partner_a);
-        handles.register_int_tensor::<B>(&outputs[1].id, partner_b);
-        handles.register_float_tensor::<B>(&outputs[2].id, target_delta);
+        handles.register_int_tensor::<B>(&outputs[0].id, candidate_index);
+        handles.register_int_tensor::<B>(&outputs[1].id, best_candidate_position);
+        handles.register_float_tensor::<B>(&outputs[2].id, top2_gap);
     }
 }
