@@ -20,10 +20,7 @@ use crate::{
     model::auxiliary::{
         AuxiliaryLossConfig, EmbeddingAuxiliaryHeads, EmbeddingAuxiliaryHeadsConfig,
     },
-    model::reconstruction::{
-        SetReconstructionLossConfig, reconstruction_similarity_from_triples,
-        set_reconstruction_loss_from_triples,
-    },
+    model::reconstruction::{SetReconstructionLossConfig, set_reconstruction_loss_from_triples},
     tokenize::SpectrumTokenizerConfig,
 };
 
@@ -38,6 +35,7 @@ use crate::{
         weighted_masked_precursor_reconstruction_output, weighted_precursor_reconstruction_output,
         weighted_similarity_ranking_output,
     },
+    model::reconstruction::reconstruction_similarity_from_triples,
     training::{AutoencoderDiagnostics, AutoencoderLossBreakdown},
 };
 
