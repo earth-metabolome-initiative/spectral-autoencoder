@@ -256,12 +256,12 @@ impl EmbeddingAuxiliaryHeadsConfigBuilder {
     /// Returns [`crate::Error::IncompleteBuilder`] when any required field
     /// (`latent_width`, `max_peaks`, `intruder_hidden_width`) was not set.
     pub fn build(self) -> crate::Result<EmbeddingAuxiliaryHeadsConfig> {
-        let latent_width =
-            self.latent_width
-                .ok_or_else(|| crate::Error::IncompleteBuilder {
-                    config: "EmbeddingAuxiliaryHeadsConfig",
-                    field: "latent_width",
-                })?;
+        let latent_width = self
+            .latent_width
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "EmbeddingAuxiliaryHeadsConfig",
+                field: "latent_width",
+            })?;
         let max_peaks = self
             .max_peaks
             .ok_or_else(|| crate::Error::IncompleteBuilder {

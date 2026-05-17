@@ -132,12 +132,12 @@ impl EncoderConfigBuilder {
     /// Returns [`crate::Error::IncompleteBuilder`] when any required field is
     /// unset.
     pub fn build(self) -> crate::Result<EncoderConfig> {
-        let spectrum_width = self
-            .spectrum_width
-            .ok_or_else(|| crate::Error::IncompleteBuilder {
-                config: "EncoderConfig",
-                field: "spectrum_width",
-            })?;
+        let spectrum_width =
+            self.spectrum_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "EncoderConfig",
+                    field: "spectrum_width",
+                })?;
         let condition_width =
             self.condition_width
                 .ok_or_else(|| crate::Error::IncompleteBuilder {
@@ -293,12 +293,12 @@ impl DecoderConfigBuilder {
                 config: "DecoderConfig",
                 field: "hidden_widths",
             })?;
-        let spectrum_width = self
-            .spectrum_width
-            .ok_or_else(|| crate::Error::IncompleteBuilder {
-                config: "DecoderConfig",
-                field: "spectrum_width",
-            })?;
+        let spectrum_width =
+            self.spectrum_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "DecoderConfig",
+                    field: "spectrum_width",
+                })?;
         let condition_output_width =
             self.condition_output_width
                 .ok_or_else(|| crate::Error::IncompleteBuilder {
@@ -930,7 +930,9 @@ impl SpectralAutoencoderConfigBuilder {
             decoder,
             loss: self.loss.unwrap_or_default(),
             reconstruction_ordering: self.reconstruction_ordering.unwrap_or_default(),
-            precursor_mz_scale: self.precursor_mz_scale.unwrap_or_else(default_precursor_mz_scale),
+            precursor_mz_scale: self
+                .precursor_mz_scale
+                .unwrap_or_else(default_precursor_mz_scale),
             regularization: self.regularization.unwrap_or_default(),
             auxiliary: self.auxiliary.unwrap_or_default(),
         })

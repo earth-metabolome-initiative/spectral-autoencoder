@@ -58,14 +58,8 @@ mod tests {
 
     #[test]
     fn parses_minimal_positional_arguments() {
-        let args = Args::try_parse_from([
-            "embed",
-            "library.mgf",
-            "-",
-            "--checkpoint",
-            "runs/foo",
-        ])
-        .expect("minimal parse");
+        let args = Args::try_parse_from(["embed", "library.mgf", "-", "--checkpoint", "runs/foo"])
+            .expect("minimal parse");
         assert_eq!(args.input, PathBuf::from("library.mgf"));
         assert_eq!(args.output, PathBuf::from("-"));
         assert_eq!(args.checkpoint, PathBuf::from("runs/foo"));

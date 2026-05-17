@@ -159,7 +159,11 @@ mod app {
             let reached_limit = args.limit.is_some_and(|cap| emitted + spectra.len() >= cap);
             if spectra.len() >= args.batch_size || reached_limit {
                 let rows = embedder.embed(&spectra)?;
-                debug_assert_eq!(rows.len(), metadata.len(), "skip_errors=false should be 1:1");
+                debug_assert_eq!(
+                    rows.len(),
+                    metadata.len(),
+                    "skip_errors=false should be 1:1"
+                );
                 for (fields, row) in metadata.drain(..).zip(rows) {
                     write_row(&mut writer, &fields, &row.latent)?;
                 }

@@ -80,11 +80,7 @@ pub fn run<B: Backend<FloatElem = f32>>(args: Args, device: B::Device) -> AppRes
 
 /// Pulls up to `cap` items from `source` into `buffer`. Returns `Ok(true)`
 /// when the source is exhausted (fewer than `cap` items were available).
-fn fill_buffer<S>(
-    source: &mut S,
-    buffer: &mut Vec<S::Item>,
-    cap: usize,
-) -> AppResult<bool>
+fn fill_buffer<S>(source: &mut S, buffer: &mut Vec<S::Item>, cap: usize) -> AppResult<bool>
 where
     S: SpectrumSource,
 {

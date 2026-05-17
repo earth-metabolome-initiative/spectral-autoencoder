@@ -266,11 +266,7 @@ pub(crate) enum LoaderProfileSink {
 
 impl LoaderProfileSink {
     /// Resolves the profile destination from CLI flags + the run directory.
-    pub(crate) fn resolve(
-        every: usize,
-        profile_log: Option<&Path>,
-        run_dir: &Path,
-    ) -> Self {
+    pub(crate) fn resolve(every: usize, profile_log: Option<&Path>, run_dir: &Path) -> Self {
         if every == 0 {
             return Self::Disabled;
         }

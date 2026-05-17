@@ -417,7 +417,10 @@ pub fn parse_usize_list(value: &str) -> Result<Vec<usize>, Box<dyn std::error::E
 
 /// Builds [`AuxiliaryLossConfig`] from CLI overrides on top of a variant default.
 #[must_use]
-pub fn auxiliary_loss_config(shared: &SharedArgs, default: AuxiliaryLossConfig) -> AuxiliaryLossConfig {
+pub fn auxiliary_loss_config(
+    shared: &SharedArgs,
+    default: AuxiliaryLossConfig,
+) -> AuxiliaryLossConfig {
     AuxiliaryLossConfig {
         reconstruction_weight: shared
             .aux_reconstruction_weight

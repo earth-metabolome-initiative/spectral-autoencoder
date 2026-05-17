@@ -221,10 +221,12 @@ impl PeakSetEncoderConfigBuilder {
     /// Returns [`crate::Error::IncompleteBuilder`] when any required field is
     /// unset.
     pub fn build(self) -> crate::Result<PeakSetEncoderConfig> {
-        let max_peaks = self.max_peaks.ok_or_else(|| crate::Error::IncompleteBuilder {
-            config: "PeakSetEncoderConfig",
-            field: "max_peaks",
-        })?;
+        let max_peaks = self
+            .max_peaks
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetEncoderConfig",
+                field: "max_peaks",
+            })?;
         let token_feature_width =
             self.token_feature_width
                 .ok_or_else(|| crate::Error::IncompleteBuilder {
@@ -243,28 +245,30 @@ impl PeakSetEncoderConfigBuilder {
                     config: "PeakSetEncoderConfig",
                     field: "token_embedding_width",
                 })?;
-        let attention_heads = self
-            .attention_heads
-            .ok_or_else(|| crate::Error::IncompleteBuilder {
-                config: "PeakSetEncoderConfig",
-                field: "attention_heads",
-            })?;
+        let attention_heads =
+            self.attention_heads
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetEncoderConfig",
+                    field: "attention_heads",
+                })?;
         let transformer_layers =
             self.transformer_layers
                 .ok_or_else(|| crate::Error::IncompleteBuilder {
                     config: "PeakSetEncoderConfig",
                     field: "transformer_layers",
                 })?;
-        let transformer_feed_forward_width = self.transformer_feed_forward_width.ok_or_else(|| {
-            crate::Error::IncompleteBuilder {
+        let transformer_feed_forward_width =
+            self.transformer_feed_forward_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetEncoderConfig",
+                    field: "transformer_feed_forward_width",
+                })?;
+        let dropout = self
+            .dropout
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
                 config: "PeakSetEncoderConfig",
-                field: "transformer_feed_forward_width",
-            }
-        })?;
-        let dropout = self.dropout.ok_or_else(|| crate::Error::IncompleteBuilder {
-            config: "PeakSetEncoderConfig",
-            field: "dropout",
-        })?;
+                field: "dropout",
+            })?;
         let hidden_widths = self
             .hidden_widths
             .ok_or_else(|| crate::Error::IncompleteBuilder {
@@ -478,10 +482,12 @@ impl PeakSetDecoderConfigBuilder {
     /// Returns [`crate::Error::IncompleteBuilder`] when any required field is
     /// unset.
     pub fn build(self) -> crate::Result<PeakSetDecoderConfig> {
-        let max_peaks = self.max_peaks.ok_or_else(|| crate::Error::IncompleteBuilder {
-            config: "PeakSetDecoderConfig",
-            field: "max_peaks",
-        })?;
+        let max_peaks = self
+            .max_peaks
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetDecoderConfig",
+                field: "max_peaks",
+            })?;
         let latent_width = self
             .latent_width
             .ok_or_else(|| crate::Error::IncompleteBuilder {
@@ -500,28 +506,30 @@ impl PeakSetDecoderConfigBuilder {
                 config: "PeakSetDecoderConfig",
                 field: "query_width",
             })?;
-        let attention_heads = self
-            .attention_heads
+        let attention_heads =
+            self.attention_heads
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetDecoderConfig",
+                    field: "attention_heads",
+                })?;
+        let decoder_layers =
+            self.decoder_layers
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetDecoderConfig",
+                    field: "decoder_layers",
+                })?;
+        let decoder_feed_forward_width =
+            self.decoder_feed_forward_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetDecoderConfig",
+                    field: "decoder_feed_forward_width",
+                })?;
+        let dropout = self
+            .dropout
             .ok_or_else(|| crate::Error::IncompleteBuilder {
                 config: "PeakSetDecoderConfig",
-                field: "attention_heads",
+                field: "dropout",
             })?;
-        let decoder_layers = self
-            .decoder_layers
-            .ok_or_else(|| crate::Error::IncompleteBuilder {
-                config: "PeakSetDecoderConfig",
-                field: "decoder_layers",
-            })?;
-        let decoder_feed_forward_width = self.decoder_feed_forward_width.ok_or_else(|| {
-            crate::Error::IncompleteBuilder {
-                config: "PeakSetDecoderConfig",
-                field: "decoder_feed_forward_width",
-            }
-        })?;
-        let dropout = self.dropout.ok_or_else(|| crate::Error::IncompleteBuilder {
-            config: "PeakSetDecoderConfig",
-            field: "dropout",
-        })?;
         let condition_output_width =
             self.condition_output_width
                 .ok_or_else(|| crate::Error::IncompleteBuilder {
@@ -1238,7 +1246,9 @@ impl PeakSetAutoencoderConfigBuilder {
             decoder,
             loss,
             regularization: self.regularization.unwrap_or_default(),
-            precursor_mz_scale: self.precursor_mz_scale.unwrap_or_else(default_precursor_mz_scale),
+            precursor_mz_scale: self
+                .precursor_mz_scale
+                .unwrap_or_else(default_precursor_mz_scale),
             auxiliary: self.auxiliary.unwrap_or_default(),
         })
     }

@@ -1602,7 +1602,8 @@ pub fn run(cli: &crate::cli::PeakSetArgs) -> Result<(), Box<dyn std::error::Erro
         shared.progress,
     ));
     let device = burn::backend::cuda::CudaDevice::new(args.device);
-    let augmentation = augmentation_config(shared, SpectrumAugmentationConfig::masked_mz_pretraining());
+    let augmentation =
+        augmentation_config(shared, SpectrumAugmentationConfig::masked_mz_pretraining());
     let tokenizer_config = SpectrumTokenizerConfig {
         max_peaks: args.max_peaks,
         ..SpectrumTokenizerConfig::default()

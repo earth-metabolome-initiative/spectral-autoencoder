@@ -269,9 +269,8 @@ impl<B: Backend<FloatElem = f32>> SpectrumEmbedder<B> {
                 let latent_width = config.encoder.latent_width;
                 let precursor_mz_scale = config.precursor_mz_scale;
                 let loss_config = config.loss;
-                let conditioning = ConditioningEncoder::new(ConditioningConfig {
-                    precursor_mz_scale,
-                });
+                let conditioning =
+                    ConditioningEncoder::new(ConditioningConfig { precursor_mz_scale });
                 Ok(Self {
                     variant: EmbedderVariant::Flat {
                         model,
@@ -300,9 +299,8 @@ impl<B: Backend<FloatElem = f32>> SpectrumEmbedder<B> {
                 let latent_width = config.encoder.latent_width;
                 let precursor_mz_scale = config.precursor_mz_scale;
                 let loss_config = config.loss;
-                let conditioning = ConditioningEncoder::new(ConditioningConfig {
-                    precursor_mz_scale,
-                });
+                let conditioning =
+                    ConditioningEncoder::new(ConditioningConfig { precursor_mz_scale });
                 Ok(Self {
                     variant: EmbedderVariant::PeakSet {
                         model,
@@ -518,7 +516,8 @@ impl<B: Backend<FloatElem = f32>> SpectrumEmbedder<B> {
             max_peaks,
             *loss_config,
         );
-        let log_mse_per_row = per_row_log_mse_from_triples(output.reconstruction.clone(), target_pairs);
+        let log_mse_per_row =
+            per_row_log_mse_from_triples(output.reconstruction.clone(), target_pairs);
 
         materialise_rows(
             &row_to_sample,
@@ -761,10 +760,7 @@ fn triples_per_row_similarities<B: Backend>(
     (linear_cosine, modified)
 }
 
-fn per_row_log_mse<B: Backend>(
-    reconstruction: Tensor<B, 2>,
-    target: Tensor<B, 2>,
-) -> Tensor<B, 1> {
+fn per_row_log_mse<B: Backend>(reconstruction: Tensor<B, 2>, target: Tensor<B, 2>) -> Tensor<B, 1> {
     let [batch_size, vector_width] = reconstruction.dims();
     let diff = reconstruction - target;
     diff.powf_scalar(2.0)
@@ -1003,8 +999,8 @@ mod tests {
         saved
             .save_json(&dir.path().join(MODEL_CONFIG_FILE))
             .expect("save");
-        let reloaded = SavedSpectrumModelConfig::load_json(&dir.path().join(MODEL_CONFIG_FILE))
-            .expect("load");
+        let reloaded =
+            SavedSpectrumModelConfig::load_json(&dir.path().join(MODEL_CONFIG_FILE)).expect("load");
         assert_eq!(reloaded.variant_name(), "peak_set");
     }
 }

@@ -1502,7 +1502,8 @@ pub fn run(cli: &crate::cli::FlatArgs) -> Result<(), Box<dyn std::error::Error>>
         shared.progress,
     ));
     let device = burn::backend::cuda::CudaDevice::new(args.device);
-    let augmentation = augmentation_config(shared, SpectrumAugmentationConfig::masked_mz_pretraining());
+    let augmentation =
+        augmentation_config(shared, SpectrumAugmentationConfig::masked_mz_pretraining());
     let vectorizer_config = SpectrumVectorizerConfig {
         max_peaks: args.max_peaks,
         ..SpectrumVectorizerConfig::default()
