@@ -11,9 +11,11 @@ pub mod augmentation;
 pub mod batch;
 pub mod conditioning;
 pub mod data;
+#[cfg(feature = "embed")]
+pub mod embed;
+#[cfg(feature = "std")]
+pub mod embedder;
 pub mod error;
-#[cfg(feature = "cuda")]
-pub mod linear_cosine_cuda;
 pub mod metrics;
 pub mod model;
 pub mod tokenize;
@@ -23,28 +25,49 @@ pub mod vectorize;
 
 #[cfg(feature = "std")]
 pub use augmentation::{AugmentingAutoencoderBatcher, AugmentingTokenizedAutoencoderBatcher};
-pub use augmentation::{SpectrumAugmentationConfig, SpectrumAugmenter};
+pub use augmentation::{
+    SpectrumAugmentationConfig, SpectrumAugmentationConfigBuilder, SpectrumAugmenter,
+};
 pub use batch::{
     AutoencoderBatch, AutoencoderSample, TokenizedAutoencoderBatch, TokenizedAutoencoderSample,
 };
 #[cfg(feature = "std")]
 pub use batch::{AutoencoderBatcher, TokenizedAutoencoderBatcher};
-pub use conditioning::{ConditioningConfig, ConditioningEncoder};
+pub use conditioning::{ConditioningConfig, ConditioningConfigBuilder, ConditioningEncoder};
 pub use data::{
     MgfSummary, TokenizedMgfIter, VectorizedMgfIter, summarize_mgf_path, tokenized_dataset_iter,
     tokenized_mgf_iter, vectorized_dataset_iter, vectorized_mgf_iter,
 };
-pub use error::{Error, Result};
-pub use metrics::{DenseReconstructionMetrics, SpectralMetricConfig, SpectralMetrics};
-pub use model::{
-    AutoencoderOutput, AuxiliaryLossConfig, Decoder, DecoderConfig, EmbeddingAuxiliaryHeads,
-    EmbeddingAuxiliaryHeadsConfig, Encoder, EncoderConfig, FlatVectorReconstructionOrdering,
-    PeakSetAutoencoder, PeakSetAutoencoderConfig, PeakSetAutoencoderOutput, PeakSetDecoder,
-    PeakSetDecoderConfig, PeakSetEncoder, PeakSetEncoderConfig, PeakSetLossConfig,
-    RegularizationConfig, SetReconstructionLossConfig, SimilarityRankingBatch, SpectralAutoencoder,
-    SpectralAutoencoderConfig,
+#[cfg(feature = "embed")]
+pub use embed::{
+    AnySource, EmbeddingRecord, EmbeddingSchema, EmbeddingSink, SinkOptions, SourceOptions,
+    SpectrumSource, sink_for_path, source_for_path,
 };
-pub use tokenize::{SpectrumTokenizer, SpectrumTokenizerConfig, SpectrumTokens};
+#[cfg(feature = "std")]
+pub use embedder::{
+    DEFAULT_EMBED_BATCH_SIZE, EmbedStream, EmbeddingRow, MODEL_CONFIG_FILE, MODEL_RECORD_FILE,
+    SavedSpectrumModelConfig, SpectrumEmbedder, SpectrumEmbedderBuilder,
+};
+pub use error::{Error, Result};
+pub use metrics::{
+    DenseReconstructionMetrics, SpectralMetricConfig, SpectralMetricConfigBuilder, SpectralMetrics,
+};
+pub use model::{
+    AutoencoderOutput, AuxiliaryLossConfig, AuxiliaryLossConfigBuilder, Decoder, DecoderConfig,
+    DecoderConfigBuilder, EmbeddingAuxiliaryHeads, EmbeddingAuxiliaryHeadsConfig,
+    EmbeddingAuxiliaryHeadsConfigBuilder, Encoder, EncoderConfig, EncoderConfigBuilder,
+    FlatVectorReconstructionOrdering, PeakSetAutoencoder, PeakSetAutoencoderConfig,
+    PeakSetAutoencoderConfigBuilder, PeakSetAutoencoderOutput, PeakSetDecoder, PeakSetDecoderConfig,
+    PeakSetDecoderConfigBuilder, PeakSetEncoder, PeakSetEncoderConfig, PeakSetEncoderConfigBuilder,
+    PeakSetLossConfig, RegularizationConfig, RegularizationConfigBuilder,
+    SetReconstructionLossConfig, SetReconstructionLossConfigBuilder, SimilarityRankingBatch,
+    SpectralAutoencoder, SpectralAutoencoderConfig, SpectralAutoencoderConfigBuilder,
+};
+pub use tokenize::{
+    SpectrumTokenizer, SpectrumTokenizerConfig, SpectrumTokenizerConfigBuilder, SpectrumTokens,
+};
 #[cfg(feature = "train")]
 pub use training::AutoencoderTrainingMetricsExt;
-pub use vectorize::{SpectrumVector, SpectrumVectorizer, SpectrumVectorizerConfig};
+pub use vectorize::{
+    SpectrumVector, SpectrumVectorizer, SpectrumVectorizerConfig, SpectrumVectorizerConfigBuilder,
+};

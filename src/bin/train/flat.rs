@@ -1,6 +1,5 @@
 use std::{
     collections::hash_map::DefaultHasher,
-    env,
     error::Error as StdError,
     fs,
     hash::{Hash, Hasher},
@@ -21,60 +20,52 @@ use spectral_autoencoder::{
     SpectrumAugmentationConfig, VectorizedMgfIter,
 };
 
-use crate::gems_common::{
-    LoaderProgress, PairSamplingEpoch, RunArgs, SimilarityTeacherBackend, SimilarityTeacherConfig,
+use mass_spectrometry::burn::AllMetricsBackend;
+
+use crate::common::{
+    LoaderProgress, PairSamplingEpoch, PreprocessedCacheOptions, RunArgs, SimilarityTeacherConfig,
     StreamingLoaderOptions, StreamingTrainingLoaderConfig, TeacherGpuCache, TeacherSpectraBuilder,
-    TeacherSpectraCache, bool_var, finish_loader_once, loader_epoch_items,
-    mask_precursor_conditions, open_records_or_panic, probability_mask, signed_random,
-    similarity_pair_seed, skip_split_records, teacher_similarity_ranking_batch, tokenization_style,
-    usize_var,
+    TeacherSpectraCache, finish_loader_once, loader_epoch_items, mask_precursor_conditions,
+    open_records_or_panic, probability_mask, signed_random, similarity_pair_seed,
+    skip_split_records, teacher_similarity_ranking_batch, tokenization_style,
 };
-use crate::gems_streaming::{
+use crate::streaming::{
     HostWindowPlan, LoaderProfileAccumulator, LoaderWindowProfile, LoaderWorkerError,
     OrderedHostWindowStream, host_window_plan, spawn_ordered_host_workers,
 };
 
-pub fn flat_vector_config_from_env(
+/// Builds the flat-vector model config, applying CLI overrides on top of the
+/// 20M-spectrum baseline.
+pub fn flat_vector_config(
     max_peaks: usize,
+    latent_width: Option<usize>,
+    hidden_widths: Option<Vec<usize>>,
+    ordering: Option<FlatVectorReconstructionOrdering>,
 ) -> Result<SpectralAutoencoderConfig, Box<dyn StdError>> {
     let mut config = SpectralAutoencoderConfig::twenty_million_run_with_peaks(max_peaks);
-    let latent_width = usize_var("GEMS_FLAT_LATENT_WIDTH", config.encoder.latent_width);
-    let hidden_widths = usize_list_var("GEMS_FLAT_HIDDEN_WIDTHS", &config.encoder.hidden_widths)?;
+    let latent_width = latent_width.unwrap_or(config.encoder.latent_width);
+    let hidden_widths = hidden_widths.unwrap_or_else(|| config.encoder.hidden_widths.clone());
+    if hidden_widths.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--hidden-widths must not be empty",
+        )
+        .into());
+    }
 
     config.encoder.latent_width = latent_width;
     config.decoder.latent_width = latent_width;
     config.encoder.hidden_widths = hidden_widths.clone();
     config.decoder.hidden_widths = hidden_widths.into_iter().rev().collect();
-    config.reconstruction_ordering =
-        flat_reconstruction_ordering_from_env(config.reconstruction_ordering)?;
-    Ok(config)
-}
-
-fn flat_reconstruction_ordering_from_env(
-    default: FlatVectorReconstructionOrdering,
-) -> Result<FlatVectorReconstructionOrdering, Box<dyn StdError>> {
-    let value = env::var("GEMS_FLAT_RECONSTRUCTION_ORDERING")
-        .unwrap_or_else(|_| default.label().to_string())
-        .to_ascii_lowercase();
-    match value.as_str() {
-        "slot" | "slots" | "strict" | "slot-wise" | "slot_wise" => {
-            Ok(FlatVectorReconstructionOrdering::Slot)
-        }
-        "intensity"
-        | "intensity-desc"
-        | "intensity_desc"
-        | "intensity-descending"
-        | "intensity_descending" => Ok(FlatVectorReconstructionOrdering::IntensityDescending),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "GEMS_FLAT_RECONSTRUCTION_ORDERING must be slot or intensity-desc",
-        )
-        .into()),
+    if let Some(value) = ordering {
+        config.reconstruction_ordering = value;
     }
+    Ok(config)
 }
 
 pub fn streaming_vectorized_loader<B, Open>(
     args: &RunArgs,
+    cache: &PreprocessedCacheOptions,
     device: B::Device,
     progress: LoaderProgress,
     start_item: usize,
@@ -83,11 +74,11 @@ pub fn streaming_vectorized_loader<B, Open>(
     open_records: Open,
 ) -> Arc<dyn DataLoader<B, AutoencoderBatch<B>>>
 where
-    B: SimilarityTeacherBackend + 'static,
+    B: AllMetricsBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     let preprocessed_cache_path =
-        flat_preprocessed_cache_path(args, start_item, progress.max_batches);
+        flat_preprocessed_cache_path(args, cache, start_item, progress.max_batches);
     let loader = Arc::new(StreamingVectorizedMgfLoader::new(
         StreamingLoaderOptions {
             mgf_source: args.mgf_source.clone(),
@@ -102,6 +93,8 @@ where
             randomize_pair_sampling: augment.is_some(),
         },
         preprocessed_cache_path,
+        cache.refresh,
+        args.gpu_transfer_chunk_batches,
         loader_config,
         open_records,
     ));
@@ -114,20 +107,22 @@ const FLAT_CACHE_VERSION: u32 = 5;
 
 fn flat_preprocessed_cache_path(
     args: &RunArgs,
+    cache: &PreprocessedCacheOptions,
     start_item: usize,
     max_batches: usize,
 ) -> Option<PathBuf> {
     assert!(
-        bool_var("GEMS_FLAT_PREPROCESSED_CACHE", true),
-        "GEMS_FLAT_PREPROCESSED_CACHE=0 is no longer supported; the host-worker loader requires the flat cache"
+        cache.enabled,
+        "--preprocessed-cache=false is not supported; the host-worker loader requires the flat cache"
     );
 
     let default_cache_dir = format!(
         "datasets/gems-a10-top-{}-peaks/preprocessed-flat",
         args.max_peaks
     );
-    let cache_dir = env::var_os("GEMS_FLAT_PREPROCESSED_CACHE_DIR")
-        .map(PathBuf::from)
+    let cache_dir = cache
+        .dir
+        .clone()
         .unwrap_or_else(|| PathBuf::from(default_cache_dir));
     let total_items = args.batch_size.saturating_mul(max_batches);
     let fingerprint = flat_preprocessed_cache_fingerprint(args, start_item, total_items);
@@ -162,13 +157,13 @@ fn flat_preprocessed_cache_fingerprint(
     hasher.finish()
 }
 
-fn gpu_transfer_chunk_items(batch_size: usize, total_items: usize) -> usize {
+fn gpu_transfer_chunk_items(batch_size: usize, chunk_batches: usize, total_items: usize) -> usize {
     if total_items == 0 {
         return 0;
     }
 
     let batch_size = batch_size.max(1);
-    let chunk_batches = usize_var("GEMS_GPU_TRANSFER_CHUNK_BATCHES", 64).max(1);
+    let chunk_batches = chunk_batches.max(1);
     batch_size
         .saturating_mul(chunk_batches)
         .max(1)
@@ -368,9 +363,12 @@ where
     loader_workers: usize,
     host_prefetch_windows: usize,
     loader_profile_every: usize,
+    loader_profile_sink: crate::streaming::LoaderProfileSink,
     preprocessed_cache_path: Option<PathBuf>,
+    preprocessed_cache_refresh: bool,
     cache_total_items: usize,
     cache_item_offset: usize,
+    gpu_transfer_chunk_batches: usize,
     device: B::Device,
     augment: Option<SpectrumAugmentationConfig>,
     similarity_teacher: SimilarityTeacherConfig,
@@ -397,9 +395,12 @@ where
             loader_workers: self.loader_workers,
             host_prefetch_windows: self.host_prefetch_windows,
             loader_profile_every: self.loader_profile_every,
+            loader_profile_sink: self.loader_profile_sink.clone(),
             preprocessed_cache_path: self.preprocessed_cache_path.clone(),
+            preprocessed_cache_refresh: self.preprocessed_cache_refresh,
             cache_total_items: self.cache_total_items,
             cache_item_offset: self.cache_item_offset,
+            gpu_transfer_chunk_batches: self.gpu_transfer_chunk_batches,
             device: self.device.clone(),
             augment: self.augment,
             similarity_teacher: self.similarity_teacher,
@@ -417,6 +418,8 @@ where
     fn new(
         options: StreamingLoaderOptions<B>,
         preprocessed_cache_path: Option<PathBuf>,
+        preprocessed_cache_refresh: bool,
+        gpu_transfer_chunk_batches: usize,
         loader_config: StreamingTrainingLoaderConfig,
         open_records: Open,
     ) -> Self {
@@ -433,9 +436,12 @@ where
             loader_workers: loader_config.loader_workers,
             host_prefetch_windows: loader_config.host_prefetch_windows,
             loader_profile_every: loader_config.loader_profile_every,
+            loader_profile_sink: loader_config.loader_profile_sink.clone(),
             preprocessed_cache_path,
+            preprocessed_cache_refresh,
             cache_total_items,
             cache_item_offset: 0,
+            gpu_transfer_chunk_batches,
             device: options.device,
             augment: options.augment,
             similarity_teacher: options.similarity_teacher,
@@ -456,12 +462,12 @@ where
             return;
         };
         let total_items = self.cache_total_items;
-        let refresh = bool_var("GEMS_FLAT_PREPROCESSED_CACHE_REFRESH", false);
+        let refresh = self.preprocessed_cache_refresh;
 
         if !refresh && path.try_exists().unwrap_or(false) {
             if let Err(error) = self.flat_cache_file_meta(path, total_items) {
                 panic!(
-                    "invalid preprocessed flat cache {}: {error}; set GEMS_FLAT_PREPROCESSED_CACHE_REFRESH=1 to rebuild it",
+                    "invalid preprocessed flat cache {}: {error}; pass --preprocessed-cache-refresh to rebuild it",
                     path.display()
                 );
             }
@@ -513,7 +519,7 @@ where
     fn flat_host_window_stream(&self) -> OrderedHostWindowStream<FlatHostWindow> {
         let path = self.preprocessed_cache_path.as_ref().unwrap_or_else(|| {
             panic!(
-                "flat host-worker loading requires GEMS_FLAT_PREPROCESSED_CACHE=1 for {}",
+                "flat host-worker loading requires the preprocessed cache for {}",
                 self.mgf_source
             )
         });
@@ -748,13 +754,20 @@ where
         host_window: &FlatHostWindow,
         transfer_bar: Option<&ProgressBar>,
     ) -> FlatGpuCache<B> {
-        move_flat_cache_window_to_gpu(host_window, self.batch_size, &self.device, transfer_bar)
+        move_flat_cache_window_to_gpu(
+            host_window,
+            self.batch_size,
+            self.gpu_transfer_chunk_batches,
+            &self.device,
+            transfer_bar,
+        )
     }
 }
 
 fn move_flat_cache_window_to_gpu<B: Backend>(
     host_window: &FlatHostWindow,
     batch_size: usize,
+    chunk_batches: usize,
     device: &B::Device,
     transfer_bar: Option<&ProgressBar>,
 ) -> FlatGpuCache<B> {
@@ -765,7 +778,7 @@ fn move_flat_cache_window_to_gpu<B: Backend>(
             items,
         };
     }
-    let chunk_items = gpu_transfer_chunk_items(batch_size, items);
+    let chunk_items = gpu_transfer_chunk_items(batch_size, chunk_batches, items);
     let chunk_count = items.div_ceil(chunk_items);
     let mut chunks = Vec::with_capacity(chunk_count);
 
@@ -857,7 +870,7 @@ fn teacher_spectra_cache_from_target_pairs(
 
 impl<B, Open> DataLoader<B, AutoencoderBatch<B>> for StreamingVectorizedMgfLoader<B, Open>
 where
-    B: SimilarityTeacherBackend + 'static,
+    B: AllMetricsBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn iter<'a>(&'a self) -> Box<dyn DataLoaderIterator<AutoencoderBatch<B>> + 'a> {
@@ -875,6 +888,7 @@ where
             profile: LoaderProfileAccumulator::new(
                 format!("{} flat", self.progress.label),
                 self.loader_profile_every,
+                self.loader_profile_sink.clone(),
             ),
             finished: false,
         })
@@ -1245,7 +1259,7 @@ where
 
 impl<B, Open> Iterator for StreamingVectorizedMgfIter<'_, B, Open>
 where
-    B: SimilarityTeacherBackend,
+    B: AllMetricsBackend,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     type Item = AutoencoderBatch<B>;
@@ -1406,7 +1420,7 @@ where
 
 impl<B, Open> DataLoaderIterator<AutoencoderBatch<B>> for StreamingVectorizedMgfIter<'_, B, Open>
 where
-    B: SimilarityTeacherBackend,
+    B: AllMetricsBackend,
     Open: Fn() -> spectral_autoencoder::Result<VectorizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn progress(&self) -> Progress {
@@ -1445,40 +1459,162 @@ fn download_style() -> ProgressStyle {
     .progress_chars("=> ")
 }
 
-fn usize_list_var(name: &str, default: &[usize]) -> Result<Vec<usize>, Box<dyn StdError>> {
-    let Some(value) = env::var(name).ok() else {
-        return Ok(default.to_vec());
+/// Trains the flat-vector autoencoder end-to-end. Called from the clap-driven
+/// `train flat` subcommand entry point.
+pub fn run(cli: &crate::cli::FlatArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    use burn::{
+        module::Module,
+        optim::{AdamConfig, decay::WeightDecayConfig, lr_scheduler::constant::ConstantLr},
+        record::CompactRecorder,
+        train::{Learner, SupervisedTraining},
     };
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(default.to_vec());
-    }
-    let mut values = Vec::new();
-    for item in value.split(',') {
-        let item = item.trim();
-        if item.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} contains an empty width"),
-            )
-            .into());
-        }
-        let width = item.parse::<usize>().map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("failed to parse {name} item {item:?}: {error}"),
-            )
-        })?;
-        if width == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("{name} widths must be greater than zero"),
-            )
-            .into());
-        }
-        values.push(width);
-    }
-    Ok(values)
+    use spectral_autoencoder::{
+        AutoencoderTrainingMetricsExt, SpectrumAugmentationConfig, SpectrumVectorizerConfig,
+    };
+
+    use crate::cli::{
+        augmentation_config, auxiliary_loss_config, parse_usize_list, run_args_from_shared,
+        similarity_teacher_config, streaming_loader_config,
+    };
+    use crate::common::{
+        GeMSProgress, InnerBackend, PreprocessedCacheOptions, TrainingBackend,
+        print_streaming_run_header, save_model_record, warm_start_model,
+    };
+    use crate::flat::{flat_vector_config, streaming_vectorized_loader};
+
+    let shared = &cli.shared;
+    let args = run_args_from_shared(
+        shared,
+        cli.batch_size,
+        cli.train_batches,
+        cli.valid_batches,
+        cli.epochs,
+    )?;
+    std::fs::create_dir_all(&args.output_dir)?;
+
+    let progress = Arc::new(GeMSProgress::new(
+        args.train_batches,
+        args.valid_batches,
+        args.batch_size,
+        "vectorizing",
+        shared.progress,
+    ));
+    let device = burn::backend::cuda::CudaDevice::new(args.device);
+    let augmentation = augmentation_config(shared, SpectrumAugmentationConfig::masked_mz_pretraining());
+    let vectorizer_config = SpectrumVectorizerConfig {
+        max_peaks: args.max_peaks,
+        ..SpectrumVectorizerConfig::default()
+    };
+    let hidden_widths = cli
+        .hidden_widths
+        .as_deref()
+        .map(parse_usize_list)
+        .transpose()?;
+    let config = flat_vector_config(
+        args.max_peaks,
+        cli.latent_width,
+        hidden_widths,
+        cli.reconstruction_ordering.map(Into::into),
+    )?;
+    let auxiliary = auxiliary_loss_config(shared, config.auxiliary);
+    let similarity_teacher = similarity_teacher_config(shared, auxiliary)?;
+    let loader_config = streaming_loader_config(shared, similarity_teacher)?;
+    let cache = PreprocessedCacheOptions {
+        enabled: cli.preprocessed_cache,
+        dir: cli.preprocessed_cache_dir.clone(),
+        refresh: cli.preprocessed_cache_refresh,
+    };
+    let train_builder = args.gems_builder.clone();
+    let train_vectorizer_config = vectorizer_config.clone();
+    let train_cache = cache.clone();
+    let train_loader = streaming_vectorized_loader::<TrainingBackend, _>(
+        &args,
+        &train_cache,
+        device.clone(),
+        progress.train.clone(),
+        args.train_start_item(),
+        Some(augmentation),
+        loader_config.clone(),
+        move || open_records(train_builder.clone(), train_vectorizer_config.clone()),
+    );
+    let valid_builder = args.gems_builder.clone();
+    let valid_vectorizer_config = vectorizer_config.clone();
+    let valid_cache = cache.clone();
+    let valid_loader = streaming_vectorized_loader::<InnerBackend, _>(
+        &args,
+        &valid_cache,
+        device.clone(),
+        progress.valid.clone(),
+        args.valid_start_item(),
+        None,
+        loader_config.clone(),
+        move || open_records(valid_builder.clone(), valid_vectorizer_config.clone()),
+    );
+
+    let config = config.with_auxiliary(auxiliary);
+    let model = config.init::<TrainingBackend>(&device);
+    let model = warm_start_model::<TrainingBackend, _>(
+        &progress,
+        model,
+        &device,
+        args.warm_start_model.as_deref(),
+        "flat-vector",
+    )?;
+    let parameter_count = model.num_params();
+    let optim = AdamConfig::new()
+        .with_weight_decay(Some(WeightDecayConfig::new(args.weight_decay as f32)))
+        .init();
+    let learner = Learner::new(model, optim, ConstantLr::new(args.learning_rate));
+
+    print_streaming_run_header(
+        "flat-vector",
+        &args,
+        parameter_count,
+        &loader_config,
+        auxiliary,
+        similarity_teacher,
+        Some(config.reconstruction_ordering),
+    );
+    progress.start_training("starting GeMS flat-vector streaming training");
+    let training = SupervisedTraining::new(&args.output_dir, train_loader, valid_loader)
+        .num_epochs(args.epochs)
+        .with_autoencoder_metrics()
+        .summary();
+    let training = if args.checkpoints {
+        training.with_file_checkpointer(CompactRecorder::new())
+    } else {
+        training
+    };
+    let training = if let Some(epoch) = args.resume_epoch {
+        training.checkpoint(epoch)
+    } else {
+        training
+    };
+    let trained = training.launch(learner);
+    progress.finish_training("finished GeMS flat-vector streaming training");
+
+    save_model_record(
+        &progress,
+        trained.model.into_record(),
+        args.output_dir.join("flat_vector_model"),
+        "save flat-vector model",
+        "saved flat-vector model record",
+    )
+}
+
+fn open_records(
+    builder: mascot_rs::prelude::GemsA10Builder<f32>,
+    vectorizer_config: spectral_autoencoder::SpectrumVectorizerConfig,
+) -> spectral_autoencoder::Result<spectral_autoencoder::VectorizedMgfIter> {
+    use spectral_autoencoder::{ConditioningEncoder, SpectrumVectorizer, VectorizedMgfIter};
+    let records = crate::common::open_gems_a10_iter(builder)?;
+    Ok(VectorizedMgfIter::from_records(
+        records,
+        SpectrumVectorizer::new(vectorizer_config),
+        ConditioningEncoder::default(),
+    ))
 }
 
 #[cfg(test)]

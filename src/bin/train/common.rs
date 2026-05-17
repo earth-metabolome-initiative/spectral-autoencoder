@@ -17,34 +17,24 @@ use burn::{
     record::{CompactRecorder, Record, Recorder},
     tensor::{Bool, Distribution, Tensor, TensorData, backend::Backend},
 };
+use clap::ValueEnum;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use mascot_rs::prelude::{
     Dataset, GEMS_A10_TOP_60_ZENODO_DOI, GEMS_A10_TOP_128_ZENODO_DOI, GemsA10Builder, GemsA10Iter,
     MGFVec, MascotError,
 };
-#[cfg(feature = "cuda")]
-use spectral_autoencoder::linear_cosine_cuda::{
-    LinearCosineKernelBackend, SIMILARITY_METRIC_LINEAR_COSINE,
-    SIMILARITY_METRIC_MODIFIED_LINEAR_COSINE, SimilarityRankingKernelConfig,
-    linear_cosine_similarity_ranking_kernel,
+use mass_spectrometry::burn::{
+    AllMetricsBackend, KernelMetric, LinearCosineMetric, LinearEntropyMetric,
+    ModifiedLinearCosineMetric, ModifiedLinearEntropyMetric, RankingConfig, RankingWindow,
+    SpectrumBatch, ranking_kernel,
 };
 use spectral_autoencoder::{
     AuxiliaryLossConfig, ConditioningConfig, FlatVectorReconstructionOrdering,
-    SimilarityRankingBatch, SpectralMetricConfig, SpectrumAugmentationConfig,
+    SimilarityRankingBatch, SpectrumAugmentationConfig,
 };
 
 pub type InnerBackend = Cuda<f32, i32>;
 pub type TrainingBackend = Autodiff<InnerBackend>;
-
-#[cfg(feature = "cuda")]
-pub trait SimilarityTeacherBackend: Backend + LinearCosineKernelBackend {}
-#[cfg(feature = "cuda")]
-impl<B> SimilarityTeacherBackend for B where B: Backend + LinearCosineKernelBackend {}
-
-#[cfg(not(feature = "cuda"))]
-pub trait SimilarityTeacherBackend: Backend {}
-#[cfg(not(feature = "cuda"))]
-impl<B> SimilarityTeacherBackend for B where B: Backend {}
 
 #[derive(Debug, Clone)]
 pub struct RunArgs {
@@ -63,94 +53,64 @@ pub struct RunArgs {
     pub checkpoints: bool,
     pub resume_epoch: Option<usize>,
     pub warm_start_model: Option<PathBuf>,
+    pub train_offset: Option<usize>,
+    pub valid_offset: Option<usize>,
+    pub gpu_transfer_chunk_batches: usize,
+}
+
+/// Per-variant on-disk preprocessed-cache options.
+#[derive(Debug, Clone, Default)]
+pub struct PreprocessedCacheOptions {
+    /// `true` to keep the cache enabled; `false` disables and panics on use
+    /// (matches the previous behaviour, which required the cache for the
+    /// host-worker streaming loader).
+    pub enabled: bool,
+    /// Explicit cache directory override; `None` falls back to the
+    /// `datasets/.../preprocessed-{flat|tokens}` default.
+    pub dir: Option<PathBuf>,
+    /// Rebuild the cache before training.
+    pub refresh: bool,
 }
 
 impl RunArgs {
-    pub fn from_env_with_training_defaults(
-        default_output_dir: &str,
-        default_batch_size: usize,
-        default_train_batches: usize,
-        default_valid_batches: usize,
-        default_epochs: usize,
-    ) -> Result<Self, Box<dyn StdError>> {
-        let max_peaks = usize_var("GEMS_MAX_PEAKS", 128);
-        let gems = resolve_mascot_gems_a10(max_peaks)?;
-        let resume_epoch = optional_usize_var("GEMS_RESUME_EPOCH");
-        if resume_epoch == Some(0) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "GEMS_RESUME_EPOCH must be greater than zero",
-            )
-            .into());
-        }
-        let warm_start_model = optional_path_var("GEMS_WARM_START_MODEL");
-        if resume_epoch.is_some() && warm_start_model.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "set either GEMS_RESUME_EPOCH or GEMS_WARM_START_MODEL, not both",
-            )
-            .into());
-        }
-        let checkpoints = bool_var("GEMS_CHECKPOINTS", true);
-        if resume_epoch.is_some() && !checkpoints {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "GEMS_RESUME_EPOCH requires GEMS_CHECKPOINTS=1",
-            )
-            .into());
-        }
-
-        Ok(Self {
-            mgf_source: gems.source,
-            mgf_paths: gems.paths,
-            gems_builder: gems.builder,
-            max_peaks,
-            output_dir: path_var("GEMS_RUN_DIR", default_output_dir),
-            device: usize_var("GEMS_CUDA_DEVICE", 0),
-            batch_size: usize_var("GEMS_BATCH_SIZE", default_batch_size),
-            train_batches: usize_var("GEMS_TRAIN_BATCHES", default_train_batches),
-            valid_batches: usize_var("GEMS_VALID_BATCHES", default_valid_batches),
-            epochs: usize_var("GEMS_EPOCHS", default_epochs),
-            learning_rate: f64_var("GEMS_LR", 1.0e-4),
-            weight_decay: f64_var("GEMS_WEIGHT_DECAY", 1.0e-4),
-            checkpoints,
-            resume_epoch,
-            warm_start_model,
-        })
-    }
-
     pub const fn valid_items(&self) -> usize {
         self.batch_size * self.valid_batches
     }
 
     pub fn train_start_item(&self) -> usize {
-        usize_var("GEMS_TRAIN_OFFSET", self.valid_items())
+        self.train_offset.unwrap_or_else(|| self.valid_items())
     }
 
     pub fn valid_start_item(&self) -> usize {
-        usize_var("GEMS_VALID_OFFSET", 0)
+        self.valid_offset.unwrap_or(0)
     }
 }
 
-struct ResolvedGemsA10 {
-    source: String,
-    paths: Vec<PathBuf>,
-    builder: GemsA10Builder<f32>,
+pub struct ResolvedGemsA10 {
+    pub source: String,
+    pub paths: Vec<PathBuf>,
+    pub builder: GemsA10Builder<f32>,
 }
 
-fn resolve_mascot_gems_a10(max_peaks: usize) -> Result<ResolvedGemsA10, Box<dyn StdError>> {
+pub fn resolve_mascot_gems_a10(
+    max_peaks: usize,
+    dataset_dir: Option<&Path>,
+    dataset_parts: Option<&str>,
+    download: bool,
+    force_download: bool,
+    progress: ProgressMode,
+) -> Result<ResolvedGemsA10, Box<dyn StdError>> {
     let default_directory = format!("datasets/gems-a10-top-{max_peaks}-peaks");
-    let target_directory = env::var_os("GEMS_A10_DIR")
-        .map(PathBuf::from)
+    let target_directory: PathBuf = dataset_dir
+        .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from(&default_directory));
-    let force_download = bool_var("GEMS_A10_FORCE_DOWNLOAD", false);
     let builder = match max_peaks {
         60 => MGFVec::<f32>::gems_a10_top_60_peaks(),
         128 => MGFVec::<f32>::gems_a10_top_128_peaks(),
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("GEMS_MAX_PEAKS={other} is unsupported; use 60 or 128"),
+                format!("--max-peaks {other} is unsupported; use 60 or 128"),
             )
             .into());
         }
@@ -158,18 +118,21 @@ fn resolve_mascot_gems_a10(max_peaks: usize) -> Result<ResolvedGemsA10, Box<dyn 
     let mut builder = builder
         .target_directory(&target_directory)
         .force_download(false);
-    if let Some(parts) = gems_a10_parts_from_env()? {
-        builder = builder.parts(parts)?;
+    if let Some(value) = dataset_parts {
+        if let Some(parts) = parse_dataset_parts(value)? {
+            builder = builder.parts(parts)?;
+        }
     }
     if let Some(token) = gems_a10_token() {
         builder = builder.token(token);
     }
-    if ProgressMode::from_env().visible() {
+    if progress.visible() {
         builder = builder.verbose();
     }
 
     ensure_mascot_gems_a10_files(
         &builder.clone().force_download(force_download),
+        download,
         force_download,
     )?;
     let paths = builder.paths();
@@ -189,10 +152,7 @@ fn resolve_mascot_gems_a10(max_peaks: usize) -> Result<ResolvedGemsA10, Box<dyn 
     })
 }
 
-fn gems_a10_parts_from_env() -> Result<Option<Vec<u8>>, Box<dyn StdError>> {
-    let Some(value) = env::var("GEMS_A10_PARTS").ok() else {
-        return Ok(None);
-    };
+fn parse_dataset_parts(value: &str) -> Result<Option<Vec<u8>>, Box<dyn StdError>> {
     let value = value.trim();
     if value.is_empty() || value.eq_ignore_ascii_case("all") {
         return Ok(None);
@@ -220,7 +180,7 @@ fn gems_a10_parts_from_env() -> Result<Option<Vec<u8>>, Box<dyn StdError>> {
     if parts.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "GEMS_A10_PARTS did not contain any part numbers",
+            "--dataset-parts did not contain any part numbers",
         )
         .into());
     }
@@ -229,6 +189,7 @@ fn gems_a10_parts_from_env() -> Result<Option<Vec<u8>>, Box<dyn StdError>> {
 
 fn ensure_mascot_gems_a10_files(
     builder: &GemsA10Builder<f32>,
+    download: bool,
     force_download: bool,
 ) -> Result<(), Box<dyn StdError>> {
     let paths = builder.paths();
@@ -239,11 +200,11 @@ fn ensure_mascot_gems_a10_files(
     if missing_or_forced == 0 {
         return Ok(());
     }
-    if !bool_var("GEMS_A10_DOWNLOAD", true) {
+    if !download {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "{missing_or_forced} GeMS-A10 file(s) are missing under {}; set GEMS_A10_DOWNLOAD=1 or select fewer parts with GEMS_A10_PARTS",
+                "{missing_or_forced} GeMS-A10 file(s) are missing under {}; pass --download or select fewer parts with --dataset-parts",
                 paths.first()
                     .and_then(|path| path.parent())
                     .map_or_else(|| Path::new(".").display().to_string(), |path| path.display().to_string())
@@ -281,7 +242,7 @@ pub fn print_streaming_run_header(
     model_name: &str,
     args: &RunArgs,
     parameter_count: usize,
-    streaming: StreamingTrainingLoaderConfig,
+    streaming: &StreamingTrainingLoaderConfig,
     auxiliary: AuxiliaryLossConfig,
     similarity_teacher: SimilarityTeacherConfig,
     flat_reconstruction_ordering: Option<FlatVectorReconstructionOrdering>,
@@ -358,88 +319,26 @@ pub fn print_streaming_run_header(
     );
 }
 
-pub fn auxiliary_loss_config_from_env(default: AuxiliaryLossConfig) -> AuxiliaryLossConfig {
-    AuxiliaryLossConfig {
-        reconstruction_weight: f64_var(
-            "GEMS_AUX_RECONSTRUCTION_WEIGHT",
-            default.reconstruction_weight,
-        ),
-        masked_peak_weight: f64_var("GEMS_AUX_MASKED_WEIGHT", default.masked_peak_weight),
-        intruder_peak_weight: f64_var("GEMS_AUX_INTRUDER_WEIGHT", default.intruder_peak_weight),
-        precursor_reconstruction_weight: f64_var(
-            "GEMS_AUX_PRECURSOR_WEIGHT",
-            default.precursor_reconstruction_weight,
-        ),
-        masked_precursor_weight: f64_var(
-            "GEMS_AUX_MASKED_PRECURSOR_WEIGHT",
-            default.masked_precursor_weight,
-        ),
-        similarity_ranking_weight: f64_var(
-            "GEMS_AUX_SIMILARITY_RANKING_WEIGHT",
-            default.similarity_ranking_weight,
-        ),
-        similarity_ranking_latent_temperature: f64_var_with_legacy(
-            "GEMS_SIMILARITY_RANKING_LATENT_TEMPERATURE",
-            "GEMS_SIMILARITY_RANKING_MARGIN",
-            default.similarity_ranking_latent_temperature,
-        ),
-        similarity_ranking_teacher_temperature: f64_var(
-            "GEMS_SIMILARITY_RANKING_TEACHER_TEMPERATURE",
-            default.similarity_ranking_teacher_temperature,
-        ),
-        similarity_ranking_min_gap: f64_var(
-            "GEMS_SIMILARITY_RANKING_MIN_GAP",
-            default.similarity_ranking_min_gap,
-        ),
-        latent_noise_std: f64_var("GEMS_LATENT_NOISE_STD", default.latent_noise_std),
-        similarity_ranking_pairs_per_batch: usize_var(
-            "GEMS_SIMILARITY_RANKING_PAIRS_PER_BATCH",
-            default.similarity_ranking_pairs_per_batch,
-        ),
-        intruder_hidden_width: usize_var(
-            "GEMS_INTRUDER_HIDDEN_WIDTH",
-            default.intruder_hidden_width,
-        ),
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum SimilarityTeacherMetric {
     LinearCosine,
     ModifiedLinearCosine,
+    LinearEntropy,
+    ModifiedLinearEntropy,
 }
 
 impl SimilarityTeacherMetric {
-    fn from_env() -> Result<Self, Box<dyn StdError>> {
-        let Ok(value) = env::var("GEMS_SIMILARITY_RANKING_METRIC") else {
-            return Ok(Self::LinearCosine);
-        };
-        match value.to_ascii_lowercase().as_str() {
-            "cosine" | "linear-cosine" | "linear_cosine" => Ok(Self::LinearCosine),
-            "modified-cosine" | "modified-linear-cosine" | "modified_linear_cosine" => {
-                Ok(Self::ModifiedLinearCosine)
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "GEMS_SIMILARITY_RANKING_METRIC must be linear-cosine or modified-linear-cosine",
-            )
-            .into()),
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Self::LinearCosine => "linear cosine",
             Self::ModifiedLinearCosine => "modified linear cosine",
+            Self::LinearEntropy => "linear entropy",
+            Self::ModifiedLinearEntropy => "modified linear entropy",
         }
     }
 
-    #[cfg(feature = "cuda")]
-    fn kernel_code(self) -> u32 {
-        match self {
-            Self::LinearCosine => SIMILARITY_METRIC_LINEAR_COSINE,
-            Self::ModifiedLinearCosine => SIMILARITY_METRIC_MODIFIED_LINEAR_COSINE,
-        }
+    pub fn is_entropy(self) -> bool {
+        matches!(self, Self::LinearEntropy | Self::ModifiedLinearEntropy)
     }
 }
 
@@ -449,55 +348,40 @@ pub struct SimilarityTeacherConfig {
     metric: SimilarityTeacherMetric,
     mz_tolerance: f64,
     max_mz: f64,
-    cosine_mz_power: f64,
-    cosine_intensity_power: f64,
+    mz_power: f64,
+    intensity_power: f64,
     candidates_per_anchor: usize,
-}
-
-fn require_cuda_similarity_teacher() -> Result<(), Box<dyn StdError>> {
-    if let Ok(value) = env::var("GEMS_SIMILARITY_RANKING_TEACHER") {
-        let value = value.to_ascii_lowercase();
-        match value.as_str() {
-            "cuda" | "gpu" | "linear-cuda" | "cuda-linear" => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "GEMS_SIMILARITY_RANKING_TEACHER must be cuda; CPU teacher scoring has been removed",
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
+    weighted_entropy: bool,
 }
 
 impl SimilarityTeacherConfig {
-    fn from_env(auxiliary: AuxiliaryLossConfig) -> Result<Self, Box<dyn StdError>> {
-        let metrics = SpectralMetricConfig::default();
-        require_cuda_similarity_teacher()?;
-        reject_similarity_teacher_blend_weight("GEMS_SIMILARITY_RANKING_COSINE_WEIGHT")?;
-        reject_similarity_teacher_blend_weight("GEMS_SIMILARITY_RANKING_ENTROPY_WEIGHT")?;
-        reject_similarity_teacher_env_var("GEMS_SIMILARITY_RANKING_ENTROPY_MZ_POWER")?;
-        reject_similarity_teacher_env_var("GEMS_SIMILARITY_RANKING_ENTROPY_INTENSITY_POWER")?;
-        reject_similarity_teacher_env_var("GEMS_SIMILARITY_RANKING_WEIGHTED_ENTROPY")?;
-        let mut config = Self {
-            enabled: auxiliary.similarity_ranking_weight > 0.0,
-            metric: SimilarityTeacherMetric::from_env()?,
-            mz_tolerance: f64_var("GEMS_SIMILARITY_RANKING_MZ_TOLERANCE", metrics.mz_tolerance),
-            max_mz: f64_var("GEMS_SIMILARITY_RANKING_MAX_MZ", 2_000.0),
-            cosine_mz_power: f64_var(
-                "GEMS_SIMILARITY_RANKING_COSINE_MZ_POWER",
-                metrics.cosine_mz_power,
-            ),
-            cosine_intensity_power: f64_var(
-                "GEMS_SIMILARITY_RANKING_COSINE_INTENSITY_POWER",
-                metrics.cosine_intensity_power,
-            ),
-            candidates_per_anchor: usize_var("GEMS_SIMILARITY_RANKING_CANDIDATES", 4),
+    #[allow(clippy::too_many_arguments)]
+    pub fn build(
+        auxiliary: AuxiliaryLossConfig,
+        metric: SimilarityTeacherMetric,
+        mz_tolerance: f64,
+        max_mz: f64,
+        mz_power: f64,
+        intensity_power: f64,
+        candidates_per_anchor: usize,
+        weighted_entropy: bool,
+    ) -> Result<Self, Box<dyn StdError>> {
+        let enabled = auxiliary.similarity_ranking_weight > 0.0;
+        let candidates_per_anchor = if enabled {
+            candidates_per_anchor.max(2)
+        } else {
+            candidates_per_anchor
         };
-        if config.enabled && config.candidates_per_anchor < 2 {
-            config.candidates_per_anchor = 2;
-        }
+        let config = Self {
+            enabled,
+            metric,
+            mz_tolerance,
+            max_mz,
+            mz_power,
+            intensity_power,
+            candidates_per_anchor,
+            weighted_entropy,
+        };
         config.validate()?;
         Ok(config)
     }
@@ -510,9 +394,15 @@ impl SimilarityTeacherConfig {
         if !self.enabled() {
             return "disabled".to_string();
         }
+        let weighted_suffix = if self.metric.is_entropy() && self.weighted_entropy {
+            " (weighted)"
+        } else {
+            ""
+        };
         format!(
-            "online {} teacher on CUDA, tolerance {} Da, candidates/anchor {}",
+            "online {}{} teacher on CUDA, tolerance {} Da, candidates/anchor {}",
             self.metric.label(),
+            weighted_suffix,
             self.mz_tolerance,
             self.candidates_per_anchor
         )
@@ -525,7 +415,7 @@ impl SimilarityTeacherConfig {
         if !(self.max_mz.is_finite() && self.max_mz > 0.0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "GEMS_SIMILARITY_RANKING_MAX_MZ must be finite and positive",
+                "--similarity-ranking-max-mz must be finite and positive",
             )
             .into());
         }
@@ -539,21 +429,21 @@ impl SimilarityTeacherConfig {
         if !(self.mz_tolerance.is_finite() && self.mz_tolerance > 0.0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "GEMS_SIMILARITY_RANKING_MZ_TOLERANCE must be finite and positive",
+                "--similarity-ranking-mz-tolerance must be finite and positive",
             )
             .into());
         }
-        if !(self.cosine_mz_power.is_finite() && self.cosine_mz_power >= 0.0) {
+        if !(self.mz_power.is_finite() && self.mz_power >= 0.0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "GEMS_SIMILARITY_RANKING_COSINE_MZ_POWER must be finite and non-negative",
+                "--similarity-ranking-mz-power must be finite and non-negative",
             )
             .into());
         }
-        if !(self.cosine_intensity_power.is_finite() && self.cosine_intensity_power >= 0.0) {
+        if !(self.intensity_power.is_finite() && self.intensity_power >= 0.0) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "GEMS_SIMILARITY_RANKING_COSINE_INTENSITY_POWER must be finite and non-negative",
+                "--similarity-ranking-intensity-power must be finite and non-negative",
             )
             .into());
         }
@@ -561,57 +451,37 @@ impl SimilarityTeacherConfig {
     }
 }
 
-fn reject_similarity_teacher_blend_weight(name: &str) -> Result<(), Box<dyn StdError>> {
-    if env::var_os(name).is_none() {
-        return Ok(());
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("{name} is no longer supported; use GEMS_SIMILARITY_RANKING_METRIC to choose one teacher metric"),
-    )
-    .into())
-}
-
-fn reject_similarity_teacher_env_var(name: &str) -> Result<(), Box<dyn StdError>> {
-    if env::var_os(name).is_none() {
-        return Ok(());
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        format!("{name} is no longer supported; the similarity-ranking teacher uses one GPU metric at a time"),
-    )
-    .into())
-}
-
-pub fn similarity_teacher_config_from_env(
-    auxiliary: AuxiliaryLossConfig,
-) -> Result<SimilarityTeacherConfig, Box<dyn StdError>> {
-    SimilarityTeacherConfig::from_env(auxiliary)
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StreamingTrainingLoaderConfig {
     pub(crate) gpu_window_batches: usize,
     pub(crate) loader_workers: usize,
     pub(crate) host_prefetch_windows: usize,
     pub(crate) loader_profile_every: usize,
     pub(crate) similarity_teacher: SimilarityTeacherConfig,
+    pub(crate) loader_profile_sink: crate::streaming::LoaderProfileSink,
 }
 
 impl StreamingTrainingLoaderConfig {
-    pub fn from_env(
+    #[must_use]
+    pub fn new(
+        gpu_window_batches: usize,
+        loader_workers: usize,
+        host_prefetch_windows: usize,
+        loader_profile_every: usize,
         similarity_teacher: SimilarityTeacherConfig,
-    ) -> Result<Self, Box<dyn StdError>> {
-        Ok(Self {
-            gpu_window_batches: positive_usize_var("GEMS_GPU_WINDOW_BATCHES", 8)?,
-            loader_workers: positive_usize_var("GEMS_LOADER_WORKERS", 16)?,
-            host_prefetch_windows: positive_usize_var("GEMS_HOST_PREFETCH_WINDOWS", 8)?,
-            loader_profile_every: usize_var("GEMS_LOADER_PROFILE_EVERY", 0),
+        loader_profile_sink: crate::streaming::LoaderProfileSink,
+    ) -> Self {
+        Self {
+            gpu_window_batches,
+            loader_workers,
+            host_prefetch_windows,
+            loader_profile_every,
             similarity_teacher,
-        })
+            loader_profile_sink,
+        }
     }
 
-    pub(crate) fn window_items(self, batch_size: usize, max_batches: usize) -> usize {
+    pub(crate) fn window_items(&self, batch_size: usize, max_batches: usize) -> usize {
         let epoch_items = loader_epoch_items(batch_size, max_batches);
         let window_batches = if max_batches > 1 {
             self.gpu_window_batches.min(max_batches - 1)
@@ -622,22 +492,6 @@ impl StreamingTrainingLoaderConfig {
             .saturating_mul(window_batches)
             .max(batch_size)
             .min(epoch_items)
-    }
-}
-
-pub fn augmentation_config_from_env(
-    default: SpectrumAugmentationConfig,
-) -> SpectrumAugmentationConfig {
-    SpectrumAugmentationConfig {
-        precursor_mask_probability: f32_var(
-            "GEMS_PRECURSOR_MASK_PROBABILITY",
-            default.precursor_mask_probability,
-        ),
-        intruder_peak_probability: f32_var(
-            "GEMS_INTRUDER_PROBABILITY",
-            default.intruder_peak_probability,
-        ),
-        ..default
     }
 }
 
@@ -974,7 +828,7 @@ fn preprocess_teacher_pairs(
     survivors
 }
 
-pub(crate) fn teacher_similarity_ranking_batch<B: SimilarityTeacherBackend>(
+pub(crate) fn teacher_similarity_ranking_batch<B: AllMetricsBackend>(
     teacher_gpu: Option<&TeacherGpuCache<B>>,
     batch_start: usize,
     batch_items: usize,
@@ -995,28 +849,57 @@ pub(crate) fn teacher_similarity_ranking_batch<B: SimilarityTeacherBackend>(
 
     #[cfg(feature = "cuda")]
     {
-        let (candidate_index, best_candidate_position, top2_gap) =
-            linear_cosine_similarity_ranking_kernel(
-                teacher_gpu.mz.clone(),
-                teacher_gpu.intensity.clone(),
-                teacher_gpu.precursor.clone(),
-                SimilarityRankingKernelConfig {
-                    batch_start,
-                    batch_items,
-                    candidates_per_anchor: config.candidates_per_anchor,
-                    mz_power: config.cosine_mz_power,
-                    intensity_power: config.cosine_intensity_power,
-                    mz_tolerance: config.mz_tolerance,
-                    metric: config.metric.kernel_code(),
-                    max_peaks: teacher_gpu.peak_width,
-                    seed,
-                    epsilon: 1.0e-8,
-                },
-            );
-        SimilarityRankingBatch {
-            candidate_index,
-            best_candidate_position,
-            top2_gap,
+        let teacher_batch = SpectrumBatch::new(
+            teacher_gpu.mz.clone(),
+            teacher_gpu.intensity.clone(),
+            teacher_gpu.precursor.clone(),
+        );
+        let window = RankingWindow::new()
+            .with_batch_start(batch_start)
+            .with_batch_items(batch_items)
+            .with_candidates_per_anchor(config.candidates_per_anchor)
+            .with_seed(seed);
+        let mz_power = config.mz_power as f32;
+        let intensity_power = config.intensity_power as f32;
+        let mz_tolerance = config.mz_tolerance as f32;
+        let max_peaks = teacher_gpu.peak_width;
+        let weighted = config.weighted_entropy;
+
+        match config.metric {
+            SimilarityTeacherMetric::LinearCosine => {
+                let scoring = LinearCosineMetric::scoring_params()
+                    .with_mz_power(mz_power)
+                    .with_intensity_power(intensity_power)
+                    .with_mz_tolerance(mz_tolerance)
+                    .with_max_peaks(max_peaks);
+                ranking_kernel(teacher_batch, RankingConfig::from_parts(scoring, window)).into()
+            }
+            SimilarityTeacherMetric::ModifiedLinearCosine => {
+                let scoring = ModifiedLinearCosineMetric::scoring_params()
+                    .with_mz_power(mz_power)
+                    .with_intensity_power(intensity_power)
+                    .with_mz_tolerance(mz_tolerance)
+                    .with_max_peaks(max_peaks);
+                ranking_kernel(teacher_batch, RankingConfig::from_parts(scoring, window)).into()
+            }
+            SimilarityTeacherMetric::LinearEntropy => {
+                let scoring = LinearEntropyMetric::scoring_params()
+                    .with_mz_power(mz_power)
+                    .with_intensity_power(intensity_power)
+                    .with_mz_tolerance(mz_tolerance)
+                    .with_max_peaks(max_peaks)
+                    .with_weighted(weighted);
+                ranking_kernel(teacher_batch, RankingConfig::from_parts(scoring, window)).into()
+            }
+            SimilarityTeacherMetric::ModifiedLinearEntropy => {
+                let scoring = ModifiedLinearEntropyMetric::scoring_params()
+                    .with_mz_power(mz_power)
+                    .with_intensity_power(intensity_power)
+                    .with_mz_tolerance(mz_tolerance)
+                    .with_max_peaks(max_peaks)
+                    .with_weighted(weighted);
+                ranking_kernel(teacher_batch, RankingConfig::from_parts(scoring, window)).into()
+            }
         }
     }
 
@@ -1120,8 +1003,8 @@ impl GeMSProgress {
         valid_batches: usize,
         batch_size: usize,
         action: &str,
+        progress_mode: ProgressMode,
     ) -> Self {
-        let progress_mode = ProgressMode::from_env();
         let multi = Arc::new(MultiProgress::with_draw_target(progress_mode.draw_target()));
         Self {
             train: LoaderProgress::new(
@@ -1268,131 +1151,47 @@ fn spinner_style() -> ProgressStyle {
         .expect("valid indicatif template")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProgressMode {
+/// Progress UI mode, set via `--progress`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum ProgressMode {
+    /// Pick automatically: hidden under the `tui` feature, bars otherwise.
+    Auto,
+    /// Render indicatif bars to stderr.
     Bars,
+    /// Suppress all bars.
     Hidden,
 }
 
 impl ProgressMode {
-    fn from_env() -> Self {
-        match env::var("GEMS_PROGRESS")
-            .ok()
-            .map(|value| value.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("bars" | "bar" | "indicatif" | "on" | "1" | "true") => Self::Bars,
-            Some("hidden" | "hide" | "off" | "0" | "false" | "none") => Self::Hidden,
-            _ if cfg!(feature = "tui") => Self::Hidden,
-            _ => Self::Bars,
-        }
-    }
-
-    fn draw_target(self) -> ProgressDrawTarget {
+    fn resolved(self) -> ResolvedProgress {
         match self {
-            Self::Bars => ProgressDrawTarget::stderr_with_hz(10),
-            Self::Hidden => ProgressDrawTarget::hidden(),
-        }
-    }
-
-    const fn visible(self) -> bool {
-        matches!(self, Self::Bars)
-    }
-}
-
-fn path_var(name: &str, default: &str) -> PathBuf {
-    env::var_os(name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(default).to_path_buf())
-}
-
-fn optional_path_var(name: &str) -> Option<PathBuf> {
-    env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-
-pub(crate) fn usize_var(name: &str, default: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn positive_usize_var(name: &str, default: usize) -> Result<usize, Box<dyn StdError>> {
-    let value = match env::var(name) {
-        Ok(value) => {
-            let value = value.trim();
-            if value.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{name} cannot be empty"),
-                )
-                .into());
+            Self::Bars => ResolvedProgress::Bars,
+            Self::Hidden => ResolvedProgress::Hidden,
+            Self::Auto => {
+                if cfg!(feature = "tui") {
+                    ResolvedProgress::Hidden
+                } else {
+                    ResolvedProgress::Bars
+                }
             }
-            value.parse::<usize>().map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{name} must be a positive integer: {error}"),
-                )
-            })?
         }
-        Err(env::VarError::NotPresent) => default,
-        Err(error) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("could not read {name}: {error}"),
-            )
-            .into());
+    }
+
+    pub(crate) fn draw_target(self) -> ProgressDrawTarget {
+        match self.resolved() {
+            ResolvedProgress::Bars => ProgressDrawTarget::stderr_with_hz(10),
+            ResolvedProgress::Hidden => ProgressDrawTarget::hidden(),
         }
-    };
-    if value == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{name} must be greater than zero"),
-        )
-        .into());
     }
-    Ok(value)
-}
 
-fn optional_usize_var(name: &str) -> Option<usize> {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .and_then(|value| value.parse().ok())
-}
-
-fn f64_var(name: &str, default: f64) -> f64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn f64_var_with_legacy(name: &str, legacy_name: &str, default: f64) -> f64 {
-    env::var(name)
-        .ok()
-        .or_else(|| env::var(legacy_name).ok())
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn f32_var(name: &str, default: f32) -> f32 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-pub(crate) fn bool_var(name: &str, default: bool) -> bool {
-    match env::var(name)
-        .ok()
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("1" | "true" | "yes" | "y" | "on") => true,
-        Some("0" | "false" | "no" | "n" | "off") => false,
-        _ => default,
+    pub fn visible(self) -> bool {
+        matches!(self.resolved(), ResolvedProgress::Bars)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedProgress {
+    Bars,
+    Hidden,
 }

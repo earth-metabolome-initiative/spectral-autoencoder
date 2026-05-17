@@ -33,6 +33,6 @@ fn peak_set_autoencoder_runs_cuda_fusion_train_step() {
 
     let output = model.step(batch);
     let loss = output.item.loss.to_data();
-    assert_eq!(loss.shape, vec![1]);
+    assert_eq!(loss.shape.dims(), [1]);
     assert!(loss.as_slice::<f32>().expect("f32 loss")[0].is_finite());
 }

@@ -7,18 +7,21 @@ pub mod reconstruction;
 pub mod regularization;
 
 pub use auxiliary::{
-    AuxiliaryLossConfig, EmbeddingAuxiliaryHeads, EmbeddingAuxiliaryHeadsConfig,
-    SimilarityRankingBatch,
+    AuxiliaryLossConfig, AuxiliaryLossConfigBuilder, EmbeddingAuxiliaryHeads,
+    EmbeddingAuxiliaryHeadsConfig, EmbeddingAuxiliaryHeadsConfigBuilder, SimilarityRankingBatch,
 };
 pub use flat_vector::{
-    AutoencoderOutput, Decoder, DecoderConfig, Encoder, EncoderConfig, SpectralAutoencoder,
-    SpectralAutoencoderConfig,
+    AutoencoderOutput, Decoder, DecoderConfig, DecoderConfigBuilder, Encoder, EncoderConfig,
+    EncoderConfigBuilder, SpectralAutoencoder, SpectralAutoencoderConfig,
+    SpectralAutoencoderConfigBuilder,
 };
 pub use peak_set::{
-    PeakSetAutoencoder, PeakSetAutoencoderConfig, PeakSetAutoencoderOutput, PeakSetDecoder,
-    PeakSetDecoderConfig, PeakSetEncoder, PeakSetEncoderConfig,
+    PeakSetAutoencoder, PeakSetAutoencoderConfig, PeakSetAutoencoderConfigBuilder,
+    PeakSetAutoencoderOutput, PeakSetDecoder, PeakSetDecoderConfig, PeakSetDecoderConfigBuilder,
+    PeakSetEncoder, PeakSetEncoderConfig, PeakSetEncoderConfigBuilder,
 };
 pub use reconstruction::{
     FlatVectorReconstructionOrdering, PeakSetLossConfig, SetReconstructionLossConfig,
+    SetReconstructionLossConfigBuilder,
 };
-pub use regularization::RegularizationConfig;
+pub use regularization::{RegularizationConfig, RegularizationConfigBuilder};

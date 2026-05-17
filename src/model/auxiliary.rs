@@ -77,6 +77,211 @@ fn default_similarity_ranking_teacher_temperature() -> f64 {
     0.10
 }
 
+impl AuxiliaryLossConfig {
+    /// Starts a fluent builder seeded with [`Self::default`].
+    #[must_use]
+    pub fn builder() -> AuxiliaryLossConfigBuilder {
+        AuxiliaryLossConfigBuilder::default()
+    }
+}
+
+/// Fluent builder for [`AuxiliaryLossConfig`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AuxiliaryLossConfigBuilder {
+    config: AuxiliaryLossConfig,
+}
+
+impl AuxiliaryLossConfigBuilder {
+    /// Creates a builder seeded with [`AuxiliaryLossConfig::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the clean-reconstruction loss weight.
+    #[inline]
+    #[must_use]
+    pub fn with_reconstruction_weight(mut self, value: f64) -> Self {
+        self.config.reconstruction_weight = value;
+        self
+    }
+
+    /// Sets the masked-peak reconstruction weight.
+    #[inline]
+    #[must_use]
+    pub fn with_masked_peak_weight(mut self, value: f64) -> Self {
+        self.config.masked_peak_weight = value;
+        self
+    }
+
+    /// Sets the intruder-peak detection weight.
+    #[inline]
+    #[must_use]
+    pub fn with_intruder_peak_weight(mut self, value: f64) -> Self {
+        self.config.intruder_peak_weight = value;
+        self
+    }
+
+    /// Sets the precursor-reconstruction weight.
+    #[inline]
+    #[must_use]
+    pub fn with_precursor_reconstruction_weight(mut self, value: f64) -> Self {
+        self.config.precursor_reconstruction_weight = value;
+        self
+    }
+
+    /// Sets the masked-precursor weight.
+    #[inline]
+    #[must_use]
+    pub fn with_masked_precursor_weight(mut self, value: f64) -> Self {
+        self.config.masked_precursor_weight = value;
+        self
+    }
+
+    /// Sets the similarity-ranking weight.
+    #[inline]
+    #[must_use]
+    pub fn with_similarity_ranking_weight(mut self, value: f64) -> Self {
+        self.config.similarity_ranking_weight = value;
+        self
+    }
+
+    /// Sets the latent temperature used by the softmax ranking loss.
+    #[inline]
+    #[must_use]
+    pub fn with_similarity_ranking_latent_temperature(mut self, value: f64) -> Self {
+        self.config.similarity_ranking_latent_temperature = value;
+        self
+    }
+
+    /// Sets the (deprecated) teacher temperature.
+    #[inline]
+    #[must_use]
+    pub fn with_similarity_ranking_teacher_temperature(mut self, value: f64) -> Self {
+        self.config.similarity_ranking_teacher_temperature = value;
+        self
+    }
+
+    /// Sets the minimum clean-spectrum gap required for a sampled ranking pair.
+    #[inline]
+    #[must_use]
+    pub fn with_similarity_ranking_min_gap(mut self, value: f64) -> Self {
+        self.config.similarity_ranking_min_gap = value;
+        self
+    }
+
+    /// Sets the decoder-input latent noise standard deviation.
+    #[inline]
+    #[must_use]
+    pub fn with_latent_noise_std(mut self, value: f64) -> Self {
+        self.config.latent_noise_std = value;
+        self
+    }
+
+    /// Sets the maximum anchors per batch used by the similarity-ranking loss.
+    #[inline]
+    #[must_use]
+    pub fn with_similarity_ranking_pairs_per_batch(mut self, value: usize) -> Self {
+        self.config.similarity_ranking_pairs_per_batch = value;
+        self
+    }
+
+    /// Sets the per-slot intruder-head hidden width.
+    #[inline]
+    #[must_use]
+    pub fn with_intruder_hidden_width(mut self, value: usize) -> Self {
+        self.config.intruder_hidden_width = value;
+        self
+    }
+
+    /// Returns the configured [`AuxiliaryLossConfig`].
+    #[inline]
+    #[must_use]
+    pub fn build(self) -> AuxiliaryLossConfig {
+        self.config
+    }
+}
+
+impl EmbeddingAuxiliaryHeadsConfig {
+    /// Starts a fluent builder. All fields must be set before [`EmbeddingAuxiliaryHeadsConfigBuilder::build`].
+    #[must_use]
+    pub fn builder() -> EmbeddingAuxiliaryHeadsConfigBuilder {
+        EmbeddingAuxiliaryHeadsConfigBuilder::default()
+    }
+}
+
+/// Fluent builder for [`EmbeddingAuxiliaryHeadsConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddingAuxiliaryHeadsConfigBuilder {
+    latent_width: Option<usize>,
+    max_peaks: Option<usize>,
+    intruder_hidden_width: Option<usize>,
+}
+
+impl EmbeddingAuxiliaryHeadsConfigBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the latent embedding width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_latent_width(mut self, value: usize) -> Self {
+        self.latent_width = Some(value);
+        self
+    }
+
+    /// Sets the maximum number of peak slots in the model input (required).
+    #[inline]
+    #[must_use]
+    pub fn with_max_peaks(mut self, value: usize) -> Self {
+        self.max_peaks = Some(value);
+        self
+    }
+
+    /// Sets the intruder-head hidden width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_intruder_hidden_width(mut self, value: usize) -> Self {
+        self.intruder_hidden_width = Some(value);
+        self
+    }
+
+    /// Builds the config, erroring when any required field is unset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::IncompleteBuilder`] when any required field
+    /// (`latent_width`, `max_peaks`, `intruder_hidden_width`) was not set.
+    pub fn build(self) -> crate::Result<EmbeddingAuxiliaryHeadsConfig> {
+        let latent_width =
+            self.latent_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "EmbeddingAuxiliaryHeadsConfig",
+                    field: "latent_width",
+                })?;
+        let max_peaks = self
+            .max_peaks
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "EmbeddingAuxiliaryHeadsConfig",
+                field: "max_peaks",
+            })?;
+        let intruder_hidden_width =
+            self.intruder_hidden_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "EmbeddingAuxiliaryHeadsConfig",
+                    field: "intruder_hidden_width",
+                })?;
+        Ok(EmbeddingAuxiliaryHeadsConfig {
+            latent_width,
+            max_peaks,
+            intruder_hidden_width,
+        })
+    }
+}
+
 /// Configuration for small embedding-level auxiliary heads.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct EmbeddingAuxiliaryHeadsConfig {
@@ -147,7 +352,19 @@ pub struct SimilarityRankingBatch<B: Backend> {
     /// Position of the highest-scoring candidate in each anchor's candidate row.
     pub best_candidate_position: Tensor<B, 1, Int>,
     /// Teacher score gap between the best and runner-up candidates.
-    pub top2_gap: Tensor<B, 2>,
+    pub top2_gap: Tensor<B, 1>,
+}
+
+#[cfg(feature = "cuda")]
+impl<B: Backend> From<mass_spectrometry::burn::RankingOutput<B>> for SimilarityRankingBatch<B> {
+    #[inline]
+    fn from(output: mass_spectrometry::burn::RankingOutput<B>) -> Self {
+        Self {
+            candidate_index: output.candidate_index,
+            best_candidate_position: output.best_position,
+            top2_gap: output.top2_gap,
+        }
+    }
 }
 
 impl<B: Backend> SimilarityRankingBatch<B> {
@@ -163,7 +380,7 @@ impl<B: Backend> SimilarityRankingBatch<B> {
                 TensorData::new(indices, [batch_size]),
                 device,
             ),
-            top2_gap: Tensor::<B, 2>::zeros([batch_size, 1], device),
+            top2_gap: Tensor::<B, 1>::zeros([batch_size], device),
         }
     }
 }
@@ -415,7 +632,11 @@ pub fn similarity_ranking_output<B: Backend>(
         .one_hot::<2>(candidate_count)
         .float();
     let cross_entropy = (log_probs * target * -1.0).sum_dim(1);
-    let target_gap = batch.top2_gap.narrow(0, 0, pair_count).detach();
+    let target_gap = batch
+        .top2_gap
+        .narrow(0, 0, pair_count)
+        .detach()
+        .unsqueeze_dim(1);
     let valid = target_gap.clone().greater_elem(min_gap).float();
     let valid_pairs = valid.clone().sum();
     let gap_weights = target_gap * valid.clone();
@@ -696,7 +917,7 @@ mod tests {
                 TensorData::new(vec![0_i64, 0, 0, 0], [4]),
                 &device,
             ),
-            top2_gap: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
+            top2_gap: Tensor::<B, 1>::from_floats([0.7, 0.7, 0.7, 0.7], &device),
         };
 
         let loss = similarity_ranking_loss(latent, batch, 0, 0.10, 0.10, 0.01).into_scalar();
@@ -720,7 +941,7 @@ mod tests {
                 TensorData::new(vec![0_i64, 0, 0, 0], [4]),
                 &device,
             ),
-            top2_gap: Tensor::<B, 2>::from_floats([[0.7], [0.7], [0.7], [0.7]], &device),
+            top2_gap: Tensor::<B, 1>::from_floats([0.7, 0.7, 0.7, 0.7], &device),
         };
 
         let output = similarity_ranking_output(latent, batch, 0, 0.10, 0.10, 0.01);
@@ -745,7 +966,7 @@ mod tests {
                 TensorData::new(vec![0_i64, 0, 0], [3]),
                 &device,
             ),
-            top2_gap: Tensor::<B, 2>::from_floats([[0.9], [0.1], [0.0]], &device),
+            top2_gap: Tensor::<B, 1>::from_floats([0.9, 0.1, 0.0], &device),
         };
 
         let loss = similarity_ranking_loss(latent, batch, 0, 0.5, 0.5, 0.01).into_scalar();
@@ -773,7 +994,7 @@ mod tests {
                 TensorData::new(vec![0_i64, 0, 0], [3]),
                 &device,
             ),
-            top2_gap: Tensor::<B, 2>::from_floats([[0.9], [0.1], [0.1]], &device),
+            top2_gap: Tensor::<B, 1>::from_floats([0.9, 0.1, 0.1], &device),
         };
 
         let output = similarity_ranking_output(latent, batch, 1, 0.5, 0.5, 0.01);

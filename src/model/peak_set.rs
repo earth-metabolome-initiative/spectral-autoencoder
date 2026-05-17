@@ -65,6 +65,13 @@ pub struct PeakSetEncoderConfig {
 }
 
 impl PeakSetEncoderConfig {
+    /// Starts a fluent builder. All fields are required before
+    /// [`PeakSetEncoderConfigBuilder::build`].
+    #[must_use]
+    pub fn builder() -> PeakSetEncoderConfigBuilder {
+        PeakSetEncoderConfigBuilder::default()
+    }
+
     /// Creates an initialized peak-token encoder.
     pub fn init<B: Backend>(&self, device: &B::Device) -> PeakSetEncoder<B> {
         assert!(self.max_peaks > 0, "max_peaks must be positive");
@@ -105,6 +112,186 @@ impl PeakSetEncoderConfig {
     }
 }
 
+/// Fluent builder for [`PeakSetEncoderConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct PeakSetEncoderConfigBuilder {
+    max_peaks: Option<usize>,
+    token_feature_width: Option<usize>,
+    condition_width: Option<usize>,
+    token_embedding_width: Option<usize>,
+    attention_heads: Option<usize>,
+    transformer_layers: Option<usize>,
+    transformer_feed_forward_width: Option<usize>,
+    dropout: Option<f64>,
+    hidden_widths: Option<Vec<usize>>,
+    latent_width: Option<usize>,
+}
+
+impl PeakSetEncoderConfigBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum number of peak tokens per spectrum (required).
+    #[inline]
+    #[must_use]
+    pub fn with_max_peaks(mut self, value: usize) -> Self {
+        self.max_peaks = Some(value);
+        self
+    }
+
+    /// Sets the per-token feature width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_token_feature_width(mut self, value: usize) -> Self {
+        self.token_feature_width = Some(value);
+        self
+    }
+
+    /// Sets the encoder-side metadata-condition width (required; may be `0`).
+    #[inline]
+    #[must_use]
+    pub fn with_condition_width(mut self, value: usize) -> Self {
+        self.condition_width = Some(value);
+        self
+    }
+
+    /// Sets the internal peak-token embedding width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_token_embedding_width(mut self, value: usize) -> Self {
+        self.token_embedding_width = Some(value);
+        self
+    }
+
+    /// Sets the number of self-attention heads (required).
+    #[inline]
+    #[must_use]
+    pub fn with_attention_heads(mut self, value: usize) -> Self {
+        self.attention_heads = Some(value);
+        self
+    }
+
+    /// Sets the number of transformer encoder layers (required).
+    #[inline]
+    #[must_use]
+    pub fn with_transformer_layers(mut self, value: usize) -> Self {
+        self.transformer_layers = Some(value);
+        self
+    }
+
+    /// Sets the transformer feed-forward block width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_transformer_feed_forward_width(mut self, value: usize) -> Self {
+        self.transformer_feed_forward_width = Some(value);
+        self
+    }
+
+    /// Sets the transformer dropout probability (required).
+    #[inline]
+    #[must_use]
+    pub fn with_dropout(mut self, value: f64) -> Self {
+        self.dropout = Some(value);
+        self
+    }
+
+    /// Sets the post-pooling hidden-layer widths (required).
+    #[inline]
+    #[must_use]
+    pub fn with_hidden_widths(mut self, value: Vec<usize>) -> Self {
+        self.hidden_widths = Some(value);
+        self
+    }
+
+    /// Sets the latent embedding width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_latent_width(mut self, value: usize) -> Self {
+        self.latent_width = Some(value);
+        self
+    }
+
+    /// Builds the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::IncompleteBuilder`] when any required field is
+    /// unset.
+    pub fn build(self) -> crate::Result<PeakSetEncoderConfig> {
+        let max_peaks = self.max_peaks.ok_or_else(|| crate::Error::IncompleteBuilder {
+            config: "PeakSetEncoderConfig",
+            field: "max_peaks",
+        })?;
+        let token_feature_width =
+            self.token_feature_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetEncoderConfig",
+                    field: "token_feature_width",
+                })?;
+        let condition_width =
+            self.condition_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetEncoderConfig",
+                    field: "condition_width",
+                })?;
+        let token_embedding_width =
+            self.token_embedding_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetEncoderConfig",
+                    field: "token_embedding_width",
+                })?;
+        let attention_heads = self
+            .attention_heads
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetEncoderConfig",
+                field: "attention_heads",
+            })?;
+        let transformer_layers =
+            self.transformer_layers
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetEncoderConfig",
+                    field: "transformer_layers",
+                })?;
+        let transformer_feed_forward_width = self.transformer_feed_forward_width.ok_or_else(|| {
+            crate::Error::IncompleteBuilder {
+                config: "PeakSetEncoderConfig",
+                field: "transformer_feed_forward_width",
+            }
+        })?;
+        let dropout = self.dropout.ok_or_else(|| crate::Error::IncompleteBuilder {
+            config: "PeakSetEncoderConfig",
+            field: "dropout",
+        })?;
+        let hidden_widths = self
+            .hidden_widths
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetEncoderConfig",
+                field: "hidden_widths",
+            })?;
+        let latent_width = self
+            .latent_width
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetEncoderConfig",
+                field: "latent_width",
+            })?;
+        Ok(PeakSetEncoderConfig {
+            max_peaks,
+            token_feature_width,
+            condition_width,
+            token_embedding_width,
+            attention_heads,
+            transformer_layers,
+            transformer_feed_forward_width,
+            dropout,
+            hidden_widths,
+            latent_width,
+        })
+    }
+}
+
 /// Query-set decoder configuration for reconstructed peak candidates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeakSetDecoderConfig {
@@ -132,6 +319,13 @@ pub struct PeakSetDecoderConfig {
 }
 
 impl PeakSetDecoderConfig {
+    /// Starts a fluent builder. All fields are required before
+    /// [`PeakSetDecoderConfigBuilder::build`].
+    #[must_use]
+    pub fn builder() -> PeakSetDecoderConfigBuilder {
+        PeakSetDecoderConfigBuilder::default()
+    }
+
     /// Returns the number of values predicted per peak candidate.
     #[must_use]
     pub const fn output_feature_width(&self) -> usize {
@@ -184,6 +378,170 @@ impl PeakSetDecoderConfig {
     }
 }
 
+/// Fluent builder for [`PeakSetDecoderConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct PeakSetDecoderConfigBuilder {
+    max_peaks: Option<usize>,
+    latent_width: Option<usize>,
+    condition_width: Option<usize>,
+    query_width: Option<usize>,
+    attention_heads: Option<usize>,
+    decoder_layers: Option<usize>,
+    decoder_feed_forward_width: Option<usize>,
+    dropout: Option<f64>,
+    condition_output_width: Option<usize>,
+}
+
+impl PeakSetDecoderConfigBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum number of reconstructed peak candidates (required).
+    #[inline]
+    #[must_use]
+    pub fn with_max_peaks(mut self, value: usize) -> Self {
+        self.max_peaks = Some(value);
+        self
+    }
+
+    /// Sets the latent embedding width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_latent_width(mut self, value: usize) -> Self {
+        self.latent_width = Some(value);
+        self
+    }
+
+    /// Sets the decoder-side metadata-condition width (required; may be `0`).
+    #[inline]
+    #[must_use]
+    pub fn with_condition_width(mut self, value: usize) -> Self {
+        self.condition_width = Some(value);
+        self
+    }
+
+    /// Sets the learned-query width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_query_width(mut self, value: usize) -> Self {
+        self.query_width = Some(value);
+        self
+    }
+
+    /// Sets the number of decoder attention heads (required).
+    #[inline]
+    #[must_use]
+    pub fn with_attention_heads(mut self, value: usize) -> Self {
+        self.attention_heads = Some(value);
+        self
+    }
+
+    /// Sets the number of transformer decoder layers (required).
+    #[inline]
+    #[must_use]
+    pub fn with_decoder_layers(mut self, value: usize) -> Self {
+        self.decoder_layers = Some(value);
+        self
+    }
+
+    /// Sets the decoder feed-forward block width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_decoder_feed_forward_width(mut self, value: usize) -> Self {
+        self.decoder_feed_forward_width = Some(value);
+        self
+    }
+
+    /// Sets the decoder dropout probability (required).
+    #[inline]
+    #[must_use]
+    pub fn with_dropout(mut self, value: f64) -> Self {
+        self.dropout = Some(value);
+        self
+    }
+
+    /// Sets the reconstructed metadata-condition width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_condition_output_width(mut self, value: usize) -> Self {
+        self.condition_output_width = Some(value);
+        self
+    }
+
+    /// Builds the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::IncompleteBuilder`] when any required field is
+    /// unset.
+    pub fn build(self) -> crate::Result<PeakSetDecoderConfig> {
+        let max_peaks = self.max_peaks.ok_or_else(|| crate::Error::IncompleteBuilder {
+            config: "PeakSetDecoderConfig",
+            field: "max_peaks",
+        })?;
+        let latent_width = self
+            .latent_width
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetDecoderConfig",
+                field: "latent_width",
+            })?;
+        let condition_width =
+            self.condition_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetDecoderConfig",
+                    field: "condition_width",
+                })?;
+        let query_width = self
+            .query_width
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetDecoderConfig",
+                field: "query_width",
+            })?;
+        let attention_heads = self
+            .attention_heads
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetDecoderConfig",
+                field: "attention_heads",
+            })?;
+        let decoder_layers = self
+            .decoder_layers
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetDecoderConfig",
+                field: "decoder_layers",
+            })?;
+        let decoder_feed_forward_width = self.decoder_feed_forward_width.ok_or_else(|| {
+            crate::Error::IncompleteBuilder {
+                config: "PeakSetDecoderConfig",
+                field: "decoder_feed_forward_width",
+            }
+        })?;
+        let dropout = self.dropout.ok_or_else(|| crate::Error::IncompleteBuilder {
+            config: "PeakSetDecoderConfig",
+            field: "dropout",
+        })?;
+        let condition_output_width =
+            self.condition_output_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "PeakSetDecoderConfig",
+                    field: "condition_output_width",
+                })?;
+        Ok(PeakSetDecoderConfig {
+            max_peaks,
+            latent_width,
+            condition_width,
+            query_width,
+            attention_heads,
+            decoder_layers,
+            decoder_feed_forward_width,
+            dropout,
+            condition_output_width,
+        })
+    }
+}
+
 /// Peak-token autoencoder configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeakSetAutoencoderConfig {
@@ -205,6 +563,13 @@ pub struct PeakSetAutoencoderConfig {
 }
 
 impl PeakSetAutoencoderConfig {
+    /// Starts a fluent builder. `encoder`, `decoder`, and `loss` are required;
+    /// remaining fields fall back to their type's default.
+    #[must_use]
+    pub fn builder() -> PeakSetAutoencoderConfigBuilder {
+        PeakSetAutoencoderConfigBuilder::default()
+    }
+
     /// Starting peak-set transformer configuration for the 20M-spectrum run.
     ///
     /// This is the recommended large-run configuration: top-N peak tokens,
@@ -776,6 +1141,106 @@ mod train_impl {
                 output.diagnostics,
             )
         }
+    }
+}
+
+/// Fluent builder for [`PeakSetAutoencoderConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct PeakSetAutoencoderConfigBuilder {
+    encoder: Option<PeakSetEncoderConfig>,
+    decoder: Option<PeakSetDecoderConfig>,
+    loss: Option<SetReconstructionLossConfig>,
+    regularization: Option<RegularizationConfig>,
+    precursor_mz_scale: Option<f64>,
+    auxiliary: Option<AuxiliaryLossConfig>,
+}
+
+impl PeakSetAutoencoderConfigBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the encoder configuration (required).
+    #[inline]
+    #[must_use]
+    pub fn with_encoder(mut self, value: PeakSetEncoderConfig) -> Self {
+        self.encoder = Some(value);
+        self
+    }
+
+    /// Sets the decoder configuration (required).
+    #[inline]
+    #[must_use]
+    pub fn with_decoder(mut self, value: PeakSetDecoderConfig) -> Self {
+        self.decoder = Some(value);
+        self
+    }
+
+    /// Sets the set-reconstruction loss config (required).
+    #[inline]
+    #[must_use]
+    pub fn with_loss(mut self, value: SetReconstructionLossConfig) -> Self {
+        self.loss = Some(value);
+        self
+    }
+
+    /// Overrides the regularization config.
+    #[inline]
+    #[must_use]
+    pub fn with_regularization(mut self, value: RegularizationConfig) -> Self {
+        self.regularization = Some(value);
+        self
+    }
+
+    /// Overrides the diagnostic precursor m/z scale.
+    #[inline]
+    #[must_use]
+    pub fn with_precursor_mz_scale(mut self, value: f64) -> Self {
+        self.precursor_mz_scale = Some(value);
+        self
+    }
+
+    /// Overrides the auxiliary-loss config.
+    #[inline]
+    #[must_use]
+    pub fn with_auxiliary(mut self, value: AuxiliaryLossConfig) -> Self {
+        self.auxiliary = Some(value);
+        self
+    }
+
+    /// Builds the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::IncompleteBuilder`] when `encoder`, `decoder`,
+    /// or `loss` is unset.
+    pub fn build(self) -> crate::Result<PeakSetAutoencoderConfig> {
+        let encoder = self
+            .encoder
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetAutoencoderConfig",
+                field: "encoder",
+            })?;
+        let decoder = self
+            .decoder
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "PeakSetAutoencoderConfig",
+                field: "decoder",
+            })?;
+        let loss = self.loss.ok_or_else(|| crate::Error::IncompleteBuilder {
+            config: "PeakSetAutoencoderConfig",
+            field: "loss",
+        })?;
+        Ok(PeakSetAutoencoderConfig {
+            encoder,
+            decoder,
+            loss,
+            regularization: self.regularization.unwrap_or_default(),
+            precursor_mz_scale: self.precursor_mz_scale.unwrap_or_else(default_precursor_mz_scale),
+            auxiliary: self.auxiliary.unwrap_or_default(),
+        })
     }
 }
 

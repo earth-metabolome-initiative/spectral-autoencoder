@@ -25,6 +25,12 @@ impl Default for RegularizationConfig {
 }
 
 impl RegularizationConfig {
+    /// Starts a fluent builder seeded with [`Self::default`].
+    #[must_use]
+    pub fn builder() -> RegularizationConfigBuilder {
+        RegularizationConfigBuilder::default()
+    }
+
     /// Returns `true` when no regularization penalty is active.
     #[must_use]
     pub fn is_disabled(&self) -> bool {
@@ -44,6 +50,43 @@ impl RegularizationConfig {
         let mut visitor = RegularizationVisitor::<B>::new(*self, device);
         module.visit(&mut visitor);
         visitor.finish()
+    }
+}
+
+/// Fluent builder for [`RegularizationConfig`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RegularizationConfigBuilder {
+    config: RegularizationConfig,
+}
+
+impl RegularizationConfigBuilder {
+    /// Creates a builder seeded with [`RegularizationConfig::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the L1 penalty weight.
+    #[inline]
+    #[must_use]
+    pub fn with_l1(mut self, value: f64) -> Self {
+        self.config.l1 = value;
+        self
+    }
+
+    /// Sets the L2 penalty weight.
+    #[inline]
+    #[must_use]
+    pub fn with_l2(mut self, value: f64) -> Self {
+        self.config.l2 = value;
+        self
+    }
+
+    /// Returns the configured [`RegularizationConfig`].
+    #[inline]
+    #[must_use]
+    pub fn build(self) -> RegularizationConfig {
+        self.config
     }
 }
 

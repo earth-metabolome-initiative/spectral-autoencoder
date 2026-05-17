@@ -1,6 +1,6 @@
 use std::{
     collections::hash_map::DefaultHasher,
-    env, fs,
+    fs,
     hash::{Hash, Hasher},
     io,
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
@@ -17,14 +17,16 @@ use spectral_autoencoder::{
     SpectrumAugmentationConfig, TokenizedAutoencoderBatch, TokenizedMgfIter,
 };
 
-use crate::gems_common::{
-    LoaderProgress, PairSamplingEpoch, RunArgs, SimilarityTeacherBackend, SimilarityTeacherConfig,
+use mass_spectrometry::burn::AllMetricsBackend;
+
+use crate::common::{
+    LoaderProgress, PairSamplingEpoch, PreprocessedCacheOptions, RunArgs, SimilarityTeacherConfig,
     StreamingLoaderOptions, StreamingTrainingLoaderConfig, TeacherGpuCache, TeacherSpectraBuilder,
-    TeacherSpectraCache, bool_var, finish_loader_once, loader_epoch_items,
-    mask_precursor_conditions, open_records_or_panic, probability_mask, signed_random,
-    similarity_pair_seed, skip_split_records, teacher_similarity_ranking_batch,
+    TeacherSpectraCache, finish_loader_once, loader_epoch_items, mask_precursor_conditions,
+    open_records_or_panic, probability_mask, signed_random, similarity_pair_seed,
+    skip_split_records, teacher_similarity_ranking_batch,
 };
-use crate::gems_streaming::{
+use crate::streaming::{
     HostWindowPlan, LoaderProfileAccumulator, LoaderWindowProfile, LoaderWorkerError,
     OrderedHostWindowStream, host_window_plan, spawn_ordered_host_workers,
 };
@@ -47,6 +49,7 @@ pub struct TokenizedLoaderOptions<B: Backend> {
     pub augment: Option<SpectrumAugmentationConfig>,
     pub loader_config: StreamingTrainingLoaderConfig,
     pub token_cache_shape: TokenCacheShape,
+    pub cache: PreprocessedCacheOptions,
 }
 
 pub fn streaming_tokenized_loader<B, Open>(
@@ -55,7 +58,7 @@ pub fn streaming_tokenized_loader<B, Open>(
     open_records: Open,
 ) -> Arc<dyn DataLoader<B, TokenizedAutoencoderBatch<B>>>
 where
-    B: SimilarityTeacherBackend + 'static,
+    B: AllMetricsBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
 {
     let TokenizedLoaderOptions {
@@ -65,9 +68,15 @@ where
         augment,
         loader_config,
         token_cache_shape,
+        cache,
     } = options;
-    let preprocessed_cache_path =
-        token_preprocessed_cache_path(args, start_item, progress.max_batches, token_cache_shape);
+    let preprocessed_cache_path = token_preprocessed_cache_path(
+        args,
+        &cache,
+        start_item,
+        progress.max_batches,
+        token_cache_shape,
+    );
     let loader = Arc::new(StreamingTokenizedMgfLoader::new(
         StreamingLoaderOptions {
             mgf_source: args.mgf_source.clone(),
@@ -82,6 +91,7 @@ where
             randomize_pair_sampling: augment.is_some(),
         },
         preprocessed_cache_path,
+        cache.refresh,
         loader_config,
         token_cache_shape,
         open_records,
@@ -92,21 +102,23 @@ where
 
 fn token_preprocessed_cache_path(
     args: &RunArgs,
+    cache: &PreprocessedCacheOptions,
     start_item: usize,
     max_batches: usize,
     shape: TokenCacheShape,
 ) -> Option<PathBuf> {
     assert!(
-        bool_var("GEMS_TOKEN_PREPROCESSED_CACHE", true),
-        "GEMS_TOKEN_PREPROCESSED_CACHE=0 is not supported; the host-worker loader requires the token cache"
+        cache.enabled,
+        "--preprocessed-cache=false is not supported; the host-worker loader requires the token cache"
     );
 
     let default_cache_dir = format!(
         "datasets/gems-a10-top-{}-peaks/preprocessed-token",
         args.max_peaks
     );
-    let cache_dir = env::var_os("GEMS_TOKEN_PREPROCESSED_CACHE_DIR")
-        .map(PathBuf::from)
+    let cache_dir = cache
+        .dir
+        .clone()
         .unwrap_or_else(|| PathBuf::from(default_cache_dir));
     let total_items = args.batch_size.saturating_mul(max_batches);
     let fingerprint = token_preprocessed_cache_fingerprint(args, start_item, total_items, shape);
@@ -372,7 +384,9 @@ where
     loader_workers: usize,
     host_prefetch_windows: usize,
     loader_profile_every: usize,
+    loader_profile_sink: crate::streaming::LoaderProfileSink,
     preprocessed_cache_path: Option<PathBuf>,
+    preprocessed_cache_refresh: bool,
     cache_total_items: usize,
     cache_item_offset: usize,
     token_cache_shape: TokenCacheShape,
@@ -402,7 +416,9 @@ where
             loader_workers: self.loader_workers,
             host_prefetch_windows: self.host_prefetch_windows,
             loader_profile_every: self.loader_profile_every,
+            loader_profile_sink: self.loader_profile_sink.clone(),
             preprocessed_cache_path: self.preprocessed_cache_path.clone(),
+            preprocessed_cache_refresh: self.preprocessed_cache_refresh,
             cache_total_items: self.cache_total_items,
             cache_item_offset: self.cache_item_offset,
             token_cache_shape: self.token_cache_shape,
@@ -423,6 +439,7 @@ where
     fn new(
         options: StreamingLoaderOptions<B>,
         preprocessed_cache_path: Option<PathBuf>,
+        preprocessed_cache_refresh: bool,
         loader_config: StreamingTrainingLoaderConfig,
         token_cache_shape: TokenCacheShape,
         open_records: Open,
@@ -440,7 +457,9 @@ where
             loader_workers: loader_config.loader_workers,
             host_prefetch_windows: loader_config.host_prefetch_windows,
             loader_profile_every: loader_config.loader_profile_every,
+            loader_profile_sink: loader_config.loader_profile_sink.clone(),
             preprocessed_cache_path,
+            preprocessed_cache_refresh,
             cache_total_items,
             cache_item_offset: 0,
             token_cache_shape,
@@ -464,12 +483,12 @@ where
             return;
         };
         let total_items = self.cache_total_items;
-        let refresh = bool_var("GEMS_TOKEN_PREPROCESSED_CACHE_REFRESH", false);
+        let refresh = self.preprocessed_cache_refresh;
 
         if !refresh && path.try_exists().unwrap_or(false) {
             if let Err(error) = self.token_cache_file_meta(path, total_items) {
                 panic!(
-                    "invalid preprocessed token cache {}: {error}; set GEMS_TOKEN_PREPROCESSED_CACHE_REFRESH=1 to rebuild it",
+                    "invalid preprocessed token cache {}: {error}; pass --preprocessed-cache-refresh to rebuild it",
                     path.display()
                 );
             }
@@ -521,7 +540,7 @@ where
     fn token_host_window_stream(&self) -> OrderedHostWindowStream<TokenHostWindow> {
         let path = self.preprocessed_cache_path.as_ref().unwrap_or_else(|| {
             panic!(
-                "token host-worker loading requires GEMS_TOKEN_PREPROCESSED_CACHE=1 for {}",
+                "token host-worker loading requires the preprocessed cache for {}",
                 self.mgf_source
             )
         });
@@ -752,7 +771,7 @@ where
 
 impl<B, Open> DataLoader<B, TokenizedAutoencoderBatch<B>> for StreamingTokenizedMgfLoader<B, Open>
 where
-    B: SimilarityTeacherBackend + 'static,
+    B: AllMetricsBackend + 'static,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn iter<'a>(&'a self) -> Box<dyn DataLoaderIterator<TokenizedAutoencoderBatch<B>> + 'a> {
@@ -770,6 +789,7 @@ where
             profile: LoaderProfileAccumulator::new(
                 format!("{} token", self.progress.label),
                 self.loader_profile_every,
+                self.loader_profile_sink.clone(),
             ),
             finished: false,
         })
@@ -1329,7 +1349,7 @@ where
 
 impl<B, Open> Iterator for StreamingTokenizedMgfIter<'_, B, Open>
 where
-    B: SimilarityTeacherBackend,
+    B: AllMetricsBackend,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
 {
     type Item = TokenizedAutoencoderBatch<B>;
@@ -1484,7 +1504,7 @@ where
 
 impl<B, Open> StreamingTokenizedMgfIter<'_, B, Open>
 where
-    B: SimilarityTeacherBackend,
+    B: AllMetricsBackend,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn fill_cache(&mut self) -> Option<TokenGpuCache<B>> {
@@ -1527,7 +1547,7 @@ where
 impl<B, Open> DataLoaderIterator<TokenizedAutoencoderBatch<B>>
     for StreamingTokenizedMgfIter<'_, B, Open>
 where
-    B: SimilarityTeacherBackend,
+    B: AllMetricsBackend,
     Open: Fn() -> spectral_autoencoder::Result<TokenizedMgfIter> + Send + Sync + Clone + 'static,
 {
     fn progress(&self) -> Progress {
@@ -1536,6 +1556,165 @@ where
             items_total: self.loader.epoch_items,
         }
     }
+}
+
+/// Trains the peak-set autoencoder end-to-end. Called from the clap-driven
+/// `train peak-set` subcommand entry point.
+pub fn run(cli: &crate::cli::PeakSetArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::Arc;
+
+    use burn::{
+        module::Module,
+        optim::{AdamConfig, decay::WeightDecayConfig, lr_scheduler::constant::ConstantLr},
+        record::CompactRecorder,
+        train::{Learner, SupervisedTraining},
+    };
+    use spectral_autoencoder::{
+        AutoencoderTrainingMetricsExt, ConditioningEncoder, PeakSetAutoencoderConfig,
+        SpectrumAugmentationConfig, SpectrumTokenizerConfig,
+    };
+
+    use crate::cli::{
+        augmentation_config, auxiliary_loss_config, run_args_from_shared,
+        similarity_teacher_config, streaming_loader_config,
+    };
+    use crate::common::{
+        GeMSProgress, InnerBackend, PreprocessedCacheOptions, TrainingBackend,
+        print_streaming_run_header, save_model_record, warm_start_model,
+    };
+    use crate::peak_set::{TokenCacheShape, TokenizedLoaderOptions, streaming_tokenized_loader};
+
+    let shared = &cli.shared;
+    let args = run_args_from_shared(
+        shared,
+        cli.batch_size,
+        cli.train_batches,
+        cli.valid_batches,
+        cli.epochs,
+    )?;
+    std::fs::create_dir_all(&args.output_dir)?;
+
+    let progress = Arc::new(GeMSProgress::new(
+        args.train_batches,
+        args.valid_batches,
+        args.batch_size,
+        "tokenizing",
+        shared.progress,
+    ));
+    let device = burn::backend::cuda::CudaDevice::new(args.device);
+    let augmentation = augmentation_config(shared, SpectrumAugmentationConfig::masked_mz_pretraining());
+    let tokenizer_config = SpectrumTokenizerConfig {
+        max_peaks: args.max_peaks,
+        ..SpectrumTokenizerConfig::default()
+    };
+    let token_cache_shape = TokenCacheShape {
+        max_peaks: tokenizer_config.max_peaks,
+        token_feature_width: tokenizer_config.feature_width(),
+        target_width: tokenizer_config.target_width(),
+        condition_width: ConditioningEncoder::default().vector_width(),
+    };
+    let config = PeakSetAutoencoderConfig::twenty_million_run_with_peaks(args.max_peaks);
+    let auxiliary = auxiliary_loss_config(shared, config.auxiliary);
+    let similarity_teacher = similarity_teacher_config(shared, auxiliary)?;
+    let loader_config = streaming_loader_config(shared, similarity_teacher)?;
+    let cache = PreprocessedCacheOptions {
+        enabled: cli.preprocessed_cache,
+        dir: cli.preprocessed_cache_dir.clone(),
+        refresh: cli.preprocessed_cache_refresh,
+    };
+    let train_builder = args.gems_builder.clone();
+    let train_tokenizer_config = tokenizer_config.clone();
+    let train_loader = streaming_tokenized_loader::<TrainingBackend, _>(
+        &args,
+        TokenizedLoaderOptions {
+            device: device.clone(),
+            progress: progress.train.clone(),
+            start_item: args.train_start_item(),
+            augment: Some(augmentation),
+            loader_config: loader_config.clone(),
+            token_cache_shape,
+            cache: cache.clone(),
+        },
+        move || open_records(train_builder.clone(), train_tokenizer_config.clone()),
+    );
+    let valid_builder = args.gems_builder.clone();
+    let valid_tokenizer_config = tokenizer_config.clone();
+    let valid_loader = streaming_tokenized_loader::<InnerBackend, _>(
+        &args,
+        TokenizedLoaderOptions {
+            device: device.clone(),
+            progress: progress.valid.clone(),
+            start_item: args.valid_start_item(),
+            augment: None,
+            loader_config: loader_config.clone(),
+            token_cache_shape,
+            cache: cache.clone(),
+        },
+        move || open_records(valid_builder.clone(), valid_tokenizer_config.clone()),
+    );
+
+    let config = config.with_auxiliary(auxiliary);
+    let model = config.init::<TrainingBackend>(&device);
+    let model = warm_start_model::<TrainingBackend, _>(
+        &progress,
+        model,
+        &device,
+        args.warm_start_model.as_deref(),
+        "peak-set",
+    )?;
+    let parameter_count = model.num_params();
+    let optim = AdamConfig::new()
+        .with_weight_decay(Some(WeightDecayConfig::new(args.weight_decay as f32)))
+        .init();
+    let learner = Learner::new(model, optim, ConstantLr::new(args.learning_rate));
+
+    print_streaming_run_header(
+        "peak-set",
+        &args,
+        parameter_count,
+        &loader_config,
+        auxiliary,
+        similarity_teacher,
+        None,
+    );
+    progress.start_training("starting GeMS peak-set streaming training");
+    let training = SupervisedTraining::new(&args.output_dir, train_loader, valid_loader)
+        .num_epochs(args.epochs)
+        .with_autoencoder_metrics()
+        .summary();
+    let training = if args.checkpoints {
+        training.with_file_checkpointer(CompactRecorder::new())
+    } else {
+        training
+    };
+    let training = if let Some(epoch) = args.resume_epoch {
+        training.checkpoint(epoch)
+    } else {
+        training
+    };
+    let trained = training.launch(learner);
+    progress.finish_training("finished GeMS peak-set streaming training");
+
+    save_model_record(
+        &progress,
+        trained.model.into_record(),
+        args.output_dir.join("peak_set_model"),
+        "save peak-set model",
+        "saved peak-set model record",
+    )
+}
+
+fn open_records(
+    builder: mascot_rs::prelude::GemsA10Builder<f32>,
+    tokenizer_config: spectral_autoencoder::SpectrumTokenizerConfig,
+) -> spectral_autoencoder::Result<spectral_autoencoder::TokenizedMgfIter> {
+    use spectral_autoencoder::{ConditioningEncoder, SpectrumTokenizer, TokenizedMgfIter};
+    let records = crate::common::open_gems_a10_iter(builder)?;
+    Ok(TokenizedMgfIter::from_records(
+        records,
+        SpectrumTokenizer::new(tokenizer_config),
+        ConditioningEncoder::default(),
+    ))
 }
 
 #[cfg(test)]

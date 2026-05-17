@@ -71,6 +71,67 @@ impl Default for SetReconstructionLossConfig {
 /// Backward-compatible name for the peak-set reconstruction loss configuration.
 pub type PeakSetLossConfig = SetReconstructionLossConfig;
 
+impl SetReconstructionLossConfig {
+    /// Starts a fluent builder seeded with [`Self::default`].
+    #[must_use]
+    pub fn builder() -> SetReconstructionLossConfigBuilder {
+        SetReconstructionLossConfigBuilder::default()
+    }
+}
+
+/// Fluent builder for [`SetReconstructionLossConfig`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SetReconstructionLossConfigBuilder {
+    config: SetReconstructionLossConfig,
+}
+
+impl SetReconstructionLossConfigBuilder {
+    /// Creates a builder seeded with [`SetReconstructionLossConfig::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the normalized m/z matching tolerance.
+    #[inline]
+    #[must_use]
+    pub fn with_normalized_mz_tolerance(mut self, value: f64) -> Self {
+        self.config.normalized_mz_tolerance = value;
+        self
+    }
+
+    /// Sets the m/z exponent for cosine-style peak products.
+    #[inline]
+    #[must_use]
+    pub fn with_mz_power(mut self, value: f64) -> Self {
+        self.config.mz_power = value;
+        self
+    }
+
+    /// Sets the intensity exponent for cosine-style peak products.
+    #[inline]
+    #[must_use]
+    pub fn with_intensity_power(mut self, value: f64) -> Self {
+        self.config.intensity_power = value;
+        self
+    }
+
+    /// Sets the weight for matching predicted and target peak counts.
+    #[inline]
+    #[must_use]
+    pub fn with_count_weight(mut self, value: f64) -> Self {
+        self.config.count_weight = value;
+        self
+    }
+
+    /// Returns the configured [`SetReconstructionLossConfig`].
+    #[inline]
+    #[must_use]
+    pub fn build(self) -> SetReconstructionLossConfig {
+        self.config
+    }
+}
+
 /// Reconstruction spectral-similarity diagnostics.
 pub struct ReconstructionSimilarityOutput<B: Backend> {
     /// Linear-cosine similarity between target and reconstructed spectra.
@@ -238,7 +299,7 @@ fn reconstruction_similarity_from_parts<B: Backend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reconstruction_similarity_for_match_mode<B: Backend>(
+pub(crate) fn reconstruction_similarity_for_match_mode<B: Backend>(
     pred_mz: Tensor<B, 2>,
     pred_products: Tensor<B, 2>,
     pred_precursor: Tensor<B, 2>,
@@ -291,7 +352,7 @@ fn reconstruction_similarity_for_match_mode<B: Backend>(
         .reshape([batch_size])
 }
 
-fn normalized_precursor<B: Backend>(conditions: Tensor<B, 2>) -> Tensor<B, 2> {
+pub(crate) fn normalized_precursor<B: Backend>(conditions: Tensor<B, 2>) -> Tensor<B, 2> {
     conditions.narrow(1, 0, 1).clamp_min(0.0).clamp_max(1.0)
 }
 
@@ -719,7 +780,7 @@ fn gather_peak_pairs<B: Backend>(
     pairs.gather(1, indices)
 }
 
-fn peak_products<B: Backend>(
+pub(crate) fn peak_products<B: Backend>(
     mz: Tensor<B, 2>,
     intensity: Tensor<B, 2>,
     presence: Tensor<B, 2>,

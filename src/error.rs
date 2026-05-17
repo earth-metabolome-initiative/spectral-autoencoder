@@ -40,4 +40,54 @@ pub enum Error {
         /// Source path.
         path: PathBuf,
     },
+
+    /// A config builder was missing a required field at build time.
+    #[error("missing required field `{field}` while building {config}")]
+    IncompleteBuilder {
+        /// Name of the config type being built.
+        config: &'static str,
+        /// Name of the unset required field.
+        field: &'static str,
+    },
+
+    /// I/O failure during checkpoint load or save.
+    #[error("io error at {path}: {source}")]
+    Io {
+        /// Path being read or written.
+        path: PathBuf,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// JSON (de)serialization failed.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// A checkpoint's model config did not match the expected variant.
+    #[error("checkpoint at {path} has wrong variant: expected {expected}, found {found}")]
+    CheckpointVariantMismatch {
+        /// Checkpoint directory.
+        path: PathBuf,
+        /// Variant the caller asked for.
+        expected: &'static str,
+        /// Variant present on disk.
+        found: &'static str,
+    },
+
+    /// Generic embed-pipeline error wrapping a string message. Used by I/O
+    /// adapters (sources/sinks) and the embed bin's loop.
+    #[error("{0}")]
+    InvalidBatch(String),
+}
+
+impl Error {
+    /// Convenience constructor for [`Error::Io`].
+    #[must_use]
+    pub fn io(path: &std::path::Path, source: std::io::Error) -> Self {
+        Self::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    }
 }

@@ -20,6 +20,12 @@ impl Default for ConditioningConfig {
 }
 
 impl ConditioningConfig {
+    /// Starts a fluent builder seeded with [`Self::default`].
+    #[must_use]
+    pub fn builder() -> ConditioningConfigBuilder {
+        ConditioningConfigBuilder::default()
+    }
+
     /// Returns the vector width for this configuration.
     #[must_use]
     pub const fn vector_width(&self) -> usize {
@@ -30,6 +36,35 @@ impl ConditioningConfig {
     #[must_use]
     pub const fn precursor_mz_scale(&self) -> f64 {
         self.precursor_mz_scale
+    }
+}
+
+/// Fluent builder for [`ConditioningConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct ConditioningConfigBuilder {
+    config: ConditioningConfig,
+}
+
+impl ConditioningConfigBuilder {
+    /// Creates a builder seeded with [`ConditioningConfig::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the precursor m/z scale divisor.
+    #[inline]
+    #[must_use]
+    pub fn with_precursor_mz_scale(mut self, value: f64) -> Self {
+        self.config.precursor_mz_scale = value;
+        self
+    }
+
+    /// Returns the configured [`ConditioningConfig`].
+    #[inline]
+    #[must_use]
+    pub fn build(self) -> ConditioningConfig {
+        self.config
     }
 }
 
@@ -75,14 +110,19 @@ impl ConditioningEncoder {
     where
         P: SpectrumFloat,
     {
-        let precursor = record.precursor_mz().to_f64();
-        if precursor.is_finite() && precursor > 0.0 {
-            vec![
-                (precursor / self.config.precursor_mz_scale).clamp(0.0, 1.0) as f32,
+        self.encode_precursor_mz(Some(record.precursor_mz().to_f64()))
+    }
+
+    /// Encodes a precursor m/z directly. `None` (or a non-finite / non-positive
+    /// value) yields the unknown-precursor encoding.
+    #[must_use]
+    pub fn encode_precursor_mz(&self, precursor_mz: Option<f64>) -> Vec<f32> {
+        match precursor_mz {
+            Some(value) if value.is_finite() && value > 0.0 => vec![
+                (value / self.config.precursor_mz_scale).clamp(0.0, 1.0) as f32,
                 1.0,
-            ]
-        } else {
-            self.unknown()
+            ],
+            _ => self.unknown(),
         }
     }
 }

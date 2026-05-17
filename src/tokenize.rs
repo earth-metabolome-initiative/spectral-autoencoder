@@ -53,6 +53,12 @@ impl Default for SpectrumTokenizerConfig {
 }
 
 impl SpectrumTokenizerConfig {
+    /// Starts a fluent builder seeded with [`Self::default`].
+    #[must_use]
+    pub fn builder() -> SpectrumTokenizerConfigBuilder {
+        SpectrumTokenizerConfigBuilder::default()
+    }
+
     /// Returns the number of features per peak token.
     #[must_use]
     pub const fn feature_width(&self) -> usize {
@@ -69,6 +75,67 @@ impl SpectrumTokenizerConfig {
     #[must_use]
     pub const fn target_width(&self) -> usize {
         self.max_peaks * 2
+    }
+}
+
+/// Fluent builder for [`SpectrumTokenizerConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct SpectrumTokenizerConfigBuilder {
+    config: SpectrumTokenizerConfig,
+}
+
+impl SpectrumTokenizerConfigBuilder {
+    /// Creates a builder seeded with [`SpectrumTokenizerConfig::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum number of peaks retained per spectrum.
+    #[inline]
+    #[must_use]
+    pub fn with_max_peaks(mut self, value: usize) -> Self {
+        self.config.max_peaks = value;
+        self
+    }
+
+    /// Sets the minimum m/z retained.
+    #[inline]
+    #[must_use]
+    pub fn with_min_mz(mut self, value: f64) -> Self {
+        self.config.min_mz = value;
+        self
+    }
+
+    /// Sets the maximum m/z represented as `1.0`.
+    #[inline]
+    #[must_use]
+    pub fn with_max_mz(mut self, value: f64) -> Self {
+        self.config.max_mz = value;
+        self
+    }
+
+    /// Sets the post-normalization intensity power.
+    #[inline]
+    #[must_use]
+    pub fn with_intensity_power(mut self, value: f64) -> Self {
+        self.config.intensity_power = value;
+        self
+    }
+
+    /// Sets the number of sine/cosine m/z frequency pairs per token.
+    #[inline]
+    #[must_use]
+    pub fn with_mz_fourier_frequencies(mut self, value: usize) -> Self {
+        self.config.mz_fourier_frequencies = value;
+        self
+    }
+
+    /// Returns the configured [`SpectrumTokenizerConfig`].
+    #[inline]
+    #[must_use]
+    pub fn build(self) -> SpectrumTokenizerConfig {
+        self.config
     }
 }
 

@@ -1,36 +1,47 @@
-#[cfg(all(feature = "cuda-fusion", feature = "std"))]
+//! Embed every spectrum in the Zenodo `annotated-ms2-top-128-peaks` dataset
+//! and write a TSV with metadata columns (SMILES, taxonomy, retention time,
+//! etc.) followed by the latent dimensions.
+//!
+//! This example demonstrates wiring [`spectral_autoencoder::SpectrumEmbedder`]
+//! against a mascot-rs dataset loader. The embedder handles vectorisation,
+//! batching, and forward passes. The example only does:
+//!
+//! 1. Resolve the Zenodo dataset via `AnnotatedMs2Builder`.
+//! 2. Open the streaming MGF iterator.
+//! 3. Drive the iterator in chunks of `--batch-size`, extracting metadata
+//!    on the way in and pairing each emitted [`EmbeddingRow`] with its
+//!    source record's annotations on the way out.
+//!
+//! The pairing is 1:1 because the embedder is built with the default
+//! `skip_errors = false`. Any failure aborts the whole run.
+//!
+//! ```bash
+//! cargo run --release --example encode_annotated_ms2_flat \
+//!     --no-default-features --features cuda,embed,embed-mgf -- \
+//!     --checkpoint runs/gems-a10-top128-flat-cache15-bs2048-80epoch \
+//!     --output runs/annotated-ms2-top128-flat/embeddings.tsv
+//! ```
+
+#[cfg(all(feature = "cuda", feature = "embed", feature = "embed-mgf"))]
 mod app {
     use std::{
-        env, fs, io,
+        fs,
         io::{BufWriter, Write},
-        path::{Path, PathBuf},
+        path::PathBuf,
     };
 
-    use burn::{
-        backend::{Cuda, cuda::CudaDevice},
-        module::Module,
-        record::{CompactRecorder, Recorder},
-        tensor::{Tensor, TensorData},
-    };
+    use clap::Parser;
     use indicatif::{ProgressBar, ProgressStyle};
     use mascot_rs::prelude::{
         ANNOTATED_MS2_TOP_128_SPECTRA_COUNT, AnnotatedMs2Builder, Dataset, MGFVec,
         MascotGenericFormat,
     };
     use mass_spectrometry::prelude::{Spectrum, SpectrumFloat};
-    use spectral_autoencoder::{
-        ConditioningEncoder, SpectralAutoencoderConfig, SpectrumVectorizer,
-        SpectrumVectorizerConfig,
-    };
+    use spectral_autoencoder::{DEFAULT_EMBED_BATCH_SIZE, SpectrumEmbedder};
 
-    type Backend = Cuda<f32, i32>;
+    type Backend = burn::backend::Cuda<f32, i32>;
 
-    const MAX_PEAKS: usize = 128;
-    const DEFAULT_MODEL: &str = "runs/gems-a10-top128-flat-cache15-bs2048-80epoch-latent96-rtgap30-rankw5-ret005/flat_vector_model";
-    const DEFAULT_OUTPUT: &str =
-        "runs/annotated-ms2-top128-flat-latent96-rtgap30-80epoch/embeddings.tsv";
     const DEFAULT_DATASET_DIR: &str = "datasets/annotated-ms2-top-128-peaks";
-    const DEFAULT_BATCH_SIZE: usize = 8192;
 
     const OUTPUT_COLUMNS: &[&str] = &[
         "index",
@@ -70,8 +81,37 @@ mod app {
     const CLASSYFIRE_SUBCLASS_KEY: &str = "CHEMONT_SUBCLASS";
     const CLASSYFIRE_DIRECT_PARENT_KEY: &str = "CHEMONT_DIRECT_PARENT";
 
+    #[derive(Debug, Parser)]
+    #[command(
+        name = "encode_annotated_ms2_flat",
+        about = "Embed the Zenodo annotated-ms2-top-128-peaks dataset"
+    )]
+    struct Args {
+        /// Training run directory containing `model-config.json` and `model.mpk`.
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// Output TSV path.
+        #[arg(long)]
+        output: PathBuf,
+        /// Local dataset cache directory.
+        #[arg(long, default_value = DEFAULT_DATASET_DIR)]
+        dataset_dir: PathBuf,
+        /// Spectra processed per forward pass.
+        #[arg(long, default_value_t = DEFAULT_EMBED_BATCH_SIZE)]
+        batch_size: usize,
+        /// CUDA device ordinal.
+        #[arg(long, default_value_t = 0)]
+        cuda_device: usize,
+        /// Stop after this many spectra (useful for smoke tests).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Force-redownload the dataset.
+        #[arg(long, default_value_t = false)]
+        force_download: bool,
+    }
+
     pub fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let args = Args::from_env()?;
+        let args = Args::parse();
         if let Some(parent) = args.output.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -87,177 +127,67 @@ mod app {
             runtime.block_on(<AnnotatedMs2Builder<f32> as Dataset>::mgf_iter(builder))?;
 
         println!("annotated MS2 MGF: {}", dataset_path.display());
-        println!("model: {}", args.model.display());
+        println!("checkpoint: {}", args.checkpoint.display());
         println!("output: {}", args.output.display());
-        println!("device: cuda:{}", args.device);
+        println!("device: cuda:{}", args.cuda_device);
         println!("batch size: {}", args.batch_size);
-        println!("latent width: {}", args.latent_width);
         if let Some(limit) = args.limit {
             println!("limit: {limit}");
         }
 
-        let device = CudaDevice::new(args.device);
-        let mut config = SpectralAutoencoderConfig::twenty_million_run_with_peaks(MAX_PEAKS);
-        config.encoder.latent_width = args.latent_width;
-        config.decoder.latent_width = args.latent_width;
-        let model = config.init::<Backend>(&device);
-        let record = CompactRecorder::new().load(record_base_path(&args.model), &device)?;
-        let model = model.load_record(record);
+        let device = burn::backend::cuda::CudaDevice::new(args.cuda_device);
+        let mut embedder = SpectrumEmbedder::<Backend>::builder(args.checkpoint.clone(), device)
+            .with_batch_size(args.batch_size)
+            .build()?;
+        let latent_width = embedder.latent_width();
 
-        let vectorizer = SpectrumVectorizer::new(SpectrumVectorizerConfig {
-            max_peaks: MAX_PEAKS,
-            ..SpectrumVectorizerConfig::default()
-        });
-        let conditioning = ConditioningEncoder::default();
         let mut writer = BufWriter::new(fs::File::create(&args.output)?);
-        write_header(&mut writer, config.encoder.latent_width)?;
+        write_header(&mut writer, latent_width)?;
 
-        let total = args.limit.unwrap_or(ANNOTATED_MS2_TOP_128_SPECTRA_COUNT);
-        let bar = progress_bar(total as u64);
-        let mut spectra = Vec::with_capacity(args.batch_size * vectorizer.vector_width());
-        let mut conditions = Vec::with_capacity(args.batch_size * conditioning.vector_width());
-        let mut annotations = Vec::with_capacity(args.batch_size);
-        let mut written = 0usize;
+        let total_expected = args.limit.unwrap_or(ANNOTATED_MS2_TOP_128_SPECTRA_COUNT);
+        let bar = progress_bar(total_expected as u64);
 
-        for record in records.by_ref() {
+        let mut spectra: Vec<MascotGenericFormat<f32>> = Vec::with_capacity(args.batch_size);
+        let mut metadata: Vec<Vec<String>> = Vec::with_capacity(args.batch_size);
+        let mut emitted = 0usize;
+
+        while let Some(record) = records.by_ref().next() {
             let record = record?;
-            let annotation = annotation_fields(written + annotations.len(), &record);
-            spectra.extend(vectorizer.encode(&record)?.values);
-            conditions.extend(conditioning.encode(&record));
-            annotations.push(annotation);
+            metadata.push(annotation_fields(emitted + spectra.len(), &record));
+            spectra.push(record);
 
-            if annotations.len() == args.batch_size {
-                write_batch(
-                    &model,
-                    &device,
-                    BatchBuffers {
-                        writer: &mut writer,
-                        spectra: &mut spectra,
-                        conditions: &mut conditions,
-                        annotations: &mut annotations,
-                        spectrum_width: config.encoder.spectrum_width,
-                        condition_width: config.encoder.condition_width,
-                        latent_width: config.encoder.latent_width,
-                    },
-                )?;
-                written += args.batch_size;
-                bar.set_position(written as u64);
-                if args.limit.is_some_and(|limit| written >= limit) {
+            let reached_limit = args.limit.is_some_and(|cap| emitted + spectra.len() >= cap);
+            if spectra.len() >= args.batch_size || reached_limit {
+                let rows = embedder.embed(&spectra)?;
+                debug_assert_eq!(rows.len(), metadata.len(), "skip_errors=false should be 1:1");
+                for (fields, row) in metadata.drain(..).zip(rows) {
+                    write_row(&mut writer, &fields, &row.latent)?;
+                }
+                emitted += spectra.len();
+                spectra.clear();
+                bar.set_position(emitted as u64);
+                if reached_limit {
                     break;
                 }
             }
-
-            if args
-                .limit
-                .is_some_and(|limit| written + annotations.len() >= limit)
-            {
-                break;
-            }
         }
 
-        if !annotations.is_empty() {
-            let batch_items = annotations.len();
-            write_batch(
-                &model,
-                &device,
-                BatchBuffers {
-                    writer: &mut writer,
-                    spectra: &mut spectra,
-                    conditions: &mut conditions,
-                    annotations: &mut annotations,
-                    spectrum_width: config.encoder.spectrum_width,
-                    condition_width: config.encoder.condition_width,
-                    latent_width: config.encoder.latent_width,
-                },
-            )?;
-            written += batch_items;
-            bar.set_position(written as u64);
+        if !spectra.is_empty() {
+            let rows = embedder.embed(&spectra)?;
+            for (fields, row) in metadata.drain(..).zip(rows) {
+                write_row(&mut writer, &fields, &row.latent)?;
+            }
+            emitted += spectra.len();
+            bar.set_position(emitted as u64);
         }
 
         writer.flush()?;
-        bar.finish_with_message(format!("encoded {written} spectra"));
+        bar.finish_with_message(format!("encoded {emitted} spectra"));
         println!("wrote embeddings: {}", args.output.display());
         Ok(())
     }
 
-    struct Args {
-        model: PathBuf,
-        output: PathBuf,
-        dataset_dir: PathBuf,
-        batch_size: usize,
-        latent_width: usize,
-        device: usize,
-        limit: Option<usize>,
-        force_download: bool,
-    }
-
-    impl Args {
-        fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
-            Ok(Self {
-                model: path_var("ANNOTATED_MS2_MODEL", DEFAULT_MODEL),
-                output: path_var("ANNOTATED_MS2_OUT", DEFAULT_OUTPUT),
-                dataset_dir: path_var("ANNOTATED_MS2_DIR", DEFAULT_DATASET_DIR),
-                batch_size: usize_var("ANNOTATED_MS2_BATCH_SIZE", DEFAULT_BATCH_SIZE)?,
-                latent_width: usize_var("ANNOTATED_MS2_LATENT_WIDTH", 96)?,
-                device: usize_var("ANNOTATED_MS2_CUDA_DEVICE", 0)?,
-                limit: optional_usize_var("ANNOTATED_MS2_LIMIT")?,
-                force_download: bool_var("ANNOTATED_MS2_FORCE_DOWNLOAD", false)?,
-            })
-        }
-    }
-
-    struct BatchBuffers<'a, W: Write> {
-        writer: &'a mut W,
-        spectra: &'a mut Vec<f32>,
-        conditions: &'a mut Vec<f32>,
-        annotations: &'a mut Vec<Vec<String>>,
-        spectrum_width: usize,
-        condition_width: usize,
-        latent_width: usize,
-    }
-
-    fn write_batch<W: Write>(
-        model: &spectral_autoencoder::SpectralAutoencoder<Backend>,
-        device: &CudaDevice,
-        batch: BatchBuffers<'_, W>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let BatchBuffers {
-            writer,
-            spectra,
-            conditions,
-            annotations,
-            spectrum_width,
-            condition_width,
-            latent_width,
-        } = batch;
-        let batch_size = annotations.len();
-        let spectra_tensor = Tensor::<Backend, 2>::from_data(
-            TensorData::new(core::mem::take(spectra), [batch_size, spectrum_width]),
-            device,
-        );
-        let condition_tensor = Tensor::<Backend, 2>::from_data(
-            TensorData::new(core::mem::take(conditions), [batch_size, condition_width]),
-            device,
-        );
-        let latent = model.encoder.forward(spectra_tensor, condition_tensor);
-        let latent = latent.into_data().to_vec::<f32>()?;
-
-        for (index, fields) in annotations.drain(..).enumerate() {
-            write_tsv_fields(writer, &fields)?;
-            let start = index * latent_width;
-            for value in &latent[start..start + latent_width] {
-                writer.write_all(b"\t")?;
-                write!(writer, "{value:.8}")?;
-            }
-            writer.write_all(b"\n")?;
-        }
-
-        spectra.reserve(batch_size * spectrum_width);
-        conditions.reserve(batch_size * condition_width);
-        Ok(())
-    }
-
-    fn write_header<W: Write>(writer: &mut W, latent_width: usize) -> io::Result<()> {
+    fn write_header<W: Write>(writer: &mut W, latent_width: usize) -> std::io::Result<()> {
         for (index, column) in OUTPUT_COLUMNS.iter().enumerate() {
             if index > 0 {
                 writer.write_all(b"\t")?;
@@ -266,6 +196,24 @@ mod app {
         }
         for index in 0..latent_width {
             write!(writer, "\tz{index}")?;
+        }
+        writer.write_all(b"\n")
+    }
+
+    fn write_row<W: Write>(
+        writer: &mut W,
+        fields: &[String],
+        latent: &[f32],
+    ) -> std::io::Result<()> {
+        for (index, field) in fields.iter().enumerate() {
+            if index > 0 {
+                writer.write_all(b"\t")?;
+            }
+            write_tsv_field(writer, field)?;
+        }
+        for value in latent {
+            writer.write_all(b"\t")?;
+            write!(writer, "{value:.8}")?;
         }
         writer.write_all(b"\n")
     }
@@ -281,7 +229,7 @@ mod app {
         let ion_mode = record.ion_mode().map(|value| value.to_string());
         let instrument = record.source_instrument().map(|value| value.to_string());
         let smiles = metadata.smiles().map(ToString::to_string);
-        let formula = record.formula().map(ToString::to_string);
+        let formula = record.formula().map(|value| value.to_string());
 
         vec![
             index.to_string(),
@@ -310,8 +258,8 @@ mod app {
     }
 
     fn metadata_value(record: &MascotGenericFormat<f32>, key: &str) -> String {
-        let metadata = record.metadata();
-        metadata
+        record
+            .metadata()
             .arbitrary_metadata_value(key)
             .map(clean_value)
             .unwrap_or_default()
@@ -329,17 +277,7 @@ mod app {
         value.trim().to_owned()
     }
 
-    fn write_tsv_fields<W: Write>(writer: &mut W, fields: &[String]) -> io::Result<()> {
-        for (index, field) in fields.iter().enumerate() {
-            if index > 0 {
-                writer.write_all(b"\t")?;
-            }
-            write_tsv_field(writer, field)?;
-        }
-        Ok(())
-    }
-
-    fn write_tsv_field<W: Write>(writer: &mut W, field: &str) -> io::Result<()> {
+    fn write_tsv_field<W: Write>(writer: &mut W, field: &str) -> std::io::Result<()> {
         for byte in field.bytes() {
             match byte {
                 b'\t' | b'\r' | b'\n' => writer.write_all(b" ")?,
@@ -360,63 +298,20 @@ mod app {
         bar
     }
 
-    fn record_base_path(path: &Path) -> PathBuf {
-        if path.extension().and_then(|ext| ext.to_str()) == Some("mpk") {
-            return path.with_extension("");
-        }
-        path.to_path_buf()
-    }
-
     fn format_f64(value: f64) -> String {
         format!("{value:.8}")
     }
-
-    fn path_var(name: &str, default: &str) -> PathBuf {
-        env::var_os(name).map_or_else(|| PathBuf::from(default), PathBuf::from)
-    }
-
-    fn usize_var(name: &str, default: usize) -> Result<usize, Box<dyn std::error::Error>> {
-        match env::var(name) {
-            Ok(value) => Ok(value.parse()?),
-            Err(env::VarError::NotPresent) => Ok(default),
-            Err(error) => Err(Box::new(error)),
-        }
-    }
-
-    fn optional_usize_var(name: &str) -> Result<Option<usize>, Box<dyn std::error::Error>> {
-        match env::var(name) {
-            Ok(value) if value.trim().is_empty() => Ok(None),
-            Ok(value) => Ok(Some(value.parse()?)),
-            Err(env::VarError::NotPresent) => Ok(None),
-            Err(error) => Err(Box::new(error)),
-        }
-    }
-
-    fn bool_var(name: &str, default: bool) -> Result<bool, Box<dyn std::error::Error>> {
-        match env::var(name) {
-            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => Ok(true),
-                "0" | "false" | "no" | "off" => Ok(false),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("{name} must be a boolean"),
-                )
-                .into()),
-            },
-            Err(env::VarError::NotPresent) => Ok(default),
-            Err(error) => Err(Box::new(error)),
-        }
-    }
 }
 
-#[cfg(all(feature = "cuda-fusion", feature = "std"))]
+#[cfg(all(feature = "cuda", feature = "embed", feature = "embed-mgf"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     app::main()
 }
 
-#[cfg(not(all(feature = "cuda-fusion", feature = "std")))]
+#[cfg(not(all(feature = "cuda", feature = "embed", feature = "embed-mgf")))]
 fn main() {
     eprintln!(
-        "encode_annotated_ms2_flat requires --no-default-features --features std,cuda-fusion"
+        "encode_annotated_ms2_flat requires --no-default-features \
+         --features cuda,embed,embed-mgf"
     );
 }

@@ -75,55 +75,102 @@ The flat-vector example defaults to the tuned 32,768-spectrum batch,
 Run the flat-vector model:
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" \
-GEMS_RUN_DIR=runs/gems-a10-top128-flat-bs32768-window8-10epoch \
-GEMS_GPU_WINDOW_BATCHES=8 \
-GEMS_LOADER_WORKERS=16 \
-GEMS_HOST_PREFETCH_WINDOWS=8 \
-GEMS_BATCH_SIZE=32768 \
-GEMS_VALID_BATCHES=6 \
-GEMS_TRAIN_BATCHES=605 \
-GEMS_EPOCHS=10 \
-cargo run --release --example train_gems_flat --no-default-features --features std,cuda-fusion,train,tui
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin train \
+    --no-default-features --features std,cuda-fusion,train,tui -- flat \
+    --run-dir runs/gems-a10-top128-flat-bs32768-window8-10epoch \
+    --gpu-window-batches 8 \
+    --loader-workers 16 \
+    --host-prefetch-windows 8 \
+    --batch-size 32768 \
+    --valid-batches 6 \
+    --train-batches 605 \
+    --epochs 10
 ```
 
 Run the peak-set model:
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" \
-GEMS_RUN_DIR=runs/gems-a10-top128-peak-window8-bs64-fusion-5epoch \
-GEMS_GPU_WINDOW_BATCHES=8 \
-GEMS_LOADER_WORKERS=16 \
-GEMS_HOST_PREFETCH_WINDOWS=8 \
-GEMS_LOADER_PROFILE_EVERY=100 \
-GEMS_BATCH_SIZE=64 \
-GEMS_VALID_BATCHES=1024 \
-GEMS_TRAIN_BATCHES=20000 \
-GEMS_EPOCHS=5 \
-cargo run --release --example train_gems_peak_set --no-default-features --features std,cuda-fusion,train,tui
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin train \
+    --no-default-features --features std,cuda-fusion,train,tui -- peak-set \
+    --run-dir runs/gems-a10-top128-peak-window8-bs64-fusion-5epoch \
+    --gpu-window-batches 8 \
+    --loader-workers 16 \
+    --host-prefetch-windows 8 \
+    --loader-profile-every 100 \
+    --batch-size 64 \
+    --valid-batches 1024 \
+    --train-batches 20000 \
+    --epochs 5
 ```
+
+`cargo run --bin train -- --help` lists every flag. The two variants share a
+common pool of CLI flags (training-loop, dataset/Zenodo, loader, augmentation,
+auxiliary, similarity-ranking) plus a handful of variant-specific flags
+(reconstruction ordering and hidden widths for `flat`, preprocessed-cache
+selection for both).
 
 ## Checkpoints
 
-GeMS examples write Burn checkpoints by default under `GEMS_RUN_DIR/checkpoint`.
+The training bin writes Burn checkpoints by default under
+`<run-dir>/checkpoint`.
 
 Resume a checkpointed run:
 
 ```bash
-RUSTFLAGS="-C target-cpu=native" \
-GEMS_RUN_DIR=runs/gems-a10-top128-flat-bs32768-window8-10epoch \
-GEMS_RESUME_EPOCH=10 \
-GEMS_EPOCHS=20 \
-cargo run --release --example train_gems_flat --no-default-features --features std,cuda-fusion,train,tui
+RUSTFLAGS="-C target-cpu=native" cargo run --release --bin train \
+    --no-default-features --features std,cuda-fusion,train,tui -- flat \
+    --run-dir runs/gems-a10-top128-flat-bs32768-window8-10epoch \
+    --resume-epoch 10 \
+    --epochs 20
 ```
 
-`GEMS_RESUME_EPOCH` restores model, optimizer, and scheduler state. For older
-runs that only have a final model record, use `GEMS_WARM_START_MODEL`; that
+`--resume-epoch` restores model, optimizer, and scheduler state. For older
+runs that only have a final model record, use `--warm-start-model <path>`; that
 loads weights but starts a fresh optimizer.
+
+## Inference
+
+The `embed` bin loads a trained checkpoint and writes latent embeddings plus
+three reconstruction-quality signals (linear cosine, modified linear cosine,
+log MSE) per input spectrum. Input formats: `.mgf`, `.mgf.zst`, `.mgf.gz`,
+plus stdin (MGF semantics). Output formats: `.tsv`, `.csv`, `.jsonl`,
+`.parquet`, plus stdout (TSV).
+
+CUDA backend:
+
+```bash
+cargo run --release --bin embed --no-default-features \
+    --features cuda,embed,embed-mgf,embed-parquet -- \
+    library.mgf embeddings.parquet \
+    --checkpoint runs/gems-a10-top128-flat-bs32768-window8-10epoch \
+    --batch-size 4096
+```
+
+CPU (`ndarray`) backend. Same flags, just drop the `cuda` feature:
+
+```bash
+cargo run --release --bin embed --no-default-features \
+    --features embed,embed-mgf,embed-parquet -- \
+    library.mgf embeddings.parquet \
+    --checkpoint runs/gems-a10-top128-flat-bs32768-window8-10epoch \
+    --batch-size 4096
+```
+
+The `--cuda-device` flag is parsed in both builds but only honoured under
+the `cuda` feature; on CPU it's silently ignored.
+
+Output rows preserve input order. Failed inputs (empty peaks, parse errors)
+abort the batch with a clear error message unless `--skip-errors` is set, in
+which case they are dropped from the output (the result is then a strict
+subset of the input).
+
+The Zenodo download token, when needed, is read from the `ZENODO_TOKEN`
+environment variable (kept as env-var rather than a flag so tokens don't end
+up in shell history).
 
 ## Features
 
 Default features are `std`, `ndarray`, `train`, and `tui`. The CUDA training
-examples run with `cuda`, `cuda-no-fusion`, or `cuda-fusion`; the documented
-commands use `cuda-fusion`, and plain `cuda` is the fallback when Burn fusion
-or autotune allocates too much temporary GPU memory.
+runs with `cuda` or `cuda-fusion`; the documented commands use `cuda-fusion`,
+and plain `cuda` is the fallback when Burn fusion or autotune allocates too
+much temporary GPU memory.

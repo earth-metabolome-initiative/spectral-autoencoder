@@ -53,6 +53,13 @@ pub struct EncoderConfig {
 }
 
 impl EncoderConfig {
+    /// Starts a fluent builder. All four fields are required before
+    /// [`EncoderConfigBuilder::build`].
+    #[must_use]
+    pub fn builder() -> EncoderConfigBuilder {
+        EncoderConfigBuilder::default()
+    }
+
     /// Creates an initialized encoder.
     pub fn init<B: Backend>(&self, device: &B::Device) -> Encoder<B> {
         let mut input_width = self.spectrum_width + self.condition_width;
@@ -67,6 +74,94 @@ impl EncoderConfig {
             latent: LinearConfig::new(input_width, self.latent_width).init(device),
             activation: Relu::new(),
         }
+    }
+}
+
+/// Fluent builder for the flat-vector [`EncoderConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct EncoderConfigBuilder {
+    spectrum_width: Option<usize>,
+    condition_width: Option<usize>,
+    hidden_widths: Option<Vec<usize>>,
+    latent_width: Option<usize>,
+}
+
+impl EncoderConfigBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the vectorized-spectrum width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_spectrum_width(mut self, value: usize) -> Self {
+        self.spectrum_width = Some(value);
+        self
+    }
+
+    /// Sets the encoder-side metadata-condition width (required; may be `0`).
+    #[inline]
+    #[must_use]
+    pub fn with_condition_width(mut self, value: usize) -> Self {
+        self.condition_width = Some(value);
+        self
+    }
+
+    /// Sets the hidden-layer widths (required).
+    #[inline]
+    #[must_use]
+    pub fn with_hidden_widths(mut self, value: Vec<usize>) -> Self {
+        self.hidden_widths = Some(value);
+        self
+    }
+
+    /// Sets the latent embedding width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_latent_width(mut self, value: usize) -> Self {
+        self.latent_width = Some(value);
+        self
+    }
+
+    /// Builds the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::IncompleteBuilder`] when any required field is
+    /// unset.
+    pub fn build(self) -> crate::Result<EncoderConfig> {
+        let spectrum_width = self
+            .spectrum_width
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "EncoderConfig",
+                field: "spectrum_width",
+            })?;
+        let condition_width =
+            self.condition_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "EncoderConfig",
+                    field: "condition_width",
+                })?;
+        let hidden_widths = self
+            .hidden_widths
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "EncoderConfig",
+                field: "hidden_widths",
+            })?;
+        let latent_width = self
+            .latent_width
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "EncoderConfig",
+                field: "latent_width",
+            })?;
+        Ok(EncoderConfig {
+            spectrum_width,
+            condition_width,
+            hidden_widths,
+            latent_width,
+        })
     }
 }
 
@@ -89,6 +184,13 @@ pub struct DecoderConfig {
 }
 
 impl DecoderConfig {
+    /// Starts a fluent builder. All fields are required before
+    /// [`DecoderConfigBuilder::build`].
+    #[must_use]
+    pub fn builder() -> DecoderConfigBuilder {
+        DecoderConfigBuilder::default()
+    }
+
     /// Creates an initialized decoder.
     pub fn init<B: Backend>(&self, device: &B::Device) -> Decoder<B> {
         let mut input_width = self.latent_width + self.condition_width;
@@ -106,6 +208,110 @@ impl DecoderConfig {
             activation: Relu::new(),
             condition_width: self.condition_width,
         }
+    }
+}
+
+/// Fluent builder for the flat-vector [`DecoderConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct DecoderConfigBuilder {
+    latent_width: Option<usize>,
+    condition_width: Option<usize>,
+    hidden_widths: Option<Vec<usize>>,
+    spectrum_width: Option<usize>,
+    condition_output_width: Option<usize>,
+}
+
+impl DecoderConfigBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the latent embedding width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_latent_width(mut self, value: usize) -> Self {
+        self.latent_width = Some(value);
+        self
+    }
+
+    /// Sets the decoder-side metadata-condition width (required; may be `0`).
+    #[inline]
+    #[must_use]
+    pub fn with_condition_width(mut self, value: usize) -> Self {
+        self.condition_width = Some(value);
+        self
+    }
+
+    /// Sets the hidden-layer widths (required).
+    #[inline]
+    #[must_use]
+    pub fn with_hidden_widths(mut self, value: Vec<usize>) -> Self {
+        self.hidden_widths = Some(value);
+        self
+    }
+
+    /// Sets the reconstructed spectrum width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_spectrum_width(mut self, value: usize) -> Self {
+        self.spectrum_width = Some(value);
+        self
+    }
+
+    /// Sets the reconstructed metadata-condition width (required).
+    #[inline]
+    #[must_use]
+    pub fn with_condition_output_width(mut self, value: usize) -> Self {
+        self.condition_output_width = Some(value);
+        self
+    }
+
+    /// Builds the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::IncompleteBuilder`] when any required field is
+    /// unset.
+    pub fn build(self) -> crate::Result<DecoderConfig> {
+        let latent_width = self
+            .latent_width
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "DecoderConfig",
+                field: "latent_width",
+            })?;
+        let condition_width =
+            self.condition_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "DecoderConfig",
+                    field: "condition_width",
+                })?;
+        let hidden_widths = self
+            .hidden_widths
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "DecoderConfig",
+                field: "hidden_widths",
+            })?;
+        let spectrum_width = self
+            .spectrum_width
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "DecoderConfig",
+                field: "spectrum_width",
+            })?;
+        let condition_output_width =
+            self.condition_output_width
+                .ok_or_else(|| crate::Error::IncompleteBuilder {
+                    config: "DecoderConfig",
+                    field: "condition_output_width",
+                })?;
+        Ok(DecoderConfig {
+            latent_width,
+            condition_width,
+            hidden_widths,
+            spectrum_width,
+            condition_output_width,
+        })
     }
 }
 
@@ -134,6 +340,13 @@ pub struct SpectralAutoencoderConfig {
 }
 
 impl SpectralAutoencoderConfig {
+    /// Starts a fluent builder. `encoder` and `decoder` are required;
+    /// remaining fields fall back to their type's default.
+    #[must_use]
+    pub fn builder() -> SpectralAutoencoderConfigBuilder {
+        SpectralAutoencoderConfigBuilder::default()
+    }
+
     /// Starting flat-vector baseline configuration for the 20M-spectrum run.
     ///
     /// This intentionally remains a compressive baseline over top-N
@@ -615,6 +828,112 @@ mod train_impl {
                 diagnostics,
             )
         }
+    }
+}
+
+/// Fluent builder for [`SpectralAutoencoderConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct SpectralAutoencoderConfigBuilder {
+    encoder: Option<EncoderConfig>,
+    decoder: Option<DecoderConfig>,
+    loss: Option<SetReconstructionLossConfig>,
+    reconstruction_ordering: Option<FlatVectorReconstructionOrdering>,
+    precursor_mz_scale: Option<f64>,
+    regularization: Option<RegularizationConfig>,
+    auxiliary: Option<AuxiliaryLossConfig>,
+}
+
+impl SpectralAutoencoderConfigBuilder {
+    /// Creates an empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the encoder configuration (required).
+    #[inline]
+    #[must_use]
+    pub fn with_encoder(mut self, value: EncoderConfig) -> Self {
+        self.encoder = Some(value);
+        self
+    }
+
+    /// Sets the decoder configuration (required).
+    #[inline]
+    #[must_use]
+    pub fn with_decoder(mut self, value: DecoderConfig) -> Self {
+        self.decoder = Some(value);
+        self
+    }
+
+    /// Overrides the set-reconstruction loss config.
+    #[inline]
+    #[must_use]
+    pub fn with_loss(mut self, value: SetReconstructionLossConfig) -> Self {
+        self.loss = Some(value);
+        self
+    }
+
+    /// Overrides the reconstruction-peak ordering policy.
+    #[inline]
+    #[must_use]
+    pub fn with_reconstruction_ordering(mut self, value: FlatVectorReconstructionOrdering) -> Self {
+        self.reconstruction_ordering = Some(value);
+        self
+    }
+
+    /// Overrides the diagnostic precursor m/z scale.
+    #[inline]
+    #[must_use]
+    pub fn with_precursor_mz_scale(mut self, value: f64) -> Self {
+        self.precursor_mz_scale = Some(value);
+        self
+    }
+
+    /// Overrides the regularization config.
+    #[inline]
+    #[must_use]
+    pub fn with_regularization(mut self, value: RegularizationConfig) -> Self {
+        self.regularization = Some(value);
+        self
+    }
+
+    /// Overrides the auxiliary-loss config.
+    #[inline]
+    #[must_use]
+    pub fn with_auxiliary(mut self, value: AuxiliaryLossConfig) -> Self {
+        self.auxiliary = Some(value);
+        self
+    }
+
+    /// Builds the config.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::IncompleteBuilder`] when `encoder` or `decoder`
+    /// is unset.
+    pub fn build(self) -> crate::Result<SpectralAutoencoderConfig> {
+        let encoder = self
+            .encoder
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "SpectralAutoencoderConfig",
+                field: "encoder",
+            })?;
+        let decoder = self
+            .decoder
+            .ok_or_else(|| crate::Error::IncompleteBuilder {
+                config: "SpectralAutoencoderConfig",
+                field: "decoder",
+            })?;
+        Ok(SpectralAutoencoderConfig {
+            encoder,
+            decoder,
+            loss: self.loss.unwrap_or_default(),
+            reconstruction_ordering: self.reconstruction_ordering.unwrap_or_default(),
+            precursor_mz_scale: self.precursor_mz_scale.unwrap_or_else(default_precursor_mz_scale),
+            regularization: self.regularization.unwrap_or_default(),
+            auxiliary: self.auxiliary.unwrap_or_default(),
+        })
     }
 }
 

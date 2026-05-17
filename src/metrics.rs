@@ -81,6 +81,83 @@ impl Default for SpectralMetricConfig {
     }
 }
 
+impl SpectralMetricConfig {
+    /// Starts a fluent builder seeded with [`Self::default`].
+    #[must_use]
+    pub fn builder() -> SpectralMetricConfigBuilder {
+        SpectralMetricConfigBuilder::default()
+    }
+}
+
+/// Fluent builder for [`SpectralMetricConfig`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpectralMetricConfigBuilder {
+    config: SpectralMetricConfig,
+}
+
+impl SpectralMetricConfigBuilder {
+    /// Creates a builder seeded with [`SpectralMetricConfig::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the peak m/z tolerance.
+    #[inline]
+    #[must_use]
+    pub fn with_mz_tolerance(mut self, value: f64) -> Self {
+        self.config.mz_tolerance = value;
+        self
+    }
+
+    /// Sets the cosine m/z exponent.
+    #[inline]
+    #[must_use]
+    pub fn with_cosine_mz_power(mut self, value: f64) -> Self {
+        self.config.cosine_mz_power = value;
+        self
+    }
+
+    /// Sets the cosine intensity exponent.
+    #[inline]
+    #[must_use]
+    pub fn with_cosine_intensity_power(mut self, value: f64) -> Self {
+        self.config.cosine_intensity_power = value;
+        self
+    }
+
+    /// Sets the entropy m/z exponent.
+    #[inline]
+    #[must_use]
+    pub fn with_entropy_mz_power(mut self, value: f64) -> Self {
+        self.config.entropy_mz_power = value;
+        self
+    }
+
+    /// Sets the entropy intensity exponent.
+    #[inline]
+    #[must_use]
+    pub fn with_entropy_intensity_power(mut self, value: f64) -> Self {
+        self.config.entropy_intensity_power = value;
+        self
+    }
+
+    /// Toggles the dynamically weighted entropy similarity.
+    #[inline]
+    #[must_use]
+    pub fn with_weighted_entropy(mut self, value: bool) -> Self {
+        self.config.weighted_entropy = value;
+        self
+    }
+
+    /// Returns the configured [`SpectralMetricConfig`].
+    #[inline]
+    #[must_use]
+    pub fn build(self) -> SpectralMetricConfig {
+        self.config
+    }
+}
+
 /// Domain-level spectral metrics.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpectralMetrics {

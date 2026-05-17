@@ -64,6 +64,12 @@ impl Default for SpectrumAugmentationConfig {
 }
 
 impl SpectrumAugmentationConfig {
+    /// Starts a fluent builder seeded with [`Self::default`].
+    #[must_use]
+    pub fn builder() -> SpectrumAugmentationConfigBuilder {
+        SpectrumAugmentationConfigBuilder::default()
+    }
+
     /// Conservative starting point inspired by DreaMS-style masked peak modeling.
     #[must_use]
     pub const fn masked_mz_pretraining() -> Self {
@@ -88,6 +94,83 @@ impl SpectrumAugmentationConfig {
             && self.intensity_jitter_fraction <= 0.0
             && self.precursor_mask_probability <= 0.0
             && self.intruder_peak_probability <= 0.0
+    }
+}
+
+/// Fluent builder for [`SpectrumAugmentationConfig`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpectrumAugmentationConfigBuilder {
+    config: SpectrumAugmentationConfig,
+}
+
+impl SpectrumAugmentationConfigBuilder {
+    /// Creates a builder seeded with [`SpectrumAugmentationConfig::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the probability of masking a peak m/z input.
+    #[inline]
+    #[must_use]
+    pub fn with_mz_mask_probability(mut self, value: f32) -> Self {
+        self.config.mz_mask_probability = value;
+        self
+    }
+
+    /// Sets the probability of dropping a peak from the input.
+    #[inline]
+    #[must_use]
+    pub fn with_peak_dropout_probability(mut self, value: f32) -> Self {
+        self.config.peak_dropout_probability = value;
+        self
+    }
+
+    /// Sets the per-spectrum m/z shift range.
+    #[inline]
+    #[must_use]
+    pub fn with_mz_shift_range(mut self, value: f32) -> Self {
+        self.config.mz_shift_range = value;
+        self
+    }
+
+    /// Sets the per-peak m/z jitter range.
+    #[inline]
+    #[must_use]
+    pub fn with_mz_jitter_range(mut self, value: f32) -> Self {
+        self.config.mz_jitter_range = value;
+        self
+    }
+
+    /// Sets the multiplicative intensity jitter fraction.
+    #[inline]
+    #[must_use]
+    pub fn with_intensity_jitter_fraction(mut self, value: f32) -> Self {
+        self.config.intensity_jitter_fraction = value;
+        self
+    }
+
+    /// Sets the probability of masking the precursor condition pair.
+    #[inline]
+    #[must_use]
+    pub fn with_precursor_mask_probability(mut self, value: f32) -> Self {
+        self.config.precursor_mask_probability = value;
+        self
+    }
+
+    /// Sets the probability of inserting a synthetic intruder peak.
+    #[inline]
+    #[must_use]
+    pub fn with_intruder_peak_probability(mut self, value: f32) -> Self {
+        self.config.intruder_peak_probability = value;
+        self
+    }
+
+    /// Returns the configured [`SpectrumAugmentationConfig`].
+    #[inline]
+    #[must_use]
+    pub fn build(self) -> SpectrumAugmentationConfig {
+        self.config
     }
 }
 

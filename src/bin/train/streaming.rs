@@ -1,9 +1,9 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    env, fmt,
+    fmt,
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver},
@@ -212,13 +212,13 @@ pub(crate) struct LoaderProfileAccumulator {
 }
 
 impl LoaderProfileAccumulator {
-    pub(crate) fn new(label: impl Into<String>, every: usize) -> Self {
+    pub(crate) fn new(label: impl Into<String>, every: usize, sink: LoaderProfileSink) -> Self {
         Self {
             label: label.into(),
             every,
             windows: 0,
             sum: LoaderWindowProfile::default(),
-            sink: LoaderProfileSink::from_env(every),
+            sink,
         }
     }
 
@@ -258,19 +258,24 @@ impl LoaderProfileAccumulator {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LoaderProfileSink {
+pub(crate) enum LoaderProfileSink {
     Disabled,
     Stderr,
     File(PathBuf),
 }
 
 impl LoaderProfileSink {
-    fn from_env(every: usize) -> Self {
+    /// Resolves the profile destination from CLI flags + the run directory.
+    pub(crate) fn resolve(
+        every: usize,
+        profile_log: Option<&Path>,
+        run_dir: &Path,
+    ) -> Self {
         if every == 0 {
             return Self::Disabled;
         }
-        if let Some(value) = env::var_os("GEMS_LOADER_PROFILE_OUTPUT") {
-            let value = value.to_string_lossy();
+        if let Some(path) = profile_log {
+            let value = path.to_string_lossy();
             let trimmed = value.trim();
             return match trimmed.to_ascii_lowercase().as_str() {
                 "" | "hidden" | "hide" | "off" | "0" | "false" | "none" => Self::Disabled,
@@ -278,14 +283,8 @@ impl LoaderProfileSink {
                 _ => Self::File(PathBuf::from(trimmed)),
             };
         }
-        if let Some(path) = env::var_os("GEMS_LOADER_PROFILE_LOG") {
-            return Self::File(PathBuf::from(path));
-        }
         if cfg!(feature = "tui") {
-            if let Some(run_dir) = env::var_os("GEMS_RUN_DIR") {
-                return Self::File(PathBuf::from(run_dir).join("loader-profile.log"));
-            }
-            return Self::File(PathBuf::from("loader-profile.log"));
+            return Self::File(run_dir.join("loader-profile.log"));
         }
         Self::Stderr
     }
@@ -363,7 +362,7 @@ mod tests {
 
     #[test]
     fn profile_accumulator_averages_milliseconds() {
-        let mut profile = LoaderProfileAccumulator::new("test", 10);
+        let mut profile = LoaderProfileAccumulator::new("test", 10, LoaderProfileSink::Stderr);
         profile.record(LoaderWindowProfile {
             wait: Duration::from_millis(1),
             disk_read: Duration::from_millis(2),

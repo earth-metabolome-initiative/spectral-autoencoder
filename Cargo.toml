@@ -11,6 +11,16 @@ readme = "README.md"
 name = "spectral_autoencoder"
 path = "src/lib.rs"
 
+[[bin]]
+name = "train"
+path = "src/bin/train/main.rs"
+required-features = ["std", "cuda", "train", "tui"]
+
+[[bin]]
+name = "embed"
+path = "src/bin/embed/main.rs"
+required-features = ["embed", "embed-mgf", "embed-parquet"]
+
 [features]
 default = ["std", "ndarray", "train", "tui"]
 std = [
@@ -22,25 +32,41 @@ std = [
     "thiserror/std",
 ]
 ndarray = ["burn/ndarray"]
-train = ["burn/train", "ndarray"]
+train = ["burn/train", "ndarray", "dep:clap", "dep:indicatif", "dep:tokio"]
 tui = ["train", "burn/tui"]
-cuda = ["burn/cuda", "dep:burn-cubecl", "dep:cubecl"]
-cuda-fusion = ["cuda", "burn/fusion", "burn/autotune", "dep:burn-fusion", "dep:burn-ir"]
-cuda-no-fusion = ["cuda", "burn/autotune"]
+cuda = [
+    "burn/cuda",
+    "mass_spectrometry/burn",
+    "mass_spectrometry/burn-cuda",
+    "mass_spectrometry/burn-autodiff",
+]
+cuda-fusion = [
+    "cuda",
+    "burn/fusion",
+    "burn/autotune",
+    "mass_spectrometry/burn-fusion",
+]
+embed = ["std", "ndarray", "dep:csv", "dep:clap"]
+embed-mgf = ["embed"]
+embed-parquet = ["embed", "dep:parquet", "dep:arrow"]
 
 [dependencies]
+arrow = { version = "55", default-features = false, optional = true }
 burn = { version = "=0.21.0", default-features = false }
-burn-cubecl = { version = "=0.21.0", default-features = false, optional = true }
-burn-fusion = { version = "=0.21.0", default-features = false, optional = true }
-burn-ir = { version = "=0.21.0", default-features = false, optional = true }
-cubecl = { version = "=0.10.0", default-features = false, optional = true }
+clap = { version = "4", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"], optional = true }
+csv = { version = "1", optional = true }
+indicatif = { version = "0.18", optional = true }
 mascot_rs = { package = "mascot-rs", git = "https://github.com/LucaCappelletti94/mascot-rs", default-features = false, features = ["std"] }
+parquet = { version = "55", default-features = false, features = ["arrow", "snap", "zstd"], optional = true }
 mass_spectrometry = { git = "https://github.com/earth-metabolome-initiative/mass-spectrometry-traits", default-features = false, features = ["std"] }
 serde = { version = "1", default-features = false, features = ["derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
 thiserror = { version = "2", default-features = false }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"], optional = true }
 
 [dev-dependencies]
 indicatif = "0.18"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [profile.release]

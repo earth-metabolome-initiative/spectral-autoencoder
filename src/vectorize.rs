@@ -42,10 +42,69 @@ impl Default for SpectrumVectorizerConfig {
 }
 
 impl SpectrumVectorizerConfig {
+    /// Starts a fluent builder seeded with [`Self::default`].
+    #[must_use]
+    pub fn builder() -> SpectrumVectorizerConfigBuilder {
+        SpectrumVectorizerConfigBuilder::default()
+    }
+
     /// Returns the dense vector width.
     #[must_use]
     pub const fn vector_width(&self) -> usize {
         self.max_peaks * 2
+    }
+}
+
+/// Fluent builder for [`SpectrumVectorizerConfig`].
+#[derive(Debug, Clone, Default)]
+pub struct SpectrumVectorizerConfigBuilder {
+    config: SpectrumVectorizerConfig,
+}
+
+impl SpectrumVectorizerConfigBuilder {
+    /// Creates a builder seeded with [`SpectrumVectorizerConfig::default`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum number of peaks retained per spectrum.
+    #[inline]
+    #[must_use]
+    pub fn with_max_peaks(mut self, value: usize) -> Self {
+        self.config.max_peaks = value;
+        self
+    }
+
+    /// Sets the minimum m/z retained.
+    #[inline]
+    #[must_use]
+    pub fn with_min_mz(mut self, value: f64) -> Self {
+        self.config.min_mz = value;
+        self
+    }
+
+    /// Sets the maximum m/z represented as `1.0`.
+    #[inline]
+    #[must_use]
+    pub fn with_max_mz(mut self, value: f64) -> Self {
+        self.config.max_mz = value;
+        self
+    }
+
+    /// Sets the post-normalization intensity power.
+    #[inline]
+    #[must_use]
+    pub fn with_intensity_power(mut self, value: f64) -> Self {
+        self.config.intensity_power = value;
+        self
+    }
+
+    /// Returns the configured [`SpectrumVectorizerConfig`].
+    #[inline]
+    #[must_use]
+    pub fn build(self) -> SpectrumVectorizerConfig {
+        self.config
     }
 }
 
