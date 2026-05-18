@@ -32,6 +32,8 @@ pub struct AutoencoderLossBreakdown<B: Backend> {
     pub similarity_ranking: Tensor<B, 1>,
     /// Optional explicit model-parameter regularization contribution.
     pub regularization: Tensor<B, 1>,
+    /// Chamfer-style m/z magnet contribution (flat-vector only).
+    pub chamfer_mz: Tensor<B, 1>,
 }
 
 impl<B: Backend> AutoencoderLossBreakdown<B> {
@@ -45,6 +47,7 @@ impl<B: Backend> AutoencoderLossBreakdown<B> {
             masked_precursor: Tensor::zeros([1], device),
             similarity_ranking: Tensor::zeros([1], device),
             regularization: Tensor::zeros([1], device),
+            chamfer_mz: Tensor::zeros([1], device),
         }
     }
 
@@ -57,6 +60,7 @@ impl<B: Backend> AutoencoderLossBreakdown<B> {
             + self.masked_precursor.clone()
             + self.similarity_ranking.clone()
             + self.regularization.clone()
+            + self.chamfer_mz.clone()
     }
 }
 
@@ -148,6 +152,7 @@ impl<B: Backend> Adaptor<AutoencoderLossComponentsInput<B>> for AutoencoderTrain
             precursor: self.losses.precursor.clone(),
             masked_precursor: self.losses.masked_precursor.clone(),
             similarity_ranking: self.losses.similarity_ranking.clone(),
+            chamfer_mz: self.losses.chamfer_mz.clone(),
             similarity_ranking_pairs: self.diagnostics.similarity_ranking_pairs.clone(),
             similarity_ranking_accuracy: self.diagnostics.similarity_ranking_accuracy.clone(),
             precursor_mae_da: self.diagnostics.precursor_mae_da.clone(),
@@ -171,6 +176,7 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             masked_precursor,
             similarity_ranking,
             regularization,
+            chamfer_mz,
             similarity_ranking_pairs,
             similarity_ranking_accuracy,
             precursor_mae_da,
@@ -186,6 +192,7 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             .register(self.losses.masked_precursor)
             .register(self.losses.similarity_ranking)
             .register(self.losses.regularization)
+            .register(self.losses.chamfer_mz)
             .register(self.diagnostics.similarity_ranking_pairs)
             .register(self.diagnostics.similarity_ranking_accuracy)
             .register(self.diagnostics.precursor_mae_da)
@@ -209,6 +216,7 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
                 masked_precursor: Tensor::from_data(masked_precursor, device),
                 similarity_ranking: Tensor::from_data(similarity_ranking, device),
                 regularization: Tensor::from_data(regularization, device),
+                chamfer_mz: Tensor::from_data(chamfer_mz, device),
             },
             diagnostics: AutoencoderDiagnostics {
                 similarity_ranking_pairs: Tensor::from_data(similarity_ranking_pairs, device),
@@ -231,6 +239,7 @@ pub struct AutoencoderLossComponentsInput<B: Backend> {
     precursor: Tensor<B, 1>,
     masked_precursor: Tensor<B, 1>,
     similarity_ranking: Tensor<B, 1>,
+    chamfer_mz: Tensor<B, 1>,
     similarity_ranking_pairs: Tensor<B, 1>,
     similarity_ranking_accuracy: Tensor<B, 1>,
     precursor_mae_da: Tensor<B, 1>,
@@ -304,6 +313,11 @@ impl<B: Backend> AutoencoderLossComponentMetric<B> {
         Self::new(AutoencoderLossComponent::SelfModifiedLinearCosine)
     }
 
+    /// Chamfer-style m/z magnet loss contribution (flat-vector only).
+    pub fn chamfer_mz() -> Self {
+        Self::new(AutoencoderLossComponent::ChamferMz)
+    }
+
     fn new(component: AutoencoderLossComponent) -> Self {
         Self {
             component,
@@ -353,6 +367,7 @@ impl<B: Backend> Metric for AutoencoderLossComponentMetric<B> {
             AutoencoderLossComponent::SelfModifiedLinearCosine => {
                 item.self_modified_linear_cosine.clone()
             }
+            AutoencoderLossComponent::ChamferMz => item.chamfer_mz.clone(),
         };
         let value = tensor
             .mean()
@@ -397,6 +412,7 @@ enum AutoencoderLossComponent {
     SimilarityRankingAccuracy,
     SelfLinearCosine,
     SelfModifiedLinearCosine,
+    ChamferMz,
 }
 
 impl AutoencoderLossComponent {
@@ -413,6 +429,7 @@ impl AutoencoderLossComponent {
             Self::SimilarityRankingAccuracy => "Similarity Ranking Accuracy",
             Self::SelfLinearCosine => "Self Linear Cosine",
             Self::SelfModifiedLinearCosine => "Self Modified Linear Cosine",
+            Self::ChamferMz => "Chamfer m/z",
         }
     }
 
@@ -429,6 +446,7 @@ impl AutoencoderLossComponent {
             Self::SimilarityRankingAccuracy => "teacher similarity-ranking ordering accuracy",
             Self::SelfLinearCosine => "target-vs-reconstruction linear cosine",
             Self::SelfModifiedLinearCosine => "target-vs-reconstruction modified linear cosine",
+            Self::ChamferMz => "Chamfer-style m/z magnet pulling pred toward nearest real target",
         }
     }
 
@@ -499,6 +517,8 @@ where
             .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::loss())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::reconstruction())
             .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::reconstruction())
+            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::chamfer_mz())
+            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::chamfer_mz())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::masked())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::intruder())
             .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::precursor())
@@ -555,6 +575,7 @@ mod tests {
             masked_precursor: scalar(6.0, device),
             similarity_ranking: scalar(7.0, device),
             regularization: scalar(8.0, device),
+            chamfer_mz: scalar(3.0, device),
         }
     }
 
@@ -624,7 +645,7 @@ mod tests {
         let device = device();
         let total = losses(&device).total();
 
-        assert_tensor_close(total, 33.0);
+        assert_tensor_close(total, 36.0);
     }
 
     #[test]
@@ -648,7 +669,7 @@ mod tests {
         let output =
             AutoencoderTrainingOutput::new(matrix(&device), matrix(&device), losses(&device));
 
-        assert_tensor_close(output.loss, 33.0);
+        assert_tensor_close(output.loss, 36.0);
         assert_eq!(output.output.dims(), [2, 2]);
         assert_eq!(output.targets.dims(), [2, 2]);
         assert_tensor_close(output.diagnostics.similarity_ranking_pairs, 0.0);
@@ -664,13 +685,14 @@ mod tests {
         let device = device();
         let adapted: AutoencoderLossComponentsInput<TestBackend> = output(&device).adapt();
 
-        assert_tensor_close(adapted.loss, 33.0);
+        assert_tensor_close(adapted.loss, 36.0);
         assert_tensor_close(adapted.reconstruction, 1.0);
         assert_tensor_close(adapted.masked, 2.0);
         assert_tensor_close(adapted.intruder, 4.0);
         assert_tensor_close(adapted.precursor, 5.0);
         assert_tensor_close(adapted.masked_precursor, 6.0);
         assert_tensor_close(adapted.similarity_ranking, 7.0);
+        assert_tensor_close(adapted.chamfer_mz, 3.0);
         assert_tensor_close(adapted.similarity_ranking_pairs, 9.0);
         assert_tensor_close(adapted.similarity_ranking_accuracy, 0.75);
         assert_tensor_close(adapted.precursor_mae_da, 12.5);
@@ -684,7 +706,7 @@ mod tests {
         let device = device();
         let synced = output(&device).sync();
 
-        assert_tensor_close(synced.loss, 33.0);
+        assert_tensor_close(synced.loss, 36.0);
         assert_eq!(synced.output.dims(), [1, 1]);
         assert_eq!(synced.targets.dims(), [1, 1]);
         assert_single_matrix_zero(synced.output);
@@ -696,6 +718,7 @@ mod tests {
         assert_tensor_close(synced.losses.masked_precursor, 6.0);
         assert_tensor_close(synced.losses.similarity_ranking, 7.0);
         assert_tensor_close(synced.losses.regularization, 8.0);
+        assert_tensor_close(synced.losses.chamfer_mz, 3.0);
         assert_tensor_close(synced.diagnostics.similarity_ranking_pairs, 9.0);
         assert_tensor_close(synced.diagnostics.similarity_ranking_accuracy, 0.75);
         assert_tensor_close(synced.diagnostics.precursor_mae_da, 12.5);
@@ -762,6 +785,11 @@ mod tests {
                 "Self Modified Linear Cosine",
                 true,
             ),
+            (
+                AutoencoderLossComponentMetric::<TestBackend>::chamfer_mz(),
+                "Chamfer m/z",
+                false,
+            ),
         ];
 
         for (metric, expected_name, higher_is_better) in cases {
@@ -787,7 +815,7 @@ mod tests {
         let item: AutoencoderLossComponentsInput<TestBackend> = output(&device).adapt();
         let metadata = metadata();
         let cases = [
-            (AutoencoderLossComponentMetric::<TestBackend>::loss(), 33.0),
+            (AutoencoderLossComponentMetric::<TestBackend>::loss(), 36.0),
             (
                 AutoencoderLossComponentMetric::<TestBackend>::masked_precursor(),
                 6.0,

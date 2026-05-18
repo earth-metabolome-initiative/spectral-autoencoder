@@ -7,13 +7,14 @@ pub mod reconstruction;
 pub mod regularization;
 
 pub use auxiliary::{
-    AuxiliaryLossConfig, AuxiliaryLossConfigBuilder, EmbeddingAuxiliaryHeads,
-    EmbeddingAuxiliaryHeadsConfig, EmbeddingAuxiliaryHeadsConfigBuilder, SimilarityRankingBatch,
+    AuxiliaryLossConfig, AuxiliaryLossConfigBuilder, DEFAULT_CHAMFER_MZ_WEIGHT,
+    EmbeddingAuxiliaryHeads, EmbeddingAuxiliaryHeadsConfig, EmbeddingAuxiliaryHeadsConfigBuilder,
+    SimilarityRankingBatch,
 };
 pub use flat_vector::{
-    AutoencoderOutput, Decoder, DecoderConfig, DecoderConfigBuilder, Encoder, EncoderConfig,
-    EncoderConfigBuilder, SpectralAutoencoder, SpectralAutoencoderConfig,
-    SpectralAutoencoderConfigBuilder,
+    AutoencoderOutput, DEFAULT_MZ_TOLERANCE_DECAY_EPOCHS, Decoder, DecoderConfig,
+    DecoderConfigBuilder, Encoder, EncoderConfig, EncoderConfigBuilder, SpectralAutoencoder,
+    SpectralAutoencoderConfig, SpectralAutoencoderConfigBuilder,
 };
 pub use peak_set::{
     PeakSetAutoencoder, PeakSetAutoencoderConfig, PeakSetAutoencoderConfigBuilder,

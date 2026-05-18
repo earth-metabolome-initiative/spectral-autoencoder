@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 
 const RECONSTRUCTION_SIMILARITY_MAX_ITEMS: usize = 256;
 
+/// Additive penalty applied to padded targets inside the Chamfer m/z magnet
+/// so they never win the per-pred-slot `min`. Well above the maximum possible
+/// `(\Delta m/z)^2 \le 1` for normalised m/z values.
+const CHAMFER_INACTIVE_PENALTY: f64 = 1.0e6;
+
 /// Flat-vector reconstruction alignment strategy.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlatVectorReconstructionOrdering {
@@ -512,9 +517,50 @@ pub fn slot_reconstruction_loss_from_vectors_with_mask<B: Backend>(
         .clamp_max(1.0);
     let cosine_loss = similarity * -1.0 + 1.0;
 
-    let count_delta = (pred_presence.sum_dim(1) - target_mask.sum_dim(1)) / max_peaks as f64;
-    let count_loss = count_delta.powf_scalar(2.0) * config.count_weight;
-    (cosine_loss + count_loss).mean()
+    cosine_loss.mean()
+}
+
+/// Permutation-invariant "magnet" term on m/z: for each predicted slot,
+/// the minimum squared distance to any real-peak target m/z. Pulls dead
+/// peaks (predictions outside the cosine's Gaussian gate) back toward the
+/// nearest real target, providing gradient where the gate has saturated.
+///
+/// Shape conventions match
+/// [`slot_reconstruction_loss_from_vectors_with_mask`]: `reconstruction`
+/// and `target` are `[batch, 2*P]`, `target_mask` is `[batch, P]`. Padded
+/// target slots are excluded from the min via the
+/// [`CHAMFER_INACTIVE_PENALTY`] constant. Assumes every row has at least
+/// one real peak (`Σ_p M_p > 0`).
+pub fn slot_chamfer_magnet_mz<B: Backend>(
+    reconstruction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    target_mask: Tensor<B, 2>,
+) -> Tensor<B, 1> {
+    let [batch_size, vector_width] = reconstruction.dims();
+    let max_peaks = vector_width / 2;
+    debug_assert_eq!(vector_width % 2, 0);
+
+    let pred_mz = reconstruction
+        .reshape([batch_size, max_peaks, 2])
+        .narrow(2, 0, 1)
+        .reshape([batch_size, max_peaks]);
+    let target_mz = target
+        .reshape([batch_size, max_peaks, 2])
+        .narrow(2, 0, 1)
+        .reshape([batch_size, max_peaks]);
+
+    // [batch, P_pred, P_target]
+    let diff = pred_mz.unsqueeze_dim::<3>(2) - target_mz.unsqueeze_dim::<3>(1);
+    let diff_sq = diff.powf_scalar(2.0);
+
+    // Padded targets get an additive penalty large enough to lose every min.
+    let target_mask_3d = target_mask.unsqueeze_dim::<3>(1);
+    let inactive_penalty =
+        (target_mask_3d.clone().ones_like() - target_mask_3d) * CHAMFER_INACTIVE_PENALTY;
+    let masked = diff_sq + inactive_penalty;
+
+    let min_dist_sq = masked.min_dim(2).reshape([batch_size, max_peaks]);
+    min_dist_sq.mean()
 }
 
 /// Flat-vector reconstruction loss with configurable slot alignment.
@@ -1013,5 +1059,103 @@ mod tests {
         let peak_mask = vector_element_mask_to_peak_mask(mask).into_data();
 
         assert_eq!(peak_mask.as_slice::<f32>().expect("f32 data"), &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn chamfer_magnet_is_zero_on_perfect_prediction() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // Two real peaks at m/z 0.1 and 0.7, intensities arbitrary.
+        let target = Tensor::<B, 2>::from_floats([[0.1, 1.0, 0.7, 0.5]], &device);
+        let pred = target.clone();
+        let target_mask = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
+
+        let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask).into_scalar();
+        assert!(value.abs() < 1.0e-6, "magnet={value}, expected ~0");
+    }
+
+    #[test]
+    fn chamfer_magnet_is_permutation_invariant_over_targets() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // Same predictions, same target *set* but slots permuted.
+        let pred = Tensor::<B, 2>::from_floats([[0.20, 1.0, 0.65, 0.5]], &device);
+        let target_ab = Tensor::<B, 2>::from_floats([[0.10, 1.0, 0.70, 0.5]], &device);
+        let target_ba = Tensor::<B, 2>::from_floats([[0.70, 0.5, 0.10, 1.0]], &device);
+        let mask = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
+
+        let v_ab: f32 = slot_chamfer_magnet_mz(pred.clone(), target_ab, mask.clone()).into_scalar();
+        let v_ba: f32 = slot_chamfer_magnet_mz(pred, target_ba, mask).into_scalar();
+        assert!((v_ab - v_ba).abs() < 1.0e-6, "{v_ab} vs {v_ba}");
+    }
+
+    #[test]
+    fn chamfer_magnet_picks_nearest_real_target() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // One pred at m/z 0.2. Real targets at 0.1 and 0.7; padded slot at 0.21
+        // (would be closer if it counted but mask excludes it).
+        let pred = Tensor::<B, 2>::from_floats([[0.20, 1.0, 0.20, 0.0, 0.20, 0.0]], &device);
+        let target = Tensor::<B, 2>::from_floats([[0.10, 1.0, 0.70, 0.5, 0.21, 0.0]], &device);
+        let target_mask = Tensor::<B, 2>::from_floats([[1.0, 1.0, 0.0]], &device);
+
+        let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask).into_scalar();
+        // Each of three pred slots maps to nearest real target = 0.1, distance 0.01.
+        let expected = ((0.20_f32 - 0.10_f32).powi(2) * 3.0) / 3.0;
+        assert!((value - expected).abs() < 1.0e-5, "value={value}, expected={expected}");
+    }
+
+    #[test]
+    fn chamfer_magnet_ignores_padded_targets_via_big_penalty() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // Pred at 0.5. Only real target at 0.0; padded "near-target" at 0.5001.
+        let pred = Tensor::<B, 2>::from_floats([[0.5, 1.0, 0.5, 0.0]], &device);
+        let target = Tensor::<B, 2>::from_floats([[0.0, 1.0, 0.5001, 0.0]], &device);
+        let target_mask = Tensor::<B, 2>::from_floats([[1.0, 0.0]], &device);
+
+        let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask).into_scalar();
+        // Both pred slots map to the real target at 0.0; distance (0.5)^2 = 0.25 each.
+        let expected = 0.25_f32;
+        assert!((value - expected).abs() < 1.0e-5, "value={value}, expected={expected}");
+    }
+
+    #[test]
+    fn count_weight_no_longer_affects_slot_reconstruction_loss() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let reconstruction = Tensor::<B, 2>::from_floats([[0.1, 1.0, 0.0, 0.0]], &device);
+        let target = Tensor::<B, 2>::from_floats([[0.1, 1.0, 0.0, 0.0]], &device);
+        let target_mask = Tensor::<B, 2>::from_floats([[1.0, 0.0]], &device);
+
+        let no_count = SetReconstructionLossConfig {
+            count_weight: 0.0,
+            ..SetReconstructionLossConfig::default()
+        };
+        let high_count = SetReconstructionLossConfig {
+            count_weight: 100.0,
+            ..SetReconstructionLossConfig::default()
+        };
+
+        let loss_zero = slot_reconstruction_loss_from_vectors_with_mask(
+            reconstruction.clone(),
+            target.clone(),
+            target_mask.clone(),
+            no_count,
+        )
+        .into_scalar();
+        let loss_high = slot_reconstruction_loss_from_vectors_with_mask(
+            reconstruction,
+            target,
+            target_mask,
+            high_count,
+        )
+        .into_scalar();
+
+        // count_weight is no longer consulted by the slot loss.
+        assert!(
+            (loss_zero - loss_high).abs() < 1.0e-6,
+            "loss_zero={loss_zero}, loss_high={loss_high}"
+        );
     }
 }

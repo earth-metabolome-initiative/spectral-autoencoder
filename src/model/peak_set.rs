@@ -1070,6 +1070,7 @@ impl<B: Backend> PeakSetAutoencoder<B> {
             masked_precursor: masked_precursor.loss,
             similarity_ranking: similarity_ranking.loss,
             regularization,
+            chamfer_mz: Tensor::zeros([1], &device),
         };
 
         PeakSetReconstructionOutput {

@@ -47,6 +47,10 @@ pub struct AuxiliaryLossConfig {
     pub similarity_ranking_pairs_per_batch: usize,
     /// Hidden width of the per-slot intruder detection head.
     pub intruder_hidden_width: usize,
+    /// Weight for the Chamfer-style m/z magnet term that pulls each predicted
+    /// slot toward the nearest real-peak target m/z (`0.0` disables it).
+    #[serde(default = "default_chamfer_mz_weight")]
+    pub chamfer_mz_weight: f64,
 }
 
 impl Default for AuxiliaryLossConfig {
@@ -65,8 +69,17 @@ impl Default for AuxiliaryLossConfig {
             latent_noise_std: 0.02,
             similarity_ranking_pairs_per_batch: 0,
             intruder_hidden_width: 128,
+            chamfer_mz_weight: DEFAULT_CHAMFER_MZ_WEIGHT,
         }
     }
+}
+
+/// Default weight for the Chamfer m/z magnet term. Opt-in (`0.0`) so existing
+/// training runs stay bit-identical until the user enables it.
+pub const DEFAULT_CHAMFER_MZ_WEIGHT: f64 = 0.0;
+
+fn default_chamfer_mz_weight() -> f64 {
+    DEFAULT_CHAMFER_MZ_WEIGHT
 }
 
 fn default_similarity_ranking_latent_temperature() -> f64 {
@@ -191,6 +204,14 @@ impl AuxiliaryLossConfigBuilder {
     #[must_use]
     pub fn with_intruder_hidden_width(mut self, value: usize) -> Self {
         self.config.intruder_hidden_width = value;
+        self
+    }
+
+    /// Sets the weight for the Chamfer m/z magnet term.
+    #[inline]
+    #[must_use]
+    pub fn with_chamfer_mz_weight(mut self, value: f64) -> Self {
+        self.config.chamfer_mz_weight = value;
         self
     }
 

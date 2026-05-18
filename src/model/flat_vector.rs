@@ -1,5 +1,10 @@
 //! Flat vector autoencoder baseline.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use burn::{
     nn::{Linear, LinearConfig, Relu},
     prelude::*,
@@ -24,6 +29,13 @@ fn default_precursor_mz_scale() -> f64 {
     ConditioningConfig::default().precursor_mz_scale()
 }
 
+/// Default number of training epochs over which the m/z Gaussian gate
+/// bandwidth `σ` decays from `mz_tolerance_start` to `mz_tolerance_end`.
+/// Chosen as a bounded window so long training runs spend most of their
+/// epochs at the tight σ_end for precision; capped to the total epoch count
+/// at the call site so short runs still complete the decay.
+pub const DEFAULT_MZ_TOLERANCE_DECAY_EPOCHS: usize = 50;
+
 #[cfg(feature = "train")]
 use crate::{
     model::auxiliary::{
@@ -33,8 +45,8 @@ use crate::{
     },
     model::reconstruction::{
         flat_vector_reconstruction_losses_from_vectors_with_masks,
-        reconstruction_similarity_from_vectors, vector_element_mask_to_peak_mask,
-        vector_target_mask,
+        reconstruction_similarity_from_vectors, slot_chamfer_magnet_mz,
+        vector_element_mask_to_peak_mask, vector_target_mask,
     },
     training::{AutoencoderDiagnostics, AutoencoderLossBreakdown},
 };
@@ -337,6 +349,19 @@ pub struct SpectralAutoencoderConfig {
     /// Auxiliary denoising, intruder, precursor, and similarity-ranking objectives.
     #[serde(default)]
     pub auxiliary: AuxiliaryLossConfig,
+    /// Initial value of the m/z Gaussian gate bandwidth `σ`. Defaults to
+    /// `loss.normalized_mz_tolerance` when the annealing schedule is unused.
+    #[serde(default)]
+    pub mz_sigma_start: f64,
+    /// Final value of `σ` reached after `mz_sigma_decay_steps` training steps.
+    /// Defaults to `loss.normalized_mz_tolerance` so the schedule is a no-op
+    /// unless the user opts in.
+    #[serde(default)]
+    pub mz_sigma_end: f64,
+    /// Number of training steps over which `σ` linearly decays from start to
+    /// end. `0` disables annealing (σ stays at `mz_sigma_start`).
+    #[serde(default)]
+    pub mz_sigma_decay_steps: usize,
 }
 
 impl SpectralAutoencoderConfig {
@@ -421,6 +446,9 @@ impl SpectralAutoencoderConfig {
             precursor_mz_scale: ConditioningConfig::default().precursor_mz_scale(),
             regularization: RegularizationConfig::default(),
             auxiliary: AuxiliaryLossConfig::default(),
+            mz_sigma_start: 0.0,
+            mz_sigma_end: 0.0,
+            mz_sigma_decay_steps: 0,
         }
     }
 
@@ -448,8 +476,40 @@ impl SpectralAutoencoderConfig {
         self
     }
 
+    /// Sets the σ annealing schedule for the m/z Gaussian gate. `decay_steps == 0`
+    /// disables annealing and σ stays at `start` for the whole run. When the
+    /// schedule fields stay at zero (the default), the model falls back to a
+    /// constant σ equal to `loss.normalized_mz_tolerance` so existing configs
+    /// behave bit-identically to before.
+    #[must_use]
+    pub const fn with_mz_sigma_schedule(
+        mut self,
+        start: f64,
+        end: f64,
+        decay_steps: usize,
+    ) -> Self {
+        self.mz_sigma_start = start;
+        self.mz_sigma_end = end;
+        self.mz_sigma_decay_steps = decay_steps;
+        self
+    }
+
     /// Creates an initialized autoencoder.
     pub fn init<B: Backend>(&self, device: &B::Device) -> SpectralAutoencoder<B> {
+        // Schedule fields default to the static `normalized_mz_tolerance` when
+        // the user hasn't opted in (both start and end zero), so the dynamic
+        // path degenerates to the previous constant-σ behaviour bit-for-bit.
+        let baseline_sigma = self.loss.normalized_mz_tolerance;
+        let mz_sigma_start = if self.mz_sigma_start > 0.0 {
+            self.mz_sigma_start
+        } else {
+            baseline_sigma
+        };
+        let mz_sigma_end = if self.mz_sigma_end > 0.0 {
+            self.mz_sigma_end
+        } else {
+            baseline_sigma
+        };
         SpectralAutoencoder {
             encoder: self.encoder.init(device),
             decoder: self.decoder.init(device),
@@ -459,7 +519,7 @@ impl SpectralAutoencoderConfig {
                 intruder_hidden_width: self.auxiliary.intruder_hidden_width,
             }
             .init(device),
-            normalized_mz_tolerance: self.loss.normalized_mz_tolerance,
+            normalized_mz_tolerance: baseline_sigma,
             loss_mz_power: self.loss.mz_power,
             loss_intensity_power: self.loss.intensity_power,
             count_weight: self.loss.count_weight,
@@ -482,6 +542,11 @@ impl SpectralAutoencoderConfig {
             similarity_ranking_min_gap: self.auxiliary.similarity_ranking_min_gap,
             latent_noise_std: self.auxiliary.latent_noise_std,
             similarity_ranking_pairs_per_batch: self.auxiliary.similarity_ranking_pairs_per_batch,
+            chamfer_mz_weight: self.auxiliary.chamfer_mz_weight,
+            mz_sigma_start,
+            mz_sigma_end,
+            mz_sigma_decay_steps: self.mz_sigma_decay_steps,
+            mz_sigma_step: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -595,12 +660,41 @@ pub struct SpectralAutoencoder<B: Backend> {
     similarity_ranking_min_gap: f64,
     latent_noise_std: f64,
     similarity_ranking_pairs_per_batch: usize,
+    chamfer_mz_weight: f64,
+    mz_sigma_start: f64,
+    mz_sigma_end: f64,
+    mz_sigma_decay_steps: usize,
+    #[module(skip)]
+    mz_sigma_step: Arc<AtomicUsize>,
 }
 
 impl<B: Backend> SpectralAutoencoder<B> {
+    /// Current value of the m/z Gaussian gate bandwidth `σ`, taking the
+    /// optional linear annealing schedule into account.
+    pub fn current_sigma(&self) -> f64 {
+        if self.mz_sigma_decay_steps == 0 {
+            return self.mz_sigma_start;
+        }
+        let step = self.mz_sigma_step.load(Ordering::Relaxed);
+        let frac = (step as f64 / self.mz_sigma_decay_steps as f64).min(1.0);
+        self.mz_sigma_start * (1.0 - frac) + self.mz_sigma_end * frac
+    }
+
+    /// Bumps the σ schedule's step counter by one. Called from the training
+    /// forward path only (validation forwards leave the counter alone).
+    fn advance_sigma_step(&self) {
+        self.mz_sigma_step.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Resets the schedule's step counter; called when resuming training from
+    /// a checkpoint so the schedule lines up with the resumed epoch.
+    pub fn set_mz_sigma_step(&self, step: usize) {
+        self.mz_sigma_step.store(step, Ordering::Relaxed);
+    }
+
     fn loss_config(&self) -> SetReconstructionLossConfig {
         SetReconstructionLossConfig {
-            normalized_mz_tolerance: self.normalized_mz_tolerance,
+            normalized_mz_tolerance: self.current_sigma(),
             mz_power: self.loss_mz_power,
             intensity_power: self.loss_intensity_power,
             count_weight: self.count_weight,
@@ -678,6 +772,9 @@ impl<B: Backend> SpectralAutoencoder<B> {
         AutoencoderLossBreakdown<B>,
         AutoencoderDiagnostics<B>,
     ) {
+        if use_latent_noise {
+            self.advance_sigma_step();
+        }
         let target = batch.target_spectra.clone();
         let input_peak_mask = vector_target_mask(batch.spectra.clone());
         let latent = self.encoder.forward(batch.spectra, batch.conditions);
@@ -706,7 +803,7 @@ impl<B: Backend> SpectralAutoencoder<B> {
                 flat_vector_reconstruction_losses_from_vectors_with_masks(
                     output.reconstruction.clone(),
                     target.clone(),
-                    target_peak_mask,
+                    target_peak_mask.clone(),
                     masked_target_mask,
                     reconstruction_config,
                     reconstruction_ordering,
@@ -724,6 +821,15 @@ impl<B: Backend> SpectralAutoencoder<B> {
             (reconstruction, Tensor::zeros([1], &device))
         };
         let (reconstruction, masked) = masked;
+        let chamfer_mz = if self.chamfer_mz_weight > 0.0 {
+            slot_chamfer_magnet_mz(
+                output.reconstruction.clone(),
+                target.clone(),
+                target_peak_mask,
+            ) * self.chamfer_mz_weight
+        } else {
+            Tensor::zeros([1], &device)
+        };
         let intruder = weighted_intruder_detection_loss(
             &self.auxiliary_heads,
             output.latent.clone(),
@@ -778,6 +884,7 @@ impl<B: Backend> SpectralAutoencoder<B> {
             masked_precursor: masked_precursor.loss,
             similarity_ranking: similarity_ranking.loss,
             regularization,
+            chamfer_mz,
         };
 
         (output.reconstruction, target, losses, diagnostics)
@@ -935,6 +1042,9 @@ impl SpectralAutoencoderConfigBuilder {
                 .unwrap_or_else(default_precursor_mz_scale),
             regularization: self.regularization.unwrap_or_default(),
             auxiliary: self.auxiliary.unwrap_or_default(),
+            mz_sigma_start: 0.0,
+            mz_sigma_end: 0.0,
+            mz_sigma_decay_steps: 0,
         })
     }
 }
@@ -1017,6 +1127,55 @@ mod tests {
             config.reconstruction_ordering,
             FlatVectorReconstructionOrdering::IntensityDescending
         );
+    }
+
+    #[test]
+    fn current_sigma_returns_start_when_decay_disabled() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let config = SpectralAutoencoderConfig::symmetric(4, 2, 2, vec![3])
+            .with_mz_sigma_schedule(0.05, 0.01, 0);
+        let model = config.init::<B>(&device);
+        assert!((model.current_sigma() - 0.05).abs() < 1.0e-12);
+        // Advancing the counter is a no-op when decay_steps == 0.
+        for _ in 0..1000 {
+            model.set_mz_sigma_step(1_000_000);
+        }
+        assert!((model.current_sigma() - 0.05).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn current_sigma_linearly_interpolates_between_start_and_end() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let config = SpectralAutoencoderConfig::symmetric(4, 2, 2, vec![3])
+            .with_mz_sigma_schedule(0.05, 0.01, 100);
+        let model = config.init::<B>(&device);
+
+        model.set_mz_sigma_step(0);
+        assert!((model.current_sigma() - 0.05).abs() < 1.0e-9);
+
+        model.set_mz_sigma_step(50);
+        assert!((model.current_sigma() - 0.03).abs() < 1.0e-9);
+
+        model.set_mz_sigma_step(100);
+        assert!((model.current_sigma() - 0.01).abs() < 1.0e-9);
+
+        // Saturates at σ_end past decay_steps.
+        model.set_mz_sigma_step(10_000);
+        assert!((model.current_sigma() - 0.01).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn config_with_zero_schedule_inherits_loss_normalized_mz_tolerance() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // Default schedule fields are all zero; init should fall back to the
+        // loss config's `normalized_mz_tolerance` (default 0.01).
+        let config = SpectralAutoencoderConfig::symmetric(4, 2, 2, vec![3]);
+        let model = config.init::<B>(&device);
+        let expected = SetReconstructionLossConfig::default().normalized_mz_tolerance;
+        assert!((model.current_sigma() - expected).abs() < 1.0e-12);
     }
 
     #[test]

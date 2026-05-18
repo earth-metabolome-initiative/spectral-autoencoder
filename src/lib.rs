@@ -53,8 +53,9 @@ pub use metrics::{
     DenseReconstructionMetrics, SpectralMetricConfig, SpectralMetricConfigBuilder, SpectralMetrics,
 };
 pub use model::{
-    AutoencoderOutput, AuxiliaryLossConfig, AuxiliaryLossConfigBuilder, Decoder, DecoderConfig,
-    DecoderConfigBuilder, EmbeddingAuxiliaryHeads, EmbeddingAuxiliaryHeadsConfig,
+    AutoencoderOutput, AuxiliaryLossConfig, AuxiliaryLossConfigBuilder, DEFAULT_CHAMFER_MZ_WEIGHT,
+    DEFAULT_MZ_TOLERANCE_DECAY_EPOCHS, Decoder, DecoderConfig, DecoderConfigBuilder,
+    EmbeddingAuxiliaryHeads, EmbeddingAuxiliaryHeadsConfig,
     EmbeddingAuxiliaryHeadsConfigBuilder, Encoder, EncoderConfig, EncoderConfigBuilder,
     FlatVectorReconstructionOrdering, PeakSetAutoencoder, PeakSetAutoencoderConfig,
     PeakSetAutoencoderConfigBuilder, PeakSetAutoencoderOutput, PeakSetDecoder,

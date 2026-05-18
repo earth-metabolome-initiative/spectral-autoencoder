@@ -1555,7 +1555,20 @@ pub fn run(cli: &crate::cli::FlatArgs) -> Result<(), Box<dyn std::error::Error>>
     );
 
     let config = config.with_auxiliary(auxiliary);
+    let sigma_default = config.loss.normalized_mz_tolerance;
+    let sigma_start = shared.mz_tolerance_start.unwrap_or(sigma_default);
+    let sigma_end = shared.mz_tolerance_end.unwrap_or(sigma_default);
+    // Cap the decay window at the total epoch count so short runs still see
+    // σ reach `mz_tolerance_end` by the last epoch. The clap default keeps
+    // it at `DEFAULT_MZ_TOLERANCE_DECAY_EPOCHS` for typical long runs.
+    let sigma_decay_epochs = shared.mz_tolerance_decay_epochs.min(args.epochs);
+    let sigma_decay_steps = sigma_decay_epochs.saturating_mul(args.train_batches);
+    let config = config.with_mz_sigma_schedule(sigma_start, sigma_end, sigma_decay_steps);
     let model = config.init::<TrainingBackend>(&device);
+    if let Some(resume_epoch) = args.resume_epoch {
+        let resume_step = resume_epoch.saturating_mul(args.train_batches);
+        model.set_mz_sigma_step(resume_step);
+    }
     let model = warm_start_model::<TrainingBackend, _>(
         &progress,
         model,

@@ -14,8 +14,8 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use spectral_autoencoder::{
-    AuxiliaryLossConfig, FlatVectorReconstructionOrdering, SpectralMetricConfig,
-    SpectrumAugmentationConfig,
+    AuxiliaryLossConfig, DEFAULT_MZ_TOLERANCE_DECAY_EPOCHS, FlatVectorReconstructionOrdering,
+    SpectralMetricConfig, SpectrumAugmentationConfig,
 };
 
 use crate::common::{
@@ -165,6 +165,27 @@ pub struct SharedArgs {
     /// Weight for the similarity-ranking loss.
     #[arg(long)]
     pub aux_similarity_ranking_weight: Option<f64>,
+
+    /// Weight for the Chamfer m/z magnet term that rescues dead peaks (`0.0` disables).
+    #[arg(long)]
+    pub aux_chamfer_mz_weight: Option<f64>,
+
+    /// Initial σ of the m/z Gaussian gate (normalized units). Wider σ early
+    /// gives every pred slot non-zero m/z gradient.
+    #[arg(long)]
+    pub mz_tolerance_start: Option<f64>,
+
+    /// Final σ of the m/z Gaussian gate after the decay schedule completes.
+    /// Defaults to the same value as the start (no annealing) when unset.
+    #[arg(long)]
+    pub mz_tolerance_end: Option<f64>,
+
+    /// Number of epochs over which σ linearly decays from `mz_tolerance_start`
+    /// to `mz_tolerance_end`. Capped at the total epoch count at the call site
+    /// so short runs still see σ reach `mz_tolerance_end`. With `0`, σ stays at
+    /// `mz_tolerance_start` for the entire run regardless of `mz_tolerance_end`.
+    #[arg(long, default_value_t = DEFAULT_MZ_TOLERANCE_DECAY_EPOCHS)]
+    pub mz_tolerance_decay_epochs: usize,
 
     /// Decoder-input latent noise std fraction.
     #[arg(long)]
@@ -456,6 +477,9 @@ pub fn auxiliary_loss_config(
         intruder_hidden_width: shared
             .intruder_hidden_width
             .unwrap_or(default.intruder_hidden_width),
+        chamfer_mz_weight: shared
+            .aux_chamfer_mz_weight
+            .unwrap_or(default.chamfer_mz_weight),
     }
 }
 
