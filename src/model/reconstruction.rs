@@ -462,10 +462,44 @@ pub fn slot_reconstruction_loss_from_vectors<B: Backend>(
 }
 
 /// Ordered slot-wise reconstruction loss for flat vectors with an explicit target peak mask.
+///
+/// The pred-side L2 norm includes all `P` slots, so phantom intensity on
+/// padded slots inflates the denominator and implicitly penalises spurious
+/// predictions. This is the right semantics for the clean reconstruction
+/// path; for the *masked* path use
+/// [`slot_reconstruction_loss_restricted_from_vectors_with_mask`] instead,
+/// which restricts both sides of the cosine to the same mask so the signal
+/// is meaningful when the target mask is very sparse.
 pub fn slot_reconstruction_loss_from_vectors_with_mask<B: Backend>(
     reconstruction: Tensor<B, 2>,
     target: Tensor<B, 2>,
     target_mask: Tensor<B, 2>,
+    config: SetReconstructionLossConfig,
+) -> Tensor<B, 1> {
+    slot_reconstruction_loss_impl(reconstruction, target, target_mask, false, config)
+}
+
+/// Ordered slot-wise reconstruction loss restricted to the slots indicated
+/// by `target_mask` on both sides of the cosine. The pred-side L2 norm is
+/// gated by `target_mask` so it sums over the same support as the
+/// target-side norm. Use this for the masked-peak path where `target_mask`
+/// is the masked-and-real subset; the full reconstruction path should keep
+/// the unrestricted variant so phantom-peak penalty still applies on
+/// padded slots.
+pub fn slot_reconstruction_loss_restricted_from_vectors_with_mask<B: Backend>(
+    reconstruction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    target_mask: Tensor<B, 2>,
+    config: SetReconstructionLossConfig,
+) -> Tensor<B, 1> {
+    slot_reconstruction_loss_impl(reconstruction, target, target_mask, true, config)
+}
+
+fn slot_reconstruction_loss_impl<B: Backend>(
+    reconstruction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    target_mask: Tensor<B, 2>,
+    restrict_pred_to_mask: bool,
     config: SetReconstructionLossConfig,
 ) -> Tensor<B, 1> {
     let [batch_size, vector_width] = reconstruction.dims();
@@ -510,7 +544,12 @@ pub fn slot_reconstruction_loss_from_vectors_with_mask<B: Backend>(
     let match_weights = (scaled.clone() * scaled * -0.5).exp() * target_mask.clone();
     let score_sum = (pred_products.clone() * target_products.clone() * match_weights).sum_dim(1);
 
-    let pred_norm = (pred_products.clone().powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
+    let pred_for_norm = if restrict_pred_to_mask {
+        pred_products.clone() * target_mask.clone()
+    } else {
+        pred_products.clone()
+    };
+    let pred_norm = (pred_for_norm.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
     let target_norm = (target_products.powf_scalar(2.0).sum_dim(1) + 1.0e-6).sqrt();
     let similarity = (score_sum / (pred_norm * target_norm))
         .clamp_min(0.0)
@@ -608,7 +647,48 @@ pub fn flat_vector_reconstruction_loss_from_vectors_with_mask<B: Backend>(
     }
 }
 
+/// Restricted-cosine variant of [`flat_vector_reconstruction_loss_from_vectors_with_mask`].
+/// Uses the same slot-ordering dispatch and per-row reshape, but delegates to
+/// [`slot_reconstruction_loss_restricted_from_vectors_with_mask`] at the end.
+pub fn flat_vector_reconstruction_loss_restricted_from_vectors_with_mask<B: Backend>(
+    reconstruction: Tensor<B, 2>,
+    target: Tensor<B, 2>,
+    target_mask: Tensor<B, 2>,
+    config: SetReconstructionLossConfig,
+    ordering: FlatVectorReconstructionOrdering,
+) -> Tensor<B, 1> {
+    match ordering {
+        FlatVectorReconstructionOrdering::Slot => {
+            slot_reconstruction_loss_restricted_from_vectors_with_mask(
+                reconstruction,
+                target,
+                target_mask,
+                config,
+            )
+        }
+        FlatVectorReconstructionOrdering::IntensityDescending => {
+            let (reconstruction, target, target_mask) =
+                sort_flat_vectors_by_intensity(reconstruction, target, target_mask);
+            slot_reconstruction_loss_restricted_from_vectors_with_mask(
+                reconstruction,
+                target,
+                target_mask,
+                config,
+            )
+        }
+    }
+}
+
 /// Clean and masked flat-vector reconstruction losses with shared alignment work.
+///
+/// The clean branch uses the unrestricted slot cosine
+/// ([`slot_reconstruction_loss_from_vectors_with_mask`]), which keeps the
+/// phantom-peak penalty from `||π||₂` summing over every slot. The masked
+/// branch uses the restricted variant
+/// ([`slot_reconstruction_loss_restricted_from_vectors_with_mask`]) so the
+/// cosine numerator and both norms are gated by the same (sparse) masked
+/// target subset; this makes the masked signal meaningful when only a
+/// handful of slots are real-and-dropped per row.
 pub fn flat_vector_reconstruction_losses_from_vectors_with_masks<B: Backend>(
     reconstruction: Tensor<B, 2>,
     target: Tensor<B, 2>,
@@ -625,7 +705,7 @@ pub fn flat_vector_reconstruction_losses_from_vectors_with_masks<B: Backend>(
                 target_mask,
                 config,
             ),
-            slot_reconstruction_loss_from_vectors_with_mask(
+            slot_reconstruction_loss_restricted_from_vectors_with_mask(
                 reconstruction,
                 target,
                 masked_target_mask,
@@ -647,7 +727,7 @@ pub fn flat_vector_reconstruction_losses_from_vectors_with_masks<B: Backend>(
                     target_mask,
                     config,
                 ),
-                slot_reconstruction_loss_from_vectors_with_mask(
+                slot_reconstruction_loss_restricted_from_vectors_with_mask(
                     reconstruction,
                     target,
                     masked_target_mask,
@@ -1028,7 +1108,7 @@ mod tests {
             FlatVectorReconstructionOrdering::IntensityDescending,
         )
         .into_scalar();
-        let masked_separate = flat_vector_reconstruction_loss_from_vectors_with_mask(
+        let masked_separate = flat_vector_reconstruction_loss_restricted_from_vectors_with_mask(
             reconstruction.clone(),
             target.clone(),
             masked_target_mask.clone(),
@@ -1118,6 +1198,57 @@ mod tests {
         // Both pred slots map to the real target at 0.0; distance (0.5)^2 = 0.25 each.
         let expected = 0.25_f32;
         assert!((value - expected).abs() < 1.0e-5, "value={value}, expected={expected}");
+    }
+
+    #[test]
+    fn restricted_cosine_is_unaffected_by_phantom_intensity_off_mask() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        let config = SetReconstructionLossConfig::default();
+        // One real-peak slot at (0.10, 1.0), one padded slot.
+        let target = Tensor::<B, 2>::from_floats([[0.10, 1.0, 0.0, 0.0]], &device);
+        let mask = Tensor::<B, 2>::from_floats([[1.0, 0.0]], &device);
+        // Two predictions: identical on the masked-real slot, different in the
+        // phantom intensity placed on the padded slot.
+        let pred_clean = Tensor::<B, 2>::from_floats([[0.10, 1.0, 0.0, 0.0]], &device);
+        let pred_noisy = Tensor::<B, 2>::from_floats([[0.10, 1.0, 0.5, 0.5]], &device);
+
+        let restricted_clean = slot_reconstruction_loss_restricted_from_vectors_with_mask(
+            pred_clean.clone(),
+            target.clone(),
+            mask.clone(),
+            config,
+        )
+        .into_scalar();
+        let restricted_noisy = slot_reconstruction_loss_restricted_from_vectors_with_mask(
+            pred_noisy.clone(),
+            target.clone(),
+            mask.clone(),
+            config,
+        )
+        .into_scalar();
+        // Restricted variant gates pred_norm by the mask, so the phantom on the
+        // padded slot must not change the loss.
+        assert!(
+            (restricted_clean - restricted_noisy).abs() < 1.0e-6,
+            "restricted_clean={restricted_clean} restricted_noisy={restricted_noisy}"
+        );
+
+        // Sanity: the unrestricted variant does react to phantom intensity.
+        let unrestricted_clean = slot_reconstruction_loss_from_vectors_with_mask(
+            pred_clean,
+            target.clone(),
+            mask.clone(),
+            config,
+        )
+        .into_scalar();
+        let unrestricted_noisy =
+            slot_reconstruction_loss_from_vectors_with_mask(pred_noisy, target, mask, config)
+                .into_scalar();
+        assert!(
+            unrestricted_noisy > unrestricted_clean + 1.0e-3,
+            "unrestricted should penalise phantom: clean={unrestricted_clean} noisy={unrestricted_noisy}"
+        );
     }
 
     #[test]
