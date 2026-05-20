@@ -80,22 +80,7 @@ inline.
 
 ## General
 
-### 5. Asymmetric-exponent ceiling on the cosine
-
-The cosine's `π_p = m̂_p^a · Î_p^{b+1}` and `τ_p = m_p^a · I_p^b · M_p`
-disagree on the intensity exponent (b+1 vs b), so even at perfect
-prediction the cosine ceiling is below 1 for spectra with non-uniform
-intensities. This is a long-standing issue we noted but deferred.
-
-`src/model/reconstruction.rs::peak_products:825` (the asymmetry's
-source: `pred_presence = pred_intensity` for the flat-vector model).
-
-Fix would replace the implicit "intensity-as-presence" double-use on
-the pred side with either a constant `1.0` (no presence factor —
-penalty handled by `||π||_2`) or an explicit decoder presence channel.
-Both are architecturally invasive.
-
-### 6. σ schedule for the precursor head
+### 5. σ schedule for the precursor head
 
 The precursor head's m/z prediction has no Gaussian gate equivalent —
 it's a direct MSE. If we want progressive precision there too, we'd

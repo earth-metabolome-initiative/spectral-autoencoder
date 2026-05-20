@@ -514,7 +514,7 @@ fn slot_reconstruction_loss_impl<B: Backend>(
     let pred_intensity = predicted_pairs
         .narrow(2, 1, 1)
         .reshape([batch_size, max_peaks]);
-    let pred_presence = pred_intensity.clone();
+    let pred_presence = pred_intensity.ones_like();
 
     let target_pairs = target.reshape([batch_size, max_peaks, 2]);
     let target_mz = target_pairs
@@ -767,7 +767,7 @@ pub fn set_reconstruction_loss_from_vectors_with_mask<B: Backend>(
     let pred_intensity = predicted_pairs
         .narrow(2, 1, 1)
         .reshape([batch_size, max_peaks]);
-    let pred_presence = pred_intensity.clone();
+    let pred_presence = pred_intensity.ones_like();
 
     set_reconstruction_loss(
         pred_mz,
@@ -931,7 +931,10 @@ mod tests {
         let device = burn::backend::ndarray::NdArrayDevice::default();
         let config = SetReconstructionLossConfig::default();
         let vector = Tensor::<B, 2>::from_floats([[0.1, 1.0, 0.2, 0.5]], &device);
-        let triples = Tensor::<B, 3>::from_floats([[[0.1, 1.0, 1.0], [0.2, 0.5, 0.5]]], &device);
+        // The 2-wide vector path implicitly treats `pred_presence = 1` on every
+        // slot, so the equivalent 3-wide triple form must set the presence
+        // channel to 1.0 (not to the slot's intensity).
+        let triples = Tensor::<B, 3>::from_floats([[[0.1, 1.0, 1.0], [0.2, 0.5, 1.0]]], &device);
         let target = Tensor::<B, 2>::from_floats([[0.1, 1.0, 0.2, 0.5]], &device);
         let target_mask = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
 
@@ -1249,6 +1252,27 @@ mod tests {
             unrestricted_noisy > unrestricted_clean + 1.0e-3,
             "unrestricted should penalise phantom: clean={unrestricted_clean} noisy={unrestricted_noisy}"
         );
+    }
+
+    #[test]
+    fn cosine_reaches_one_at_perfect_prediction_with_varied_intensities() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // Two real peaks with non-uniform intensities. Under the previous
+        // asymmetric-exponent form, sim plateaued around 0.96 here. With the
+        // pred_presence-as-ones fix, sim must reach 1 at pred == target.
+        let target = Tensor::<B, 2>::from_floats([[0.10, 1.0, 0.20, 0.5]], &device);
+        let pred = target.clone();
+        let mask = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
+
+        let loss = slot_reconstruction_loss_from_vectors_with_mask(
+            pred,
+            target,
+            mask,
+            SetReconstructionLossConfig::default(),
+        )
+        .into_scalar();
+        assert!(loss < 1.0e-3, "loss at perfect prediction should be ~0, got {loss}");
     }
 
     #[test]
