@@ -429,7 +429,7 @@ impl AutoencoderLossComponent {
             Self::SimilarityRankingAccuracy => "Similarity Ranking Accuracy",
             Self::SelfLinearCosine => "Self Linear Cosine",
             Self::SelfModifiedLinearCosine => "Self Modified Linear Cosine",
-            Self::ChamferMz => "Chamfer m/z",
+            Self::ChamferMz => "Chamfer mz",
         }
     }
 
@@ -787,7 +787,7 @@ mod tests {
             ),
             (
                 AutoencoderLossComponentMetric::<TestBackend>::chamfer_mz(),
-                "Chamfer m/z",
+                "Chamfer mz",
                 false,
             ),
         ];

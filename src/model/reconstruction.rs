@@ -1185,7 +1185,10 @@ mod tests {
         let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask).into_scalar();
         // Each of three pred slots maps to nearest real target = 0.1, distance 0.01.
         let expected = ((0.20_f32 - 0.10_f32).powi(2) * 3.0) / 3.0;
-        assert!((value - expected).abs() < 1.0e-5, "value={value}, expected={expected}");
+        assert!(
+            (value - expected).abs() < 1.0e-5,
+            "value={value}, expected={expected}"
+        );
     }
 
     #[test]
@@ -1200,7 +1203,10 @@ mod tests {
         let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask).into_scalar();
         // Both pred slots map to the real target at 0.0; distance (0.5)^2 = 0.25 each.
         let expected = 0.25_f32;
-        assert!((value - expected).abs() < 1.0e-5, "value={value}, expected={expected}");
+        assert!(
+            (value - expected).abs() < 1.0e-5,
+            "value={value}, expected={expected}"
+        );
     }
 
     #[test]
@@ -1272,7 +1278,10 @@ mod tests {
             SetReconstructionLossConfig::default(),
         )
         .into_scalar();
-        assert!(loss < 1.0e-3, "loss at perfect prediction should be ~0, got {loss}");
+        assert!(
+            loss < 1.0e-3,
+            "loss at perfect prediction should be ~0, got {loss}"
+        );
     }
 
     #[test]

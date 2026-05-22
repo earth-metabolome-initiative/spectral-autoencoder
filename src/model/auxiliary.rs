@@ -74,9 +74,10 @@ impl Default for AuxiliaryLossConfig {
     }
 }
 
-/// Default weight for the Chamfer m/z magnet term. Opt-in (`0.0`) so existing
-/// training runs stay bit-identical until the user enables it.
-pub const DEFAULT_CHAMFER_MZ_WEIGHT: f64 = 0.0;
+/// Default weight for the Chamfer m/z magnet term, matched to the intruder
+/// and precursor weights so the magnet contributes a meaningful gradient to
+/// dead-peak rescue without dominating the cosine reconstruction.
+pub const DEFAULT_CHAMFER_MZ_WEIGHT: f64 = 0.05;
 
 fn default_chamfer_mz_weight() -> f64 {
     DEFAULT_CHAMFER_MZ_WEIGHT
