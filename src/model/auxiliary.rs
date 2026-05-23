@@ -51,11 +51,13 @@ pub struct AuxiliaryLossConfig {
     /// slot toward the nearest real-peak target m/z (`0.0` disables it).
     #[serde(default = "default_chamfer_mz_weight")]
     pub chamfer_mz_weight: f64,
-    /// Number of target peaks randomly sampled per forward pass by the Chamfer
-    /// m/z magnet. `0` disables subsampling and uses every peak (default).
-    /// Smaller values trade per-batch gradient coverage for GPU memory.
-    #[serde(default = "default_chamfer_max_target_peaks")]
-    pub chamfer_max_target_peaks: usize,
+    /// Number of predicted peak slots randomly sampled per forward pass by the
+    /// Chamfer m/z magnet. `0` disables subsampling and evaluates every pred
+    /// slot (default). Smaller values reduce the broadcast tensor's footprint
+    /// proportionally while keeping each sampled slot's `min`-over-targets
+    /// exact, so the loss remains an unbiased estimator of the full mean.
+    #[serde(default = "default_chamfer_max_pred_peaks")]
+    pub chamfer_max_pred_peaks: usize,
 }
 
 impl Default for AuxiliaryLossConfig {
@@ -75,7 +77,7 @@ impl Default for AuxiliaryLossConfig {
             similarity_ranking_pairs_per_batch: 0,
             intruder_hidden_width: 128,
             chamfer_mz_weight: DEFAULT_CHAMFER_MZ_WEIGHT,
-            chamfer_max_target_peaks: DEFAULT_CHAMFER_MAX_TARGET_PEAKS,
+            chamfer_max_pred_peaks: DEFAULT_CHAMFER_MAX_PRED_PEAKS,
         }
     }
 }
@@ -89,13 +91,13 @@ fn default_chamfer_mz_weight() -> f64 {
     DEFAULT_CHAMFER_MZ_WEIGHT
 }
 
-/// Default count of target peaks randomly sampled by the Chamfer m/z magnet.
-/// `0` disables subsampling (every peak participates), matching the original
+/// Default count of pred slots randomly sampled by the Chamfer m/z magnet.
+/// `0` disables subsampling (every slot is evaluated), matching the original
 /// kernel behavior.
-pub const DEFAULT_CHAMFER_MAX_TARGET_PEAKS: usize = 0;
+pub const DEFAULT_CHAMFER_MAX_PRED_PEAKS: usize = 0;
 
-fn default_chamfer_max_target_peaks() -> usize {
-    DEFAULT_CHAMFER_MAX_TARGET_PEAKS
+fn default_chamfer_max_pred_peaks() -> usize {
+    DEFAULT_CHAMFER_MAX_PRED_PEAKS
 }
 
 fn default_similarity_ranking_latent_temperature() -> f64 {
@@ -231,13 +233,14 @@ impl AuxiliaryLossConfigBuilder {
         self
     }
 
-    /// Sets the count of target peaks randomly sampled by the Chamfer m/z
-    /// magnet on each forward pass. `0` disables subsampling (uses every
-    /// peak); smaller values trade per-batch gradient coverage for memory.
+    /// Sets the count of pred slots randomly sampled by the Chamfer m/z
+    /// magnet on each forward pass. `0` disables subsampling (evaluates
+    /// every slot); smaller values shrink the broadcast tensor and keep
+    /// the loss unbiased.
     #[inline]
     #[must_use]
-    pub fn with_chamfer_max_target_peaks(mut self, value: usize) -> Self {
-        self.config.chamfer_max_target_peaks = value;
+    pub fn with_chamfer_max_pred_peaks(mut self, value: usize) -> Self {
+        self.config.chamfer_max_pred_peaks = value;
         self
     }
 

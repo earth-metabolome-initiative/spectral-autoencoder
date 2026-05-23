@@ -395,19 +395,22 @@ fn slot_reconstruction_loss_impl<B: Backend>(
 /// [`CHAMFER_INACTIVE_PENALTY`] constant. Assumes every row has at least
 /// one real peak (`Σ_p M_p > 0`).
 ///
-/// `max_target_peaks` randomly subsamples `k` target peaks (with
+/// `max_pred_peaks` randomly subsamples `k` predicted peak slots (with
 /// replacement, **independently per batch row**, resampled per forward
 /// pass) so the broadcast tensor shrinks from `[batch, P_pred, P_target]`
-/// to `[batch, P_pred, k]`. Per-row sampling means each anchor gets its
-/// own draw of targets, so per-batch loss variance averages over `batch`
-/// independent draws instead of one shared draw across the whole batch.
-/// `0` disables subsampling and is bit-identical to the original kernel.
-/// Values `>= max_peaks` are treated the same as `0`.
+/// to `[batch, k, P_target]`. Each sampled pred slot still computes its
+/// `min` over the full set of `P_target` real peaks, so the per-slot
+/// magnet term is exact — only the *which* slots get evaluated changes
+/// each batch. The resulting estimator is unbiased: it is the mean over
+/// a random k-subset of the per-pred-slot Chamfer terms, identical in
+/// expectation to the full pred-dimension mean. `0` disables subsampling
+/// and is bit-identical to the original kernel. Values `>= max_peaks`
+/// are treated the same as `0`.
 pub fn slot_chamfer_magnet_mz<B: Backend>(
     reconstruction: Tensor<B, 2>,
     target: Tensor<B, 2>,
     target_mask: Tensor<B, 2>,
-    max_target_peaks: usize,
+    max_pred_peaks: usize,
 ) -> Tensor<B, 1> {
     let [batch_size, vector_width] = reconstruction.dims();
     let max_peaks = vector_width / 2;
@@ -422,37 +425,37 @@ pub fn slot_chamfer_magnet_mz<B: Backend>(
         .narrow(2, 0, 1)
         .reshape([batch_size, max_peaks]);
 
-    let (target_mz, target_mask) = if max_target_peaks == 0 || max_target_peaks >= max_peaks {
-        (target_mz, target_mask)
+    let pred_mz = if max_pred_peaks == 0 || max_pred_peaks >= max_peaks {
+        pred_mz
     } else {
-        let device = target_mz.device();
+        let device = pred_mz.device();
         // Per-row indices: each batch row gets its own random k-subset of
-        // target peaks. Shape [batch, k] so gather on dim 1 produces a
-        // [batch, k] view of target_mz and target_mask.
+        // pred slots. Shape [batch, k] so gather on dim 1 produces a
+        // [batch, k] view of pred_mz. Target side is untouched, so the
+        // inner min for each sampled slot is still computed over every
+        // real peak (no bias).
         let indices = Tensor::<B, 2>::random(
-            [batch_size, max_target_peaks],
+            [batch_size, max_pred_peaks],
             Distribution::Uniform(0.0, max_peaks as f64),
             &device,
         )
         .int();
-        (
-            target_mz.gather(1, indices.clone()),
-            target_mask.gather(1, indices),
-        )
+        pred_mz.gather(1, indices)
     };
 
-    // [batch, P_pred, P_target_effective]
+    // [batch, P_pred_effective, P_target]
     let diff = pred_mz.unsqueeze_dim::<3>(2) - target_mz.unsqueeze_dim::<3>(1);
     let diff_sq = diff.powf_scalar(2.0);
 
     // Padded targets get an additive penalty large enough to lose every min.
+    // target_mask is [batch, P_target]; unsqueeze to [batch, 1, P_target] so
+    // it broadcasts against the [batch, k, P_target] diff regardless of k.
     let target_mask_3d = target_mask.unsqueeze_dim::<3>(1);
     let inactive_penalty =
         (target_mask_3d.clone().ones_like() - target_mask_3d) * CHAMFER_INACTIVE_PENALTY;
     let masked = diff_sq + inactive_penalty;
 
-    let min_dist_sq = masked.min_dim(2).reshape([batch_size, max_peaks]);
-    min_dist_sq.mean()
+    masked.min_dim(2).mean()
 }
 
 /// Flat-vector reconstruction loss with configurable slot alignment.
@@ -1020,7 +1023,7 @@ mod tests {
     }
 
     #[test]
-    fn chamfer_subsample_with_k_at_or_above_target_matches_unsubsampled() {
+    fn chamfer_subsample_with_k_at_or_above_pred_matches_unsubsampled() {
         type B = burn::backend::NdArray<f32, i64>;
         let device = burn::backend::ndarray::NdArrayDevice::default();
         // Three real-peak targets at 0.1, 0.4, 0.7; pred slots at 0.15, 0.45, 0.65.
@@ -1037,18 +1040,18 @@ mod tests {
             unsub.is_finite() && unsub > 0.0,
             "baseline finite, got {unsub}"
         );
-        assert_eq!(unsub, at_k, "k = P_target should short-circuit identically");
+        assert_eq!(unsub, at_k, "k = P_pred should short-circuit identically");
         assert_eq!(
             unsub, above_k,
-            "k > P_target should short-circuit identically"
+            "k > P_pred should short-circuit identically"
         );
     }
 
     #[test]
-    fn chamfer_subsample_produces_finite_non_negative_output_with_k_less_than_target() {
+    fn chamfer_subsample_produces_finite_non_negative_output_with_k_less_than_pred() {
         type B = burn::backend::NdArray<f32, i64>;
         let device = burn::backend::ndarray::NdArrayDevice::default();
-        // 8 target peaks, 8 pred slots. k = 2 → subsample to 2 random targets.
+        // 8 target peaks, 8 pred slots. k = 2 → subsample to 2 random pred slots.
         let pred = Tensor::<B, 2>::from_floats(
             [[
                 0.05, 1.0, 0.15, 1.0, 0.25, 1.0, 0.35, 1.0, 0.45, 1.0, 0.55, 1.0, 0.65, 1.0, 0.75,
