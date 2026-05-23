@@ -542,6 +542,7 @@ impl SpectralAutoencoderConfig {
             latent_noise_std: self.auxiliary.latent_noise_std,
             similarity_ranking_pairs_per_batch: self.auxiliary.similarity_ranking_pairs_per_batch,
             chamfer_mz_weight: self.auxiliary.chamfer_mz_weight,
+            chamfer_max_target_peaks: self.auxiliary.chamfer_max_target_peaks,
             mz_sigma_start,
             mz_sigma_end,
             mz_sigma_decay_steps: self.mz_sigma_decay_steps,
@@ -660,6 +661,7 @@ pub struct SpectralAutoencoder<B: Backend> {
     latent_noise_std: f64,
     similarity_ranking_pairs_per_batch: usize,
     chamfer_mz_weight: f64,
+    chamfer_max_target_peaks: usize,
     mz_sigma_start: f64,
     mz_sigma_end: f64,
     mz_sigma_decay_steps: usize,
@@ -826,6 +828,7 @@ impl<B: Backend> SpectralAutoencoder<B> {
                 output.reconstruction.clone(),
                 target.clone(),
                 target_peak_mask,
+                self.chamfer_max_target_peaks,
             ) * self.chamfer_mz_weight
         } else {
             Tensor::zeros([1], &device)

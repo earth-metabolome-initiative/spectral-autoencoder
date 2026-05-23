@@ -170,6 +170,12 @@ pub struct SharedArgs {
     #[arg(long)]
     pub aux_chamfer_mz_weight: Option<f64>,
 
+    /// Number of target peaks randomly sampled per forward pass by the Chamfer
+    /// m/z magnet (`0` = all peaks). Lower values free GPU memory for larger
+    /// batches at the cost of per-batch gradient coverage.
+    #[arg(long)]
+    pub aux_chamfer_max_target_peaks: Option<usize>,
+
     /// Initial σ of the m/z Gaussian gate (normalized units). Wider σ early
     /// gives every pred slot non-zero m/z gradient.
     #[arg(long)]
@@ -480,6 +486,9 @@ pub fn auxiliary_loss_config(
         chamfer_mz_weight: shared
             .aux_chamfer_mz_weight
             .unwrap_or(default.chamfer_mz_weight),
+        chamfer_max_target_peaks: shared
+            .aux_chamfer_max_target_peaks
+            .unwrap_or(default.chamfer_max_target_peaks),
     }
 }
 

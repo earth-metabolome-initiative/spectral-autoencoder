@@ -2,7 +2,7 @@
 
 use burn::{
     prelude::*,
-    tensor::{Int, Tensor},
+    tensor::{Distribution, Int, Tensor},
 };
 use serde::{Deserialize, Serialize};
 
@@ -394,10 +394,17 @@ fn slot_reconstruction_loss_impl<B: Backend>(
 /// target slots are excluded from the min via the
 /// [`CHAMFER_INACTIVE_PENALTY`] constant. Assumes every row has at least
 /// one real peak (`Σ_p M_p > 0`).
+///
+/// `max_target_peaks` randomly subsamples `k` target peaks (with
+/// replacement, shared across batch rows, resampled per forward pass) so
+/// the broadcast tensor shrinks from `[batch, P_pred, P_target]` to
+/// `[batch, P_pred, k]`. `0` disables subsampling and is bit-identical to
+/// the original kernel. Values `>= max_peaks` are treated the same as `0`.
 pub fn slot_chamfer_magnet_mz<B: Backend>(
     reconstruction: Tensor<B, 2>,
     target: Tensor<B, 2>,
     target_mask: Tensor<B, 2>,
+    max_target_peaks: usize,
 ) -> Tensor<B, 1> {
     let [batch_size, vector_width] = reconstruction.dims();
     let max_peaks = vector_width / 2;
@@ -412,7 +419,23 @@ pub fn slot_chamfer_magnet_mz<B: Backend>(
         .narrow(2, 0, 1)
         .reshape([batch_size, max_peaks]);
 
-    // [batch, P_pred, P_target]
+    let (target_mz, target_mask) = if max_target_peaks == 0 || max_target_peaks >= max_peaks {
+        (target_mz, target_mask)
+    } else {
+        let device = target_mz.device();
+        let indices = Tensor::<B, 1>::random(
+            [max_target_peaks],
+            Distribution::Uniform(0.0, max_peaks as f64),
+            &device,
+        )
+        .int();
+        (
+            target_mz.select(1, indices.clone()),
+            target_mask.select(1, indices),
+        )
+    };
+
+    // [batch, P_pred, P_target_effective]
     let diff = pred_mz.unsqueeze_dim::<3>(2) - target_mz.unsqueeze_dim::<3>(1);
     let diff_sq = diff.powf_scalar(2.0);
 
@@ -933,7 +956,7 @@ mod tests {
         let pred = target.clone();
         let target_mask = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
 
-        let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask).into_scalar();
+        let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask, 0).into_scalar();
         assert!(value.abs() < 1.0e-6, "magnet={value}, expected ~0");
     }
 
@@ -947,8 +970,9 @@ mod tests {
         let target_ba = Tensor::<B, 2>::from_floats([[0.70, 0.5, 0.10, 1.0]], &device);
         let mask = Tensor::<B, 2>::from_floats([[1.0, 1.0]], &device);
 
-        let v_ab: f32 = slot_chamfer_magnet_mz(pred.clone(), target_ab, mask.clone()).into_scalar();
-        let v_ba: f32 = slot_chamfer_magnet_mz(pred, target_ba, mask).into_scalar();
+        let v_ab: f32 =
+            slot_chamfer_magnet_mz(pred.clone(), target_ab, mask.clone(), 0).into_scalar();
+        let v_ba: f32 = slot_chamfer_magnet_mz(pred, target_ba, mask, 0).into_scalar();
         assert!((v_ab - v_ba).abs() < 1.0e-6, "{v_ab} vs {v_ba}");
     }
 
@@ -962,7 +986,7 @@ mod tests {
         let target = Tensor::<B, 2>::from_floats([[0.10, 1.0, 0.70, 0.5, 0.21, 0.0]], &device);
         let target_mask = Tensor::<B, 2>::from_floats([[1.0, 1.0, 0.0]], &device);
 
-        let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask).into_scalar();
+        let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask, 0).into_scalar();
         // Each of three pred slots maps to nearest real target = 0.1, distance 0.01.
         let expected = ((0.20_f32 - 0.10_f32).powi(2) * 3.0) / 3.0;
         assert!(
@@ -980,12 +1004,69 @@ mod tests {
         let target = Tensor::<B, 2>::from_floats([[0.0, 1.0, 0.5001, 0.0]], &device);
         let target_mask = Tensor::<B, 2>::from_floats([[1.0, 0.0]], &device);
 
-        let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask).into_scalar();
+        let value: f32 = slot_chamfer_magnet_mz(pred, target, target_mask, 0).into_scalar();
         // Both pred slots map to the real target at 0.0; distance (0.5)^2 = 0.25 each.
         let expected = 0.25_f32;
         assert!(
             (value - expected).abs() < 1.0e-5,
             "value={value}, expected={expected}"
+        );
+    }
+
+    #[test]
+    fn chamfer_subsample_with_k_at_or_above_target_matches_unsubsampled() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // Three real-peak targets at 0.1, 0.4, 0.7; pred slots at 0.15, 0.45, 0.65.
+        let pred = Tensor::<B, 2>::from_floats([[0.15, 1.0, 0.45, 0.5, 0.65, 0.25]], &device);
+        let target = Tensor::<B, 2>::from_floats([[0.10, 1.0, 0.40, 0.5, 0.70, 0.25]], &device);
+        let mask = Tensor::<B, 2>::from_floats([[1.0, 1.0, 1.0]], &device);
+
+        let unsub: f32 =
+            slot_chamfer_magnet_mz(pred.clone(), target.clone(), mask.clone(), 0).into_scalar();
+        let at_k: f32 =
+            slot_chamfer_magnet_mz(pred.clone(), target.clone(), mask.clone(), 3).into_scalar();
+        let above_k: f32 = slot_chamfer_magnet_mz(pred, target, mask, 100).into_scalar();
+        assert!(
+            unsub.is_finite() && unsub > 0.0,
+            "baseline finite, got {unsub}"
+        );
+        assert_eq!(unsub, at_k, "k = P_target should short-circuit identically");
+        assert_eq!(
+            unsub, above_k,
+            "k > P_target should short-circuit identically"
+        );
+    }
+
+    #[test]
+    fn chamfer_subsample_produces_finite_non_negative_output_with_k_less_than_target() {
+        type B = burn::backend::NdArray<f32, i64>;
+        let device = burn::backend::ndarray::NdArrayDevice::default();
+        // 8 target peaks, 8 pred slots. k = 2 → subsample to 2 random targets.
+        let pred = Tensor::<B, 2>::from_floats(
+            [[
+                0.05, 1.0, 0.15, 1.0, 0.25, 1.0, 0.35, 1.0, 0.45, 1.0, 0.55, 1.0, 0.65, 1.0, 0.75,
+                1.0,
+            ]],
+            &device,
+        );
+        let target = Tensor::<B, 2>::from_floats(
+            [[
+                0.10, 1.0, 0.20, 1.0, 0.30, 1.0, 0.40, 1.0, 0.50, 1.0, 0.60, 1.0, 0.70, 1.0, 0.80,
+                1.0,
+            ]],
+            &device,
+        );
+        let mask = Tensor::<B, 2>::from_floats([[1.0; 8]], &device);
+
+        let value: f32 = slot_chamfer_magnet_mz(pred, target, mask, 2).into_scalar();
+        assert!(
+            value.is_finite(),
+            "subsampled value should be finite, got {value}"
+        );
+        assert!(
+            value >= 0.0,
+            "subsampled value should be non-negative, got {value}"
         );
     }
 
