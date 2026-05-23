@@ -396,10 +396,13 @@ fn slot_reconstruction_loss_impl<B: Backend>(
 /// one real peak (`Σ_p M_p > 0`).
 ///
 /// `max_target_peaks` randomly subsamples `k` target peaks (with
-/// replacement, shared across batch rows, resampled per forward pass) so
-/// the broadcast tensor shrinks from `[batch, P_pred, P_target]` to
-/// `[batch, P_pred, k]`. `0` disables subsampling and is bit-identical to
-/// the original kernel. Values `>= max_peaks` are treated the same as `0`.
+/// replacement, **independently per batch row**, resampled per forward
+/// pass) so the broadcast tensor shrinks from `[batch, P_pred, P_target]`
+/// to `[batch, P_pred, k]`. Per-row sampling means each anchor gets its
+/// own draw of targets, so per-batch loss variance averages over `batch`
+/// independent draws instead of one shared draw across the whole batch.
+/// `0` disables subsampling and is bit-identical to the original kernel.
+/// Values `>= max_peaks` are treated the same as `0`.
 pub fn slot_chamfer_magnet_mz<B: Backend>(
     reconstruction: Tensor<B, 2>,
     target: Tensor<B, 2>,
@@ -423,15 +426,18 @@ pub fn slot_chamfer_magnet_mz<B: Backend>(
         (target_mz, target_mask)
     } else {
         let device = target_mz.device();
-        let indices = Tensor::<B, 1>::random(
-            [max_target_peaks],
+        // Per-row indices: each batch row gets its own random k-subset of
+        // target peaks. Shape [batch, k] so gather on dim 1 produces a
+        // [batch, k] view of target_mz and target_mask.
+        let indices = Tensor::<B, 2>::random(
+            [batch_size, max_target_peaks],
             Distribution::Uniform(0.0, max_peaks as f64),
             &device,
         )
         .int();
         (
-            target_mz.select(1, indices.clone()),
-            target_mask.select(1, indices),
+            target_mz.gather(1, indices.clone()),
+            target_mask.gather(1, indices),
         )
     };
 
