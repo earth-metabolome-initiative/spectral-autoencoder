@@ -127,7 +127,7 @@ pub struct EmbeddingRow {
 
 enum EmbedderVariant<B: Backend> {
     Flat {
-        model: SpectralAutoencoder<B>,
+        model: Box<SpectralAutoencoder<B>>,
         vectorizer: SpectrumVectorizer,
         vectorizer_config: SpectrumVectorizerConfig,
         loss_config: SetReconstructionLossConfig,
@@ -135,7 +135,7 @@ enum EmbedderVariant<B: Backend> {
         latent_width: usize,
     },
     PeakSet {
-        model: PeakSetAutoencoder<B>,
+        model: Box<PeakSetAutoencoder<B>>,
         tokenizer: SpectrumTokenizer,
         tokenizer_config: SpectrumTokenizerConfig,
         loss_config: SetReconstructionLossConfig,
@@ -273,7 +273,7 @@ impl<B: Backend<FloatElem = f32>> SpectrumEmbedder<B> {
                     ConditioningEncoder::new(ConditioningConfig { precursor_mz_scale });
                 Ok(Self {
                     variant: EmbedderVariant::Flat {
-                        model,
+                        model: Box::new(model),
                         vectorizer,
                         vectorizer_config,
                         loss_config,
@@ -303,7 +303,7 @@ impl<B: Backend<FloatElem = f32>> SpectrumEmbedder<B> {
                     ConditioningEncoder::new(ConditioningConfig { precursor_mz_scale });
                 Ok(Self {
                     variant: EmbedderVariant::PeakSet {
-                        model,
+                        model: Box::new(model),
                         tokenizer,
                         tokenizer_config,
                         loss_config,
@@ -624,11 +624,12 @@ fn vectorizer_config_for_flat(config: &SpectralAutoencoderConfig) -> SpectrumVec
 }
 
 fn tokenizer_config_for_peak_set(config: &PeakSetAutoencoderConfig) -> SpectrumTokenizerConfig {
-    let mut tokenizer = SpectrumTokenizerConfig::default();
-    tokenizer.max_peaks = config.encoder.max_peaks;
     let extra_features = config.encoder.token_feature_width.saturating_sub(3);
-    tokenizer.mz_fourier_frequencies = extra_features / 2;
-    tokenizer
+    SpectrumTokenizerConfig {
+        max_peaks: config.encoder.max_peaks,
+        mz_fourier_frequencies: extra_features / 2,
+        ..SpectrumTokenizerConfig::default()
+    }
 }
 
 fn finite_positive_precursor<S>(spectrum: &S) -> Option<f64>
@@ -938,7 +939,7 @@ mod tests {
         };
         let mut embedder = SpectrumEmbedder::<B> {
             variant: EmbedderVariant::Flat {
-                model,
+                model: Box::new(model),
                 vectorizer: SpectrumVectorizer::new(vectorizer_config.clone()),
                 vectorizer_config,
                 loss_config: SetReconstructionLossConfig::default(),

@@ -118,10 +118,10 @@ pub fn resolve_mascot_gems_a10(
     let mut builder = builder
         .target_directory(&target_directory)
         .force_download(false);
-    if let Some(value) = dataset_parts {
-        if let Some(parts) = parse_dataset_parts(value)? {
-            builder = builder.parts(parts)?;
-        }
+    if let Some(value) = dataset_parts
+        && let Some(parts) = parse_dataset_parts(value)?
+    {
+        builder = builder.parts(parts)?;
     }
     if let Some(token) = gems_a10_token() {
         builder = builder.token(token);

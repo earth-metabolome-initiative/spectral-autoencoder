@@ -63,6 +63,7 @@ pub fn flat_vector_config(
     Ok(config)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn streaming_vectorized_loader<B, Open>(
     args: &RunArgs,
     cache: &PreprocessedCacheOptions,
