@@ -580,6 +580,9 @@ pub struct SimilarityRankingOutput<B: Backend> {
     pub valid_pairs: Tensor<B, 1>,
     /// Fraction of valid anchors where latent similarity preserved target ordering.
     pub accuracy: Tensor<B, 1>,
+    /// Mean reciprocal rank of the teacher's best candidate under the
+    /// latent-cosine ordering, averaged over valid anchors. Diagnostic only.
+    pub mrr: Tensor<B, 1>,
 }
 
 /// In-batch softmax ranking loss that preserves sampled teacher similarity order.
@@ -663,18 +666,28 @@ pub fn similarity_ranking_output<B: Backend>(
     let valid_pairs = valid.clone().sum();
     let gap_weights = target_gap * valid.clone();
     let gap_weight_sum = gap_weights.clone().sum().clamp_min(1.0e-6);
-    let predicted_best = logits.argmax(1);
+    let predicted_best = logits.clone().argmax(1);
     let teacher_best = batch
         .best_candidate_position
         .narrow(0, 0, pair_count)
         .reshape([pair_count, 1]);
-    let accuracy = (predicted_best.equal(teacher_best).float() * valid.clone()).sum()
+    let accuracy = (predicted_best.equal(teacher_best.clone()).float() * valid.clone()).sum()
         / valid_pairs.clone().clamp_min(1.0);
+
+    // Mean reciprocal rank of the teacher's best candidate under the
+    // latent-cosine ordering. Counts how many candidates score above the
+    // teacher's choice; rank = that count + 1, reciprocal-averaged across
+    // valid anchors.
+    let teacher_logit = logits.clone().gather(1, teacher_best);
+    let higher_count = logits.greater(teacher_logit).float().sum_dim(1);
+    let rank = higher_count + 1.0;
+    let mrr = (rank.recip() * valid.clone()).sum() / valid_pairs.clone().clamp_min(1.0);
 
     SimilarityRankingOutput {
         loss: (cross_entropy * gap_weights).sum() / gap_weight_sum,
         valid_pairs,
         accuracy,
+        mrr,
     }
 }
 
@@ -731,6 +744,7 @@ fn zero_similarity_ranking_output<B: Backend>(device: &B::Device) -> SimilarityR
         loss: Tensor::zeros([1], device),
         valid_pairs: Tensor::zeros([1], device),
         accuracy: Tensor::zeros([1], device),
+        mrr: Tensor::zeros([1], device),
     }
 }
 

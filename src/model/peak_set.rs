@@ -35,7 +35,6 @@ use crate::{
         weighted_masked_precursor_reconstruction_output, weighted_precursor_reconstruction_output,
         weighted_similarity_ranking_output,
     },
-    model::reconstruction::reconstruction_similarity_from_triples,
     training::{AutoencoderDiagnostics, AutoencoderLossBreakdown},
 };
 
@@ -1045,22 +1044,12 @@ impl<B: Backend> PeakSetAutoencoder<B> {
             self.similarity_ranking_min_gap,
             self.similarity_ranking_weight,
         );
-        let reconstruction_similarity = reconstruction_similarity_from_triples(
-            output.reconstruction.clone(),
-            target.clone(),
-            target_mask.clone(),
-            precursor_target,
-            output.condition_reconstruction.clone(),
-            self.loss_config(),
-        );
         let regularization = self.regularization_config().penalty(self, &device);
         let diagnostics = AutoencoderDiagnostics {
             similarity_ranking_pairs: similarity_ranking.valid_pairs,
             similarity_ranking_accuracy: similarity_ranking.accuracy,
+            similarity_ranking_mrr: similarity_ranking.mrr,
             precursor_mae_da: precursor.mae_da,
-            self_linear_cosine: reconstruction_similarity.linear_cosine,
-            self_modified_linear_cosine: reconstruction_similarity.modified_linear_cosine,
-            self_similarity_items: reconstruction_similarity.items,
         };
         let losses = AutoencoderLossBreakdown {
             reconstruction,

@@ -70,14 +70,11 @@ pub struct AutoencoderDiagnostics<B: Backend> {
     pub similarity_ranking_pairs: Tensor<B, 1>,
     /// Latent-vs-target ordering accuracy over valid similarity-ranking pairs.
     pub similarity_ranking_accuracy: Tensor<B, 1>,
+    /// Mean reciprocal rank of the teacher's best candidate under the
+    /// latent-cosine ordering, averaged over valid anchors.
+    pub similarity_ranking_mrr: Tensor<B, 1>,
     /// Mean absolute precursor m/z reconstruction error in Da.
     pub precursor_mae_da: Tensor<B, 1>,
-    /// Linear-cosine similarity between target and reconstructed spectra.
-    pub self_linear_cosine: Tensor<B, 1>,
-    /// Modified-linear-cosine similarity between target and reconstructed spectra.
-    pub self_modified_linear_cosine: Tensor<B, 1>,
-    /// Number of spectra sampled for self-similarity diagnostics.
-    pub self_similarity_items: Tensor<B, 1>,
 }
 
 impl<B: Backend> AutoencoderDiagnostics<B> {
@@ -86,10 +83,8 @@ impl<B: Backend> AutoencoderDiagnostics<B> {
         Self {
             similarity_ranking_pairs: Tensor::zeros([1], device),
             similarity_ranking_accuracy: Tensor::zeros([1], device),
+            similarity_ranking_mrr: Tensor::zeros([1], device),
             precursor_mae_da: Tensor::zeros([1], device),
-            self_linear_cosine: Tensor::zeros([1], device),
-            self_modified_linear_cosine: Tensor::zeros([1], device),
-            self_similarity_items: Tensor::zeros([1], device),
         }
     }
 }
@@ -155,10 +150,8 @@ impl<B: Backend> Adaptor<AutoencoderLossComponentsInput<B>> for AutoencoderTrain
             chamfer_mz: self.losses.chamfer_mz.clone(),
             similarity_ranking_pairs: self.diagnostics.similarity_ranking_pairs.clone(),
             similarity_ranking_accuracy: self.diagnostics.similarity_ranking_accuracy.clone(),
+            similarity_ranking_mrr: self.diagnostics.similarity_ranking_mrr.clone(),
             precursor_mae_da: self.diagnostics.precursor_mae_da.clone(),
-            self_linear_cosine: self.diagnostics.self_linear_cosine.clone(),
-            self_modified_linear_cosine: self.diagnostics.self_modified_linear_cosine.clone(),
-            self_similarity_items: self.diagnostics.self_similarity_items.clone(),
         }
     }
 }
@@ -179,10 +172,8 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             chamfer_mz,
             similarity_ranking_pairs,
             similarity_ranking_accuracy,
+            similarity_ranking_mrr,
             precursor_mae_da,
-            self_linear_cosine,
-            self_modified_linear_cosine,
-            self_similarity_items,
         ] = Transaction::default()
             .register(self.loss)
             .register(self.losses.reconstruction)
@@ -195,10 +186,8 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             .register(self.losses.chamfer_mz)
             .register(self.diagnostics.similarity_ranking_pairs)
             .register(self.diagnostics.similarity_ranking_accuracy)
+            .register(self.diagnostics.similarity_ranking_mrr)
             .register(self.diagnostics.precursor_mae_da)
-            .register(self.diagnostics.self_linear_cosine)
-            .register(self.diagnostics.self_modified_linear_cosine)
-            .register(self.diagnostics.self_similarity_items)
             .execute()
             .try_into()
             .expect("Correct amount of tensor data");
@@ -221,10 +210,8 @@ impl<B: Backend> ItemLazy for AutoencoderTrainingOutput<B> {
             diagnostics: AutoencoderDiagnostics {
                 similarity_ranking_pairs: Tensor::from_data(similarity_ranking_pairs, device),
                 similarity_ranking_accuracy: Tensor::from_data(similarity_ranking_accuracy, device),
+                similarity_ranking_mrr: Tensor::from_data(similarity_ranking_mrr, device),
                 precursor_mae_da: Tensor::from_data(precursor_mae_da, device),
-                self_linear_cosine: Tensor::from_data(self_linear_cosine, device),
-                self_modified_linear_cosine: Tensor::from_data(self_modified_linear_cosine, device),
-                self_similarity_items: Tensor::from_data(self_similarity_items, device),
             },
         }
     }
@@ -242,10 +229,8 @@ pub struct AutoencoderLossComponentsInput<B: Backend> {
     chamfer_mz: Tensor<B, 1>,
     similarity_ranking_pairs: Tensor<B, 1>,
     similarity_ranking_accuracy: Tensor<B, 1>,
+    similarity_ranking_mrr: Tensor<B, 1>,
     precursor_mae_da: Tensor<B, 1>,
-    self_linear_cosine: Tensor<B, 1>,
-    self_modified_linear_cosine: Tensor<B, 1>,
-    self_similarity_items: Tensor<B, 1>,
 }
 
 /// A numeric TUI metric for one autoencoder loss component or diagnostic.
@@ -303,14 +288,9 @@ impl<B: Backend> AutoencoderLossComponentMetric<B> {
         Self::new(AutoencoderLossComponent::SimilarityRankingAccuracy)
     }
 
-    /// Target-vs-reconstruction linear-cosine similarity.
-    pub fn self_linear_cosine() -> Self {
-        Self::new(AutoencoderLossComponent::SelfLinearCosine)
-    }
-
-    /// Target-vs-reconstruction modified-linear-cosine similarity.
-    pub fn self_modified_linear_cosine() -> Self {
-        Self::new(AutoencoderLossComponent::SelfModifiedLinearCosine)
+    /// Similarity-ranking mean reciprocal rank diagnostic.
+    pub fn similarity_ranking_mrr() -> Self {
+        Self::new(AutoencoderLossComponent::SimilarityRankingMrr)
     }
 
     /// Chamfer-style m/z magnet loss contribution (flat-vector only).
@@ -363,10 +343,7 @@ impl<B: Backend> Metric for AutoencoderLossComponentMetric<B> {
             AutoencoderLossComponent::SimilarityRankingAccuracy => {
                 item.similarity_ranking_accuracy.clone()
             }
-            AutoencoderLossComponent::SelfLinearCosine => item.self_linear_cosine.clone(),
-            AutoencoderLossComponent::SelfModifiedLinearCosine => {
-                item.self_modified_linear_cosine.clone()
-            }
+            AutoencoderLossComponent::SimilarityRankingMrr => item.similarity_ranking_mrr.clone(),
             AutoencoderLossComponent::ChamferMz => item.chamfer_mz.clone(),
         };
         let value = tensor
@@ -410,8 +387,7 @@ enum AutoencoderLossComponent {
     PrecursorMaeDa,
     SimilarityRanking,
     SimilarityRankingAccuracy,
-    SelfLinearCosine,
-    SelfModifiedLinearCosine,
+    SimilarityRankingMrr,
     ChamferMz,
 }
 
@@ -427,8 +403,7 @@ impl AutoencoderLossComponent {
             Self::PrecursorMaeDa => "Precursor MAE Da",
             Self::SimilarityRanking => "Similarity Ranking Loss",
             Self::SimilarityRankingAccuracy => "Similarity Ranking Accuracy",
-            Self::SelfLinearCosine => "Self Linear Cosine",
-            Self::SelfModifiedLinearCosine => "Self Modified Linear Cosine",
+            Self::SimilarityRankingMrr => "Similarity Ranking MRR",
             Self::ChamferMz => "Chamfer mz",
         }
     }
@@ -444,8 +419,7 @@ impl AutoencoderLossComponent {
             Self::PrecursorMaeDa => "precursor reconstruction mean absolute error in Da",
             Self::SimilarityRanking => "teacher similarity ranking",
             Self::SimilarityRankingAccuracy => "teacher similarity-ranking ordering accuracy",
-            Self::SelfLinearCosine => "target-vs-reconstruction linear cosine",
-            Self::SelfModifiedLinearCosine => "target-vs-reconstruction modified linear cosine",
+            Self::SimilarityRankingMrr => "teacher similarity-ranking mean reciprocal rank",
             Self::ChamferMz => "Chamfer-style m/z magnet pulling pred toward nearest real target",
         }
     }
@@ -453,19 +427,16 @@ impl AutoencoderLossComponent {
     const fn higher_is_better(self) -> bool {
         matches!(
             self,
-            Self::SimilarityRankingAccuracy
-                | Self::SelfLinearCosine
-                | Self::SelfModifiedLinearCosine
+            Self::SimilarityRankingAccuracy | Self::SimilarityRankingMrr
         )
     }
 
     fn batch_size<B: Backend>(self, item: &AutoencoderLossComponentsInput<B>) -> usize {
         match self {
-            Self::SimilarityRankingAccuracy => metric_scalar(&item.similarity_ranking_pairs)
-                .max(1.0)
-                .round() as usize,
-            Self::SelfLinearCosine | Self::SelfModifiedLinearCosine => {
-                metric_scalar(&item.self_similarity_items).max(1.0).round() as usize
+            Self::SimilarityRankingAccuracy | Self::SimilarityRankingMrr => {
+                metric_scalar(&item.similarity_ranking_pairs)
+                    .max(1.0)
+                    .round() as usize
             }
             _ => 1,
         }
@@ -534,13 +505,11 @@ where
             .metric_valid_numeric(
                 AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_accuracy(),
             )
-            .metric_train_numeric(AutoencoderLossComponentMetric::<NdArray>::self_linear_cosine())
-            .metric_valid_numeric(AutoencoderLossComponentMetric::<NdArray>::self_linear_cosine())
             .metric_train_numeric(
-                AutoencoderLossComponentMetric::<NdArray>::self_modified_linear_cosine(),
+                AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_mrr(),
             )
             .metric_valid_numeric(
-                AutoencoderLossComponentMetric::<NdArray>::self_modified_linear_cosine(),
+                AutoencoderLossComponentMetric::<NdArray>::similarity_ranking_mrr(),
             )
     }
 }
@@ -583,10 +552,8 @@ mod tests {
         AutoencoderDiagnostics {
             similarity_ranking_pairs: scalar(9.0, device),
             similarity_ranking_accuracy: scalar(0.75, device),
+            similarity_ranking_mrr: scalar(0.65, device),
             precursor_mae_da: scalar(12.5, device),
-            self_linear_cosine: scalar(0.82, device),
-            self_modified_linear_cosine: scalar(0.91, device),
-            self_similarity_items: scalar(11.0, device),
         }
     }
 
@@ -657,10 +624,8 @@ mod tests {
         assert_tensor_close(losses.total(), 0.0);
         assert_tensor_close(diagnostics.similarity_ranking_pairs, 0.0);
         assert_tensor_close(diagnostics.similarity_ranking_accuracy, 0.0);
+        assert_tensor_close(diagnostics.similarity_ranking_mrr, 0.0);
         assert_tensor_close(diagnostics.precursor_mae_da, 0.0);
-        assert_tensor_close(diagnostics.self_linear_cosine, 0.0);
-        assert_tensor_close(diagnostics.self_modified_linear_cosine, 0.0);
-        assert_tensor_close(diagnostics.self_similarity_items, 0.0);
     }
 
     #[test]
@@ -674,10 +639,8 @@ mod tests {
         assert_eq!(output.targets.dims(), [2, 2]);
         assert_tensor_close(output.diagnostics.similarity_ranking_pairs, 0.0);
         assert_tensor_close(output.diagnostics.similarity_ranking_accuracy, 0.0);
+        assert_tensor_close(output.diagnostics.similarity_ranking_mrr, 0.0);
         assert_tensor_close(output.diagnostics.precursor_mae_da, 0.0);
-        assert_tensor_close(output.diagnostics.self_linear_cosine, 0.0);
-        assert_tensor_close(output.diagnostics.self_modified_linear_cosine, 0.0);
-        assert_tensor_close(output.diagnostics.self_similarity_items, 0.0);
     }
 
     #[test]
@@ -695,10 +658,8 @@ mod tests {
         assert_tensor_close(adapted.chamfer_mz, 3.0);
         assert_tensor_close(adapted.similarity_ranking_pairs, 9.0);
         assert_tensor_close(adapted.similarity_ranking_accuracy, 0.75);
+        assert_tensor_close(adapted.similarity_ranking_mrr, 0.65);
         assert_tensor_close(adapted.precursor_mae_da, 12.5);
-        assert_tensor_close(adapted.self_linear_cosine, 0.82);
-        assert_tensor_close(adapted.self_modified_linear_cosine, 0.91);
-        assert_tensor_close(adapted.self_similarity_items, 11.0);
     }
 
     #[test]
@@ -721,10 +682,8 @@ mod tests {
         assert_tensor_close(synced.losses.chamfer_mz, 3.0);
         assert_tensor_close(synced.diagnostics.similarity_ranking_pairs, 9.0);
         assert_tensor_close(synced.diagnostics.similarity_ranking_accuracy, 0.75);
+        assert_tensor_close(synced.diagnostics.similarity_ranking_mrr, 0.65);
         assert_tensor_close(synced.diagnostics.precursor_mae_da, 12.5);
-        assert_tensor_close(synced.diagnostics.self_linear_cosine, 0.82);
-        assert_tensor_close(synced.diagnostics.self_modified_linear_cosine, 0.91);
-        assert_tensor_close(synced.diagnostics.self_similarity_items, 11.0);
     }
 
     #[test]
@@ -776,13 +735,8 @@ mod tests {
                 true,
             ),
             (
-                AutoencoderLossComponentMetric::<TestBackend>::self_linear_cosine(),
-                "Self Linear Cosine",
-                true,
-            ),
-            (
-                AutoencoderLossComponentMetric::<TestBackend>::self_modified_linear_cosine(),
-                "Self Modified Linear Cosine",
+                AutoencoderLossComponentMetric::<TestBackend>::similarity_ranking_mrr(),
+                "Similarity Ranking MRR",
                 true,
             ),
             (
@@ -833,12 +787,8 @@ mod tests {
                 0.75,
             ),
             (
-                AutoencoderLossComponentMetric::<TestBackend>::self_linear_cosine(),
-                f64::from(0.82_f32),
-            ),
-            (
-                AutoencoderLossComponentMetric::<TestBackend>::self_modified_linear_cosine(),
-                f64::from(0.91_f32),
+                AutoencoderLossComponentMetric::<TestBackend>::similarity_ranking_mrr(),
+                f64::from(0.65_f32),
             ),
         ];
 
@@ -874,11 +824,11 @@ mod tests {
     }
 
     #[test]
-    fn self_similarity_metrics_use_sample_count_for_aggregation() {
+    fn similarity_ranking_mrr_uses_pair_count_for_aggregation() {
         let device = device();
         let item: AutoencoderLossComponentsInput<TestBackend> = output(&device).adapt();
         let metadata = metadata();
-        let mut metric = AutoencoderLossComponentMetric::<TestBackend>::self_linear_cosine();
+        let mut metric = AutoencoderLossComponentMetric::<TestBackend>::similarity_ranking_mrr();
 
         metric.update(&item, &metadata);
 
@@ -887,10 +837,10 @@ mod tests {
                 aggregated_value,
                 count,
             } => {
-                assert_metric_close(aggregated_value, 0.82);
-                assert_eq!(count, 11);
+                assert_metric_close(aggregated_value, f64::from(0.65_f32));
+                assert_eq!(count, 9);
             }
-            NumericEntry::Value(_) => panic!("self-similarity metric should be aggregated"),
+            NumericEntry::Value(_) => panic!("similarity ranking MRR should be aggregated"),
         }
     }
 
