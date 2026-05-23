@@ -681,6 +681,7 @@ impl<B: Backend> SpectralAutoencoder<B> {
 
     /// Bumps the σ schedule's step counter by one. Called from the training
     /// forward path only (validation forwards leave the counter alone).
+    #[cfg(feature = "train")]
     fn advance_sigma_step(&self) {
         self.mz_sigma_step.fetch_add(1, Ordering::Relaxed);
     }

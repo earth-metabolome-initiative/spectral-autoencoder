@@ -135,6 +135,7 @@ impl SetReconstructionLossConfigBuilder {
     }
 }
 
+#[cfg(feature = "std")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reconstruction_similarity_for_match_mode<B: Backend>(
     pred_mz: Tensor<B, 2>,
@@ -189,6 +190,7 @@ pub(crate) fn reconstruction_similarity_for_match_mode<B: Backend>(
         .reshape([batch_size])
 }
 
+#[cfg(feature = "std")]
 pub(crate) fn normalized_precursor<B: Backend>(conditions: Tensor<B, 2>) -> Tensor<B, 2> {
     conditions.narrow(1, 0, 1).clamp_min(0.0).clamp_max(1.0)
 }
