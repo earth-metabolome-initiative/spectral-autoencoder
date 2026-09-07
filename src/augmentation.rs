@@ -214,7 +214,7 @@ impl SpectrumAugmenter {
         let mz_shift = rng.signed(self.config.mz_shift_range.max(0.0));
         let mut output = values.to_vec();
         let mut masked = vec![0.0; values.len()];
-        for (pair_index, pair) in output.chunks_exact_mut(2).enumerate() {
+        for (pair_index, pair) in output.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             if pair[0] <= 0.0 || pair[1] <= 0.0 {
                 continue;
             }
@@ -567,7 +567,9 @@ fn insert_token_intruders(
 #[cfg(feature = "std")]
 fn peak_range_from_vector(values: &[f32]) -> Option<PeakRange> {
     values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .filter_map(|pair| valid_peak(pair[0], pair[1]))
         .fold(None, update_peak_range)
 }

@@ -97,7 +97,9 @@ pub(crate) fn decode_normalized_peak_pairs(
     }
 
     let mut peaks = values
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .filter_map(|pair| {
             let mz = f64::from(pair[0]) * max_mz;
             let intensity = f64::from(pair[1]);
